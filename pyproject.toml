@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77.0.1", "wheel", "build"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autosaddler"
+version = "0.2.0"
+description = "AutoSaddler: DAG-based evolutionary optimization for agent system prompts."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12, <3.15"
+
+dependencies = [
+    "litellm>=1.64.0",
+    "tqdm>=4.66.1",
+    "cloudpickle>=3.0.0",
+    "pyyaml>=6.0",
+    "gitpython>=3.1",
+    "claude-agent-sdk>=0.1.39",
+    "github-copilot-sdk>=1.0.0",
+    "jsonschema>=4.23",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff>=0.3.0",
+]
+meta-are-setup = [
+    "datasets>=3.0",
+    "huggingface-hub[hf-xet]>=1.20.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+autosaddler = ["v1/README.md", "v1/proposer/autosaddler/**/*.md", "v2/plugins/**/*.md", "v2/prompting/methodology/**/*.md"]
+
+[tool.ruff]
+include = ["src/**/*.py"]
+line-length = 120
+indent-width = 4
+target-version = "py312"

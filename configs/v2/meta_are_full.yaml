@@ -1,0 +1,95 @@
+# Full V2 Meta-ARE/GAIA2 run using the sandbox sibling layout and official OpenAI API.
+# V2 reruns the 65-case seed development evaluation and uses deterministic
+# epoch-shuffled sampling because legacy seed reuse and agent-bandit sampling
+# are not supported by the V2 engine.
+schema_version: autosaddler/v2
+
+scenario:
+  type: meta_are
+  settings:
+    source_repo: ../../../Meta-ARE
+    base_revision: 395d1dd512add1e3aeb5a6a092490768b51e3ce5
+    data_mode: local_only
+    dataset_root: ../../../Meta-ARE/datasets_local/gaia2
+    dataset_source_revision: 78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99
+    dataset_source_descriptor: ../../../Meta-ARE/datasets_local/gaia2/.autosaddler-gaia2-source.json
+    train_manifest: ../datasets/GAIA2/train.json
+    development_manifest: ../datasets/GAIA2/val.json
+    test_manifest: ../datasets/GAIA2/test_universe_22.json
+    writable_paths:
+      - are/simulation/agents/default_agent
+      - are/simulation/agents/are_simulation_agent_config.py
+      - are/simulation/agents/agent_config_builder.py
+      - are/simulation/apps/agent_user_interface.py
+      - hook.json
+    forbidden_paths:
+      - are/simulation/validation
+      - are/simulation/scenarios
+      - are/simulation/benchmark
+      - are/simulation/benchmark.py
+      - are/simulation/tests
+      - are/simulation/data
+      - are/simulation/data_handler
+      - are/simulation/checkpoint
+      - are/simulation/tutorials
+      - are/simulation/gui
+    demo_filesystem_root: ../../../meta_are_data/gaia2_filesystem/132e26376f5e963bb59f64bcccdd02188cb08dee/demo_filesystem
+    demo_filesystem_source_revision: 132e26376f5e963bb59f64bcccdd02188cb08dee
+    demo_filesystem_source_descriptor: ../../../meta_are_data/gaia2_filesystem/132e26376f5e963bb59f64bcccdd02188cb08dee/source.json
+    demo_filesystem_manifest: ../../../meta_are_data/gaia2_filesystem/132e26376f5e963bb59f64bcccdd02188cb08dee/manifest.json
+    benchmark_config: autosaddler_selected
+    benchmark_split: validation
+    agent: default
+    model: gpt-5.5
+    model_provider: openai
+    model_wire_api: chat_completions
+    model_endpoint: https://api.openai.com/v1
+    reasoning_effort: xhigh
+    judge_model: gpt-5.5
+    judge_provider: openai
+    judge_endpoint: https://api.openai.com/v1
+    scenario_timeout_seconds: 1800
+    process_completion_grace_seconds: 60
+    verification_timeout_seconds: 300
+    repetitions: 1
+    max_concurrent: 3
+    infrastructure_retries: 1
+    import_check: from are.simulation.agents.default_agent import base_agent
+    capability_phase_iterations: 25
+
+optimization:
+  task_selection:
+    type: epoch_shuffled
+    batch_size: 3
+    seed: 42
+  acceptance:
+    type: matched_valid_strict_improvement
+  development:
+    type: full_on_accept
+  ranking:
+    type: mean_development_score
+  budget:
+    max_rollouts: 30000
+    max_iterations: 2000
+  diagnosis_patch_timeout_seconds: 18000
+  selection_timeout_seconds: 1800
+  reflection_timeout_seconds: 3600
+  session_retries: 2
+  session_retry_backoff_seconds: 15
+
+provider:
+  type: copilot
+  capabilities: [read_workspace, edit_workspace, run_commands, load_skills]
+  settings:
+    model: gpt-5.5
+    reasoning_effort: xhigh
+    provider:
+      type: openai
+      base_url: https://api.openai.com/v1
+      wire_api: responses
+      model_id: gpt-5.5
+      wire_model: gpt-5.5
+
+storage:
+  type: local
+  run_root: ../../../working_dir/outputs/v2_meta_are_full/runs

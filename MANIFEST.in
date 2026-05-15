@@ -1,0 +1,4 @@
+recursive-include configs *.yaml *.json *.md
+recursive-include docs *.md *.yaml
+recursive-include figures *.jpg
+recursive-include scripts *.sh *.py

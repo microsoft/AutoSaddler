@@ -1,0 +1,61 @@
+# Legacy V1 Meta-ARE smoke configuration using bounded GAIA2 split manifests.
+#
+# Usage:
+#   uv run python -m autosaddler.v1.adapters.meta_are_adapter.optimize \
+#       --config configs/v1/meta_are_smoke.yaml
+
+dataset:
+  train_file: ../datasets/GAIA2/train_smoke.json
+  val_file: ../datasets/GAIA2/val_smoke.json
+
+adapter:
+  meta_are_repo: ${META_ARE_REPO}
+  session_root_base: ${META_ARE_REPO}/autosaddler
+  dataset_path: ${META_ARE_REPO}/datasets_local/gaia2
+  activate_command: "source ${META_ARE_REPO}/.venv/bin/activate"
+  import_check_statement: "from are.simulation.agents.default_agent import base_agent"
+  base_branch: ${META_ARE_BASE_BRANCH:-main}
+  agent: default
+  model: ${AGENT_MODEL:-gpt-4.1-mini}
+  model_provider: ${AGENT_MODEL_PROVIDER:-openai}
+  model_endpoint: ${AGENT_MODEL_ENDPOINT}
+  reasoning_effort: ${AGENT_REASONING_EFFORT}
+  judge_model: ${JUDGE_MODEL:-gpt-4.1-mini}
+  judge_provider: ${JUDGE_MODEL_PROVIDER:-openai}
+  scenario_timeout: 7200
+  num_runs: 1
+  max_concurrent: 3
+
+optimization:
+  mutation_strategy: autosaddler
+  max_metric_calls: 50
+  max_candidate_proposals: 5
+  perfect_score: 1.0
+  frontier_type: instance
+  seed: 42
+  display_progress_bar: true
+
+autosaddler:
+  claude_agent_sdk_model: claude-opus-4-6
+  diagnosis_patch_timeout: 18000.0
+  reflection_timeout: 3600.0
+  candidate_selection_timeout: 1800.0
+  train_minibatch_size: 3
+  capability_phase_iterations: 0
+  capability_phase_epochs: 1
+  skip_session0: false
+
+sdk:
+  backend: claude
+  claude:
+    model: claude-opus-4-6
+    permission_mode: bypassPermissions
+    effort: max
+    allowed_tools: [Read, Glob, Grep, Agent, Write, Edit, Bash]
+    setting_sources: [project]
+    mcp_servers: {}
+    plugins: []
+  copilot:
+    model: gpt-5.4
+    effort: high
+    allowed_tools: [view, create, edit, bash, glob, grep, skill]

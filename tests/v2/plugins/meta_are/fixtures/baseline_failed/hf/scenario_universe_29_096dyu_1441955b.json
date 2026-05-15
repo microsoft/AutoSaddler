@@ -1,0 +1,43 @@
+{
+  "world_logs": [],
+  "apps": [],
+  "events": [],
+  "completed_events": [],
+  "version": "are_simulation_v1",
+  "context": null,
+  "augmentation": null,
+  "metadata": {
+    "definition": {
+      "scenario_id": "scenario_universe_29_096dyu",
+      "seed": 0,
+      "duration": 7200.0,
+      "run_number": null,
+      "has_exception": false,
+      "exception_type": null,
+      "exception_message": null,
+      "tags": ["Universe", "Adaptability"]
+    },
+    "simulation": {
+      "agent_id": "default",
+      "model_id": "gpt-5-mini"
+    },
+    "annotation": {
+      "validation_decision": "Invalid"
+    },
+    "execution": null,
+    "runner_config": {
+      "model": "gpt-5-mini",
+      "model_provider": "copilot",
+      "agent": "default",
+      "output_dir": "<run>/output",
+      "endpoint": "http://127.0.0.1:4144/v1",
+      "trace_dump_format": "both",
+      "judge_engine_config": {
+        "model_name": "Llama-3.3-70B-Instruct",
+        "provider": "azure",
+        "endpoint": null,
+        "reasoning_effort": null
+      }
+    }
+  }
+}

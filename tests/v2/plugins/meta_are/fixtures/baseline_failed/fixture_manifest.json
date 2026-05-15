@@ -1,0 +1,26 @@
+{
+  "schema_version": "autosaddler-meta-are-recorded-fixture/v1",
+  "source_run_id": "meta_are_baseline_20260808T080203Z",
+  "recorded_at_utc": "2026-08-08T08:28:25Z",
+  "raw_artifact_root": "outputs/phase6/meta_are_baseline_20260808T080203Z",
+  "source_artifact_sha256": {
+    "output.jsonl": "c5e0e87ffdc91ed71e92b6e9e5165ba17396508ec85100a06cc56119b46a4d3f",
+    "hf_trace": "98916d91ff7740837b11081ec2f570e8fc868df766348e8fcd4c5b40ad55870c",
+    "lite_trace": "1f9caefa4e9b1e589d858f7bf3bb67d650dd751a32af0c0926913866c68241e1"
+  },
+  "redactions": [
+    "Replaced the absolute run root with <run>.",
+    "Replaced the generated agent UUID with agent_redacted.",
+    "Replaced prompt, response, tool-result, app-state, and event payloads with structural projections."
+  ],
+  "expected": {
+    "scenario_id": "scenario_universe_29_096dyu",
+    "producer_run_number": null,
+    "normalized_repetition": 0,
+    "disposition": "task_failure",
+    "score": 0.0,
+    "has_exception": false,
+    "task_agent_calls": 1,
+    "judge_calls": 0
+  }
+}

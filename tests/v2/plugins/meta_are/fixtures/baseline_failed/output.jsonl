@@ -1,0 +1,1 @@
+{"task_id":"scenario_universe_29_096dyu","trace_id":"<run>/output/hf/scenario_universe_29_096dyu_1441955b.json","score":0.0,"metadata":{"scenario_id":"scenario_universe_29_096dyu","status":"failed","has_exception":false,"rationale":"Failure: \nAgent and oracle counters do not match for the following tools:\n- Tool 'CabApp__order_ride': Agent count 0, Oracle count 1"}}

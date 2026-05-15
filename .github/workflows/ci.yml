@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra dev --locked
+      - name: Lint
+        run: uv run ruff check src/autosaddler tests/
+      - name: Enforce public scenario boundary
+        run: |
+          if git grep -I -n -E 'copilot_studio|Copilot Studio|ThinkingBox|Agent17|RalphLoop|/DERA' -- . \
+            ':!.github/workflows/ci.yml'; then
+            echo "Private scenario material is not allowed in the public repository."
+            exit 1
+          fi
+      - name: Test
+        run: uv run python -m pytest tests/ -v --tb=short
+      - name: Build distributions
+        run: uv build

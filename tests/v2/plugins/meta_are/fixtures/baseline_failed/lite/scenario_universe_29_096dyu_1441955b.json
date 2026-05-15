@@ -1,0 +1,26 @@
+{
+  "scenario_id": "scenario_universe_29_096dyu",
+  "model_id": "gpt-5-mini",
+  "main_agent_type": "default",
+  "run_duration": 11.43559217453003,
+  "validation_decision": "Invalid",
+  "validation_rationale": "Failure: \nAgent and oracle counters do not match for the following tools:\n- Tool 'CabApp__order_ride': Agent count 0, Oracle count 1",
+  "per_agent_interaction_histories": {
+    "agent_redacted": [
+      {"role": "system", "content": "<redacted>", "attachments": [], "timestamp": 1728975600.041136},
+      {"role": "user", "content": "<redacted>", "attachments": [], "timestamp": 1728975600.0411732},
+      {"role": "assistant", "content": "<redacted>", "attachments": [], "timestamp": 1728975609.4341612},
+      {"role": "tool-response", "content": "<redacted>", "attachments": [], "timestamp": 1728975609.4346774}
+    ]
+  },
+  "per_agent_llm_usage_stats": {
+    "agent_redacted": {
+      "total_llm_calls": 1,
+      "prompt_tokens": [12283],
+      "completion_tokens": [1062],
+      "total_tokens": [13345],
+      "reasoning_tokens": [832],
+      "completion_duration": [9.391857147216797]
+    }
+  }
+}

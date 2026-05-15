@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+*.egg
+dist/
+build/
+logs/
+outputs/
+
+# Datasets
+data/gaia2_full/
+data/gaia2_smoke/
