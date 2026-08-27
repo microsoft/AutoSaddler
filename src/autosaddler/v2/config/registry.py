@@ -35,6 +35,7 @@ from autosaddler.v2.providers.copilot import (
     CopilotProviderConfig,
 )
 from autosaddler.v2.providers.fake import FakeAgentProvider, PaidWorkLedger
+from autosaddler.v2.providers.taskferry import TaskferryAgentProvider, TaskferryProviderConfig
 from autosaddler.v2.storage.local import LocalRunStore, TransitionHook
 
 _PROVIDER_SDK_DISTRIBUTIONS = {
@@ -135,6 +136,7 @@ def default_registry() -> Registry:
             "fake": lambda *, ledger, settings: _fake_provider(ledger, settings),
             "claude": _registered_claude_provider,
             "copilot": _registered_copilot_provider,
+            "taskferry": _registered_taskferry_provider,
         }
     )
     registry.task_selection["fixed"] = lambda *, batch_size, seed: FixedTaskSelectionPolicy(batch_size=batch_size)
@@ -217,6 +219,11 @@ def _registered_claude_provider(*, ledger, settings) -> ClaudeAgentProvider:
 def _registered_copilot_provider(*, ledger, settings) -> CopilotAgentProvider:
     del ledger
     return _copilot_provider(settings)
+
+
+def _registered_taskferry_provider(*, ledger, settings) -> TaskferryAgentProvider:
+    del ledger
+    return _taskferry_provider(settings)
 
 
 def build_runtime(
@@ -369,6 +376,22 @@ def _copilot_custom_provider(value: JsonValue | None) -> CopilotCustomProviderCo
     )
 
 
+def _taskferry_provider(settings: Mapping[str, JsonValue]) -> TaskferryAgentProvider:
+    expected = {"model", "variant", "executor", "sandboxed"}
+    missing = sorted({"model"} - settings.keys())
+    extra = sorted(settings.keys() - expected)
+    if missing or extra:
+        raise ValueError(f"Invalid keys at provider.settings for taskferry: missing={missing}, extra={extra}")
+    return TaskferryAgentProvider(
+        TaskferryProviderConfig(
+            model=_string(settings["model"], "provider.settings.model"),
+            variant=_optional_string(settings.get("variant"), "provider.settings.variant"),
+            executor=_optional_string(settings.get("executor"), "provider.settings.executor"),
+            sandboxed=_optional_bool(settings.get("sandboxed"), "provider.settings.sandboxed", default=True),
+        )
+    )
+
+
 def _resolved_entities(
     config: RunConfig,
     scenario: ScenarioComponents,
@@ -443,3 +466,11 @@ def _optional_string(value: JsonValue, path: str) -> str | None:
     if value is None:
         return None
     return _string(value, path)
+
+
+def _optional_bool(value: JsonValue, path: str, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise TypeError(f"{path} must be a boolean")
+    return value

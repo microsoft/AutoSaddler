@@ -33,6 +33,7 @@ from autosaddler.v2.providers.copilot import (
     _copilot_session_metrics,
     _export_copilot_session_state,
 )
+from autosaddler.v2.providers.taskferry import TaskferryAgentProvider
 
 
 class CapturingTransport:
@@ -475,6 +476,7 @@ def session_spec() -> SessionSpec:
     [
         (ClaudeAgentProvider, "CLAUDE.md", ".claude/skills"),
         (CopilotAgentProvider, "AGENTS.md", ".copilot/skills"),
+        (TaskferryAgentProvider, "AGENTS.md", ".opencode/skills"),
     ],
 )
 def test_provider_parity_preserves_semantic_session_assets(
@@ -523,7 +525,7 @@ def test_provider_parity_preserves_semantic_session_assets(
     assert rendered.allowed_tools
 
 
-@pytest.mark.parametrize("provider_type", [ClaudeAgentProvider, CopilotAgentProvider])
+@pytest.mark.parametrize("provider_type", [ClaudeAgentProvider, CopilotAgentProvider, TaskferryAgentProvider])
 def test_provider_rejects_skill_without_discovery_frontmatter(tmp_path: Path, provider_type) -> None:
     spec = replace(session_spec(), skills={"diagnose": "# Diagnose\n"})
     transport = CapturingTransport()
@@ -548,6 +550,7 @@ def test_provider_rejects_skill_without_discovery_frontmatter(tmp_path: Path, pr
     [
         (ClaudeAgentProvider, ".claude/skills"),
         (CopilotAgentProvider, ".copilot/skills"),
+        (TaskferryAgentProvider, ".opencode/skills"),
     ],
 )
 def test_provider_rejects_workspace_file_in_skill_directory(tmp_path: Path, provider_type, skill_root: str) -> None:

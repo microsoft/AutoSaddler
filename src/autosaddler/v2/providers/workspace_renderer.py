@@ -146,6 +146,16 @@ COPILOT_CAPABILITY_TO_TOOLS: Mapping[Capability, tuple[str, ...]] = MappingProxy
     }
 )
 
+TASKFERRY_CAPABILITY_TO_TOOLS: Mapping[Capability, tuple[str, ...]] = MappingProxyType(
+    {
+        "read_workspace": ("read", "glob", "grep"),
+        "edit_workspace": ("write", "edit"),
+        "run_commands": ("bash",),
+        "load_skills": ("skill",),
+        "network": ("webfetch", "websearch"),
+    }
+)
+
 
 def claude_renderer() -> WorkspaceRenderer:
     return WorkspaceRenderer(
@@ -162,4 +172,13 @@ def copilot_renderer() -> WorkspaceRenderer:
         instruction_file="AGENTS.md",
         skill_directory=".copilot/skills",
         capability_tools=COPILOT_CAPABILITY_TO_TOOLS,
+    )
+
+
+def taskferry_renderer() -> WorkspaceRenderer:
+    return WorkspaceRenderer(
+        provider="taskferry",
+        instruction_file="AGENTS.md",
+        skill_directory=".opencode/skills",
+        capability_tools=TASKFERRY_CAPABILITY_TO_TOOLS,
     )

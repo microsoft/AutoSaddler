@@ -108,7 +108,29 @@ The current repository includes:
 | Meta-ARE Default ReAct Agent (`meta_are`) | Git repository | GAIA2 | End-to-end smoke experiments |
 
 V2 supports immutable, content-addressed component-map and Git candidate spaces. Optimizer sessions
-can use the built-in fake provider, Anthropic Claude Agent SDK, or GitHub Copilot SDK transport.
+can use the built-in fake provider, Anthropic Claude Agent SDK, GitHub Copilot SDK transport, or a
+TaskFerry-dispatch opencode/pi worker (`taskferry` provider).
+
+The `taskferry` provider runs each optimizer session as its own sandboxed TaskFerry task
+(`--no-overlay`, so the worker's writes land directly in the auto-generated session workspace),
+waits for settlement, and records the reported tokens and cost in the usage ledger. Configure it
+with the worker model inside `provider.settings`:
+
+```yaml
+provider:
+  type: taskferry
+  capabilities: [read_workspace, edit_workspace, run_commands, load_skills, network]
+  settings:
+    model: openai/gpt-5.6
+    variant: default
+    executor: opencode
+    sandboxed: true
+```
+
+`model` is required and must name a model the TaskFerry daemon can route (see TaskFerry's
+`choosing-a-model` conventions). `variant`, `executor` (`opencode` or `pi`), and `sandboxed`
+(default `true`) are optional. Sessions are dispatched with a `--class` of `autosaddler-v2` so
+they are identifiable in `taskferry list`.
 
 Integrations for additional harnesses (e.g., **OpenClaw** and **Codex**) and benchmarks (e.g., **Terminal-Bench**) are coming. Stay tuned!
 
