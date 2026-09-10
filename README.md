@@ -108,7 +108,7 @@ The current repository includes:
 | Meta-ARE Default ReAct Agent (`meta_are`) | Git repository | GAIA2 | End-to-end smoke experiments |
 
 V2 supports immutable, content-addressed component-map and Git candidate spaces. Optimizer sessions
-can use the built-in fake provider, Anthropic Claude Agent SDK, or GitHub Copilot SDK transport.
+can use the built-in fake provider, Anthropic Claude Agent SDK, GitHub Copilot SDK, or Codex CLI transport.
 
 Integrations for additional harnesses (e.g., **OpenClaw** and **Codex**) and benchmarks (e.g., **Terminal-Bench**) are coming. Stay tuned!
 
@@ -132,6 +132,7 @@ Included configurations:
 | Path | Purpose |
 |---|---|
 | `configs/v2/local_template.yaml` | Credential-free deterministic V2 template |
+| `configs/v2/codex_local_smoke.yaml` | Real Codex optimizer with the deterministic local evaluator |
 | `configs/v2/meta_are_smoke.yaml` | Current Meta-ARE/GAIA2 smoke integration |
 | `configs/v1/meta_are.yaml` | Legacy full Meta-ARE/GAIA2 run |
 | `configs/v1/meta_are_smoke.yaml` | Legacy bounded smoke run |
@@ -139,6 +140,61 @@ Included configurations:
 
 Configuration is strict and fail-closed. A run ID can be reused only when all resolved inputs are
 byte-identical; changed source revisions, manifests, settings, or provenance are rejected.
+
+### Codex optimizer provider
+
+Install and authenticate the [Codex CLI](https://developers.openai.com/codex/cli/)
+before selecting `provider.type: codex`. The transport uses
+[`codex exec --json`](https://developers.openai.com/codex/noninteractive/) and has
+been tested with CLI 0.153.0. Authentication is handled by Codex; credentials do
+not belong in the YAML configuration.
+
+```yaml
+provider:
+  type: codex
+  capabilities: [read_workspace, edit_workspace, run_commands, load_skills]
+  settings:
+    model: gpt-5.5
+    reasoning_effort: low
+    executable: codex
+```
+
+`model` and `reasoning_effort` are required; use `null` for the latter to use
+Codex's default effort. Choose a model available to your Codex account.
+`executable` is optional and defaults to `codex` on `PATH`.
+
+The provider stages `AGENTS.md` and `.agents/skills/`, supplies the session's
+instructions explicitly, and disables automatic ancestor instruction loading.
+It ignores user CLI configuration to keep provider settings explicit. Codex
+writes the existing `.autosaddler/session_output.json` contract, which
+AutoSaddler validates against the scenario's schema. This supports the same
+schemas as the other providers without requiring OpenAI's narrower structured
+output schema format.
+
+Sessions use the workspace-write sandbox when editing is requested and the
+read-only sandbox otherwise. Network access and web search are disabled unless
+the session requests the `network` capability. Codex uses shell commands for
+workspace reads, so these controls are sandbox permissions, not a per-tool
+allowlist. No approval or sandbox bypass flag is used.
+
+JSONL events and stderr are exported under `sessions/*/codex-session-state/`,
+including on failure. Token usage includes cached-input and reasoning counters
+when reported; no dollar cost is inferred. The CLI version is recorded in run
+provenance, so upgrading Codex requires a new run ID.
+
+Run the bounded local integration check with:
+
+```bash
+uv run python -m autosaddler.v2.cli \
+  --config configs/v2/codex_local_smoke.yaml \
+  --run-id codex-local-smoke
+```
+
+This uses real Codex sessions and consumes account quota; only the evaluator is
+deterministic. Repeating the command resumes the same run. For the Meta-ARE
+integration, follow the provisioning steps below and replace the smoke config's
+provider section with the Codex settings above. Its task agent and judge still
+require their own API credentials.
 
 ## 🔬 Reproducing the Included GAIA2 Smoke Run
 

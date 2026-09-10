@@ -27,6 +27,7 @@ PROVIDER_ASSETS = (
     PurePosixPath("AGENTS.md"),
     PurePosixPath(".claude"),
     PurePosixPath(".copilot"),
+    PurePosixPath(".agents"),
     PurePosixPath(".autosaddler"),
 )
 SANITIZED_SOURCE_ASSETS = (PurePosixPath(".github"),)
