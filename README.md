@@ -167,7 +167,8 @@ The provider stages `AGENTS.md` and `.agents/skills/`, supplies the session's
 instructions explicitly, and disables automatic ancestor instruction loading.
 It ignores user CLI configuration to keep provider settings explicit. Codex
 writes the existing `.autosaddler/session_output.json` contract, which
-AutoSaddler validates against the scenario's schema. This supports the same
+AutoSaddler validates against the scenario's schema. Read-only sessions return
+the JSON object in their final response instead. This supports the same
 schemas as the other providers without requiring OpenAI's narrower structured
 output schema format.
 

@@ -122,6 +122,13 @@ class CodexCliTransport:
     def _command(self, session: RenderedSession) -> list[str]:
         writable = "edit_workspace" in session.allowed_tools
         network = "network" in session.allowed_tools
+        instructions = session.instruction_path.read_text(encoding="utf-8")
+        if not writable:
+            instructions = (
+                f"{session.system_context.rstrip()}\n\n## Structured output\n\n"
+                "Follow `.autosaddler/session_output_schema.json` and return the final JSON object "
+                "as your final response. Do not write workspace files.\n"
+            )
         command = [
             self.config.executable,
             "exec",
@@ -140,7 +147,7 @@ class CodexCliTransport:
             "-c",
             "project_doc_max_bytes=0",
             "-c",
-            "developer_instructions=" + json.dumps(session.instruction_path.read_text(encoding="utf-8"), ensure_ascii=False),
+            "developer_instructions=" + json.dumps(instructions, ensure_ascii=False),
             "-c",
             'web_search="live"' if network else 'web_search="disabled"',
             "-c",

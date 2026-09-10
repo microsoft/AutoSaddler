@@ -61,9 +61,11 @@ emit({"type": "item.completed", "item": {
 response = {"change": "improved"} if mode != "schema" else {"wrong": True}
 if (root / ".autosaddler/fake_response.json").exists():
     response = json.loads((root / ".autosaddler/fake_response.json").read_text())
-if mode != "missing":
+readonly = sys.argv[sys.argv.index("--sandbox") + 1] == "read-only"
+if mode != "missing" and not readonly:
     (root / ".autosaddler/session_output.json").write_text(json.dumps(response))
-emit({"type": "item.completed", "item": {"id": "message", "type": "agent_message", "text": "Done"}})
+emit({"type": "item.completed", "item": {
+    "id": "message", "type": "agent_message", "text": json.dumps(response) if readonly else "Done"}})
 emit({"type": "turn.completed", "usage": {
     "input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}})
 if mode == "exit":
@@ -161,6 +163,10 @@ def test_read_only_and_network_capabilities(tmp_path: Path, codex_cli: Path) -> 
     args = json.loads((req.workspace / "invocation.json").read_text())["args"]
     assert args[args.index("--sandbox") + 1] == "read-only"
     assert 'web_search="live"' in args
+    assert not (req.workspace / ".autosaddler/session_output.json").exists()
+    assert result.structured_output == {"change": "improved"}
+    instructions = next(arg for arg in args if arg.startswith("developer_instructions="))
+    assert "Do not write workspace files" in tomllib.loads(instructions)["developer_instructions"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process group cleanup")
