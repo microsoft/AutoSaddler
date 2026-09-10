@@ -164,7 +164,7 @@ Clone the adapted Meta-ARE repository at the revision pinned by the config:
 ```bash
 cd ..
 git clone https://github.com/pshlego/Meta-ARE.git Meta-ARE
-git -C Meta-ARE checkout --detach 2419824a94fb8211fc8227ada7bff1b29f86e563
+git -C Meta-ARE checkout --detach 395d1dd512add1e3aeb5a6a092490768b51e3ce5
 mkdir -p working_dir
 cd AutoSaddler
 uv sync --extra meta-are-setup
@@ -177,7 +177,7 @@ Provision the seven manifest-selected GAIA2 payloads from the pinned Hugging Fac
 
 ```bash
 uv run --extra meta-are-setup python scripts/meta_are/provision_gaia2_scenarios.py \
-  --destination-root "$PWD/../Meta-ARE/datasets_local/gaia2" \
+  --destination-root "$PWD/../Meta-ARE/datasets_local/gaia2_smoke" \
   --revision 78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99
 ```
 
