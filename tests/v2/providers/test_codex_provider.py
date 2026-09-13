@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +13,7 @@ import yaml
 
 from autosaddler.v2.config.registry import build_runtime
 from autosaddler.v2.prompting.models import SessionRequest, SessionSpec
-from autosaddler.v2.providers.codex import CodexAgentProvider, CodexProviderConfig, _codex_usage
+from autosaddler.v2.providers.codex import CodexAgentProvider, CodexProviderConfig, _codex_usage, codex_runtime
 
 
 @pytest.fixture
@@ -39,6 +40,16 @@ def emit(value):
     print(json.dumps(value), flush=True)
 emit({"type": "thread.started", "thread_id": "codex-thread"})
 emit({"type": "turn.started"})
+if mode == "retry":
+    emit({"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion)"})
+if mode == "background":
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    (root / "child.pid").write_text(str(child.pid))
+    (root / "group.id").write_text(str(os.getpgid(0)))
 if mode in ("timeout", "cancel"):
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     (root / "child.pid").write_text(str(child.pid))
@@ -132,6 +143,7 @@ def test_cli_transport_returns_output_usage_tools_and_trace(tmp_path: Path, code
     assert "sandbox_workspace_write.network_access=false" in args
     assert "--ignore-user-config" in args
     assert "project_doc_max_bytes=0" in args
+    assert "--strict-config" in args
     instructions = next(arg for arg in args if arg.startswith("developer_instructions="))
     assert req.spec.system_context in tomllib.loads(instructions)["developer_instructions"]
     assert not any("dangerously" in arg for arg in args)
@@ -139,6 +151,8 @@ def test_cli_transport_returns_output_usage_tools_and_trace(tmp_path: Path, code
     manifest = json.loads((trace / "export-manifest.json").read_text())
     assert manifest["status"] == "completed"
     assert manifest["codex_thread_id"] == "codex-thread"
+    assert manifest["schema_version"] == "autosaddler-codex-trace-export/v1"
+    assert manifest["sensitive"] is True
     assert len((trace / "events.jsonl").read_text().splitlines()) == 6
 
 
@@ -153,6 +167,42 @@ def test_failures_cannot_become_success(tmp_path: Path, codex_cli: Path, mode: s
     assert (req.trace_dir / "codex-session-state/events.jsonl").exists()
     if mode == "exit":
         assert "status 2" in result.error
+
+
+def test_recoverable_error_event_does_not_fail_session(tmp_path: Path, codex_cli: Path) -> None:
+    req = request(tmp_path)
+    req.workspace.mkdir()
+    (req.workspace / "mode").write_text("retry")
+    result = asyncio.run(provider(codex_cli).run(req))
+    assert result.status == "completed"
+    assert result.structured_output == {"change": "improved"}
+    manifest = json.loads((req.trace_dir / "codex-session-state/export-manifest.json").read_text())
+    assert manifest["status"] == "completed"
+
+
+def test_manifest_write_failure_preserves_session_error(tmp_path: Path, codex_cli: Path) -> None:
+    req = request(tmp_path)
+    req.workspace.mkdir()
+    (req.workspace / "mode").write_text("exit")
+    (req.trace_dir / "codex-session-state/export-manifest.json").mkdir(parents=True)
+    result = asyncio.run(provider(codex_cli).run(req))
+    assert result.status == "failed"
+    assert "status 2" in result.error
+
+
+def test_danger_full_access_sandbox_is_explicit_opt_in(tmp_path: Path, codex_cli: Path) -> None:
+    req = request(tmp_path)
+    config = CodexProviderConfig(
+        model="test-model",
+        reasoning_effort="low",
+        executable=str(codex_cli),
+        sandbox_mode="danger-full-access",
+    )
+    result = asyncio.run(CodexAgentProvider(config).run(req))
+    assert result.status == "completed"
+    args = json.loads((req.workspace / "invocation.json").read_text())["args"]
+    assert args[args.index("--sandbox") + 1] == "danger-full-access"
+    assert not any("dangerously" in arg for arg in args)
 
 
 def test_read_only_and_network_capabilities(tmp_path: Path, codex_cli: Path) -> None:
@@ -205,6 +255,31 @@ def test_timeout_and_cancellation_reap_cli_and_child(tmp_path: Path, codex_cli: 
     assert manifest["status"] in {"timeout", "interrupted"}
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process group cleanup")
+def test_completed_session_stops_background_tools(tmp_path: Path, codex_cli: Path) -> None:
+    req = request(tmp_path)
+    req.workspace.mkdir()
+    (req.workspace / "mode").write_text("background")
+    result = asyncio.run(provider(codex_cli).run(req))
+    assert result.status == "completed"
+    child = int((req.workspace / "child.pid").read_text())
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(child)], capture_output=True, text=True).stdout.strip()
+    assert not state or state.startswith("Z")
+    group = int((req.workspace / "group.id").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.killpg(group, 0)
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_codex_runtime_reports_unrunnable_cli(tmp_path: Path, broken: bool) -> None:
+    executable = tmp_path / "codex"
+    if broken:
+        executable.write_text("#!/bin/sh\nexit 1\n")
+        executable.chmod(0o755)
+    with pytest.raises(RuntimeError, match="Codex CLI is not runnable"):
+        codex_runtime(str(executable))
+
+
 @pytest.mark.parametrize("counter", [-1, True, "10", 1.5, None])
 def test_invalid_usage_is_rejected(counter) -> None:
     with pytest.raises(ValueError, match="usage counter"):
@@ -246,7 +321,10 @@ def test_codex_optimization_and_resume_preserve_usage_and_cli_provenance(tmp_pat
         build_runtime(path, run_id="codex-run")
 
 
-@pytest.mark.parametrize("change", [{"unknown": True}, {"model": ""}, {"executable": ""}])
+@pytest.mark.parametrize(
+    "change",
+    [{"unknown": True}, {"model": ""}, {"executable": ""}, {"sandbox_mode": "workspace-write"}],
+)
 def test_codex_registry_rejects_invalid_settings(tmp_path: Path, codex_cli: Path, change: dict) -> None:
     path = config_path(tmp_path, codex_cli)
     config = yaml.safe_load(path.read_text())
@@ -254,3 +332,12 @@ def test_codex_registry_rejects_invalid_settings(tmp_path: Path, codex_cli: Path
     path.write_text(yaml.safe_dump(config))
     with pytest.raises((ValueError, TypeError)):
         build_runtime(path, run_id="invalid-codex")
+
+
+def test_codex_registry_accepts_danger_full_access(tmp_path: Path, codex_cli: Path) -> None:
+    path = config_path(tmp_path, codex_cli)
+    config = yaml.safe_load(path.read_text())
+    config["provider"]["settings"]["sandbox_mode"] = "danger-full-access"
+    path.write_text(yaml.safe_dump(config))
+    runtime = build_runtime(path, run_id="danger-codex")
+    assert runtime.provider._transport.config.sandbox_mode == "danger-full-access"

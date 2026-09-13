@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -13,12 +15,19 @@ from autosaddler.v2.prompting.models import ToolCall, Usage
 from autosaddler.v2.providers.base import AgentTransport, BaseAgentProvider, TransportOutcome, observe_usage
 from autosaddler.v2.providers.workspace_renderer import RenderedSession, codex_renderer
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class CodexProviderConfig:
     model: str
     reasoning_effort: str | None = None
     executable: str = "codex"
+    sandbox_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.sandbox_mode not in (None, "danger-full-access"):
+            raise ValueError("Codex sandbox_mode must be null or 'danger-full-access'")
 
 
 class CodexAgentProvider(BaseAgentProvider):
@@ -37,13 +46,16 @@ class CodexAgentProvider(BaseAgentProvider):
 
 def codex_runtime(executable: str) -> Mapping[str, JsonValue]:
     """Resolve the CLI version before initializing or resuming a run."""
-    result = subprocess.run(
-        [executable, "--version"],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"Codex CLI is not runnable: {executable}") from error
     cli_version = result.stdout.strip()
     if not cli_version.startswith("codex-cli "):
         raise ValueError("Codex executable did not report a codex-cli version")
@@ -60,19 +72,22 @@ class CodexCliTransport:
         events = _CodexEvents(self.config)
         status = "failed"
         process: asyncio.subprocess.Process | None = None
+        process_group: asyncio.subprocess.Process | None = None
         try:
             with (
                 (trace_root / "events.jsonl").open("wb") as transcript,
                 (trace_root / "stderr.log").open("wb") as stderr,
             ):
                 async with asyncio.timeout(timeout_seconds):
+                    if os.name == "posix":
+                        process_group = await _hold_process_group()
                     process = await asyncio.create_subprocess_exec(
                         *self._command(session),
                         cwd=session.workspace,
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=stderr,
-                        start_new_session=os.name == "posix",
+                        process_group=process_group.pid if process_group is not None else None,
                         limit=4 * 1024 * 1024,
                     )
                     assert process.stdin is not None and process.stdout is not None
@@ -102,22 +117,25 @@ class CodexCliTransport:
             status = "interrupted"
             raise
         finally:
-            if process is not None:
-                await _stop_process(process)
-            (trace_root / "export-manifest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": "autosaddler-codex-session-state/v1",
-                        "status": status,
-                        "session_id": session.session_id,
-                        "codex_thread_id": events.thread_id,
-                        "files": ["events.jsonl", "stderr.log"],
-                    },
-                    indent=2,
+            await _stop_processes(process, process_group)
+            try:
+                (trace_root / "export-manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "autosaddler-codex-trace-export/v1",
+                            "status": status,
+                            "session_id": session.session_id,
+                            "codex_thread_id": events.thread_id,
+                            "files": ["events.jsonl", "stderr.log"],
+                            "sensitive": True,
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
                 )
-                + "\n",
-                encoding="utf-8",
-            )
+            except Exception:
+                logger.warning("Failed to write Codex trace export manifest", exc_info=True)
 
     def _command(self, session: RenderedSession) -> list[str]:
         writable = "edit_workspace" in session.allowed_tools
@@ -138,10 +156,11 @@ class CodexCliTransport:
             "--skip-git-repo-check",
             "--ephemeral",
             "--ignore-user-config",
+            "--strict-config",
             "--model",
             self.config.model,
             "--sandbox",
-            "workspace-write" if writable else "read-only",
+            self.config.sandbox_mode or ("workspace-write" if writable else "read-only"),
             "-c",
             'approval_policy="never"',
             "-c",
@@ -176,7 +195,7 @@ class _CodexEvents:
         event_type = event["type"]
         if event_type == "thread.started":
             self.thread_id = event["thread_id"]
-        elif event_type in {"turn.failed", "error"}:
+        elif event_type == "turn.failed":
             raise RuntimeError("Codex reported a failed turn; see the session trace")
         elif event_type == "turn.completed":
             if self.completed:
@@ -233,14 +252,35 @@ def _codex_usage(value: Mapping[str, JsonValue], config: CodexProviderConfig, th
     )
 
 
-async def _stop_process(process: asyncio.subprocess.Process) -> None:
-    """Reap the CLI and stop its tools when a session is cancelled or fails."""
-    if os.name == "posix":
+async def _hold_process_group() -> asyncio.subprocess.Process:
+    """Start an idle process whose group the CLI joins.
+
+    The group ID stays reserved while this process lives, so cleanup cannot
+    signal an unrelated group that reused the CLI's PID after it exited.
+    """
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys; sys.stdin.buffer.read()",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        process_group=0,
+    )
+
+
+async def _stop_processes(
+    process: asyncio.subprocess.Process | None,
+    process_group: asyncio.subprocess.Process | None,
+) -> None:
+    """Stop the CLI and every tool it started, then reap them."""
+    if process_group is not None:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process_group.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    elif process.returncode is None:
+        await process_group.wait()
+    elif process is not None and process.returncode is None:
         killer = await asyncio.create_subprocess_exec(
             "taskkill",
             "/PID",
@@ -251,4 +291,5 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
             stderr=asyncio.subprocess.DEVNULL,
         )
         await killer.wait()
-    await process.wait()
+    if process is not None:
+        await process.wait()

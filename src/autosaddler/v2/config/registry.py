@@ -225,7 +225,7 @@ def _registered_codex_provider(*, ledger, settings) -> CodexAgentProvider:
     del ledger
     required = {"model", "reasoning_effort"}
     missing = sorted(required - settings.keys())
-    extra = sorted(settings.keys() - required - {"executable"})
+    extra = sorted(settings.keys() - required - {"executable", "sandbox_mode"})
     if missing or extra:
         raise ValueError(f"Invalid keys at provider.settings for codex: missing={missing}, extra={extra}")
     return CodexAgentProvider(
@@ -233,6 +233,7 @@ def _registered_codex_provider(*, ledger, settings) -> CodexAgentProvider:
             model=_string(settings["model"], "provider.settings.model"),
             reasoning_effort=_optional_string(settings["reasoning_effort"], "provider.settings.reasoning_effort"),
             executable=_string(settings.get("executable", "codex"), "provider.settings.executable"),
+            sandbox_mode=_optional_string(settings.get("sandbox_mode"), "provider.settings.sandbox_mode"),
         )
     )
 
