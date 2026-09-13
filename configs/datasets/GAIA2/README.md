@@ -29,7 +29,7 @@ README:
 
 ```bash
 uv run --extra meta-are-setup python scripts/meta_are/provision_gaia2_scenarios.py \
-	--destination-root "$PWD/../Meta-ARE/datasets_local/gaia2" \
+	--destination-root "$PWD/../Meta-ARE/datasets_local/gaia2_smoke" \
 	--revision 78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99
 ```
 
