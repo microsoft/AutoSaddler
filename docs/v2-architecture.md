@@ -45,7 +45,7 @@ evaluation, ranking, and budget decisions.
 | `harness` | Content-addressed component-map and Git candidate spaces |
 | `plugins` | Scenario-specific settings, evaluation, evidence, prompts, and verification |
 | `prompting` | Session contracts, shared methodology assets, composition, and history rendering |
-| `providers` | Optimizer session adapters for fake, Claude, and GitHub Copilot transports |
+| `providers` | Optimizer session adapters for fake, Claude, GitHub Copilot, and Codex transports |
 | `storage` | Local event store, artifacts, replay, snapshots, metrics, resume, and fork support |
 
 Dependency direction points inward: plugins and providers implement protocols from `core` and

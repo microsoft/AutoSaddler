@@ -131,6 +131,8 @@ def test_git_space_attempt_delta_ignores_provider_namespace_only(tmp_path: Path)
     shutil.copytree(session.workspace, attempt_workspace)
     (attempt_workspace / ".autosaddler/session_context.json").write_text("{}\n", encoding="utf-8")
     (attempt_workspace / ".autosaddler/training_evidence.json").write_text("{}\n", encoding="utf-8")
+    (attempt_workspace / ".agents/skills/method").mkdir(parents=True)
+    (attempt_workspace / ".agents/skills/method/SKILL.md").write_text("provider skill\n")
     (attempt_workspace / "candidate/instructions.txt").write_text(
         "provider edit\n",
         encoding="utf-8",
@@ -380,6 +382,8 @@ def test_git_candidate_identity_excludes_provider_assets(tmp_path: Path) -> None
     (session.workspace / "AGENTS.md").write_text("provider instructions\n")
     (session.workspace / ".copilot").mkdir()
     (session.workspace / ".copilot/instructions.md").write_text("provider instructions\n")
+    (session.workspace / ".agents/skills/method").mkdir(parents=True)
+    (session.workspace / ".agents/skills/method/SKILL.md").write_text("provider skill\n")
     (session.workspace / "candidate/instructions.txt").write_text("candidate edit\n")
 
     child = harness.finalize(session)
@@ -390,6 +394,7 @@ def test_git_candidate_identity_excludes_provider_assets(tmp_path: Path) -> None
     try:
         assert not (materialized.root / "AGENTS.md").exists()
         assert not (materialized.root / ".copilot").exists()
+        assert not (materialized.root / ".agents").exists()
     finally:
         materialized.release()
 

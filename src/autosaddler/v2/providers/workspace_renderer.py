@@ -163,3 +163,14 @@ def copilot_renderer() -> WorkspaceRenderer:
         skill_directory=".copilot/skills",
         capability_tools=COPILOT_CAPABILITY_TO_TOOLS,
     )
+
+
+def codex_renderer() -> WorkspaceRenderer:
+    # Codex uses a shell for workspace reads. Its sandbox controls writes and
+    # network access rather than exposing the SDKs' per-tool allowlists.
+    return WorkspaceRenderer(
+        provider="codex",
+        instruction_file="AGENTS.md",
+        skill_directory=".agents/skills",
+        capability_tools={capability: (capability,) for capability in CLAUDE_CAPABILITY_TO_TOOLS},
+    )

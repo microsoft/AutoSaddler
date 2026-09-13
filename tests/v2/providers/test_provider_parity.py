@@ -15,6 +15,7 @@ import yaml
 
 from autosaddler.v2.prompting.models import SessionRequest, SessionSpec, ToolCall, Usage
 from autosaddler.v2.providers.base import TransportOutcome
+from autosaddler.v2.providers.codex import CodexAgentProvider
 from autosaddler.v2.providers.claude import (
     ClaudeAgentProvider,
     ClaudeProviderConfig,
@@ -474,6 +475,7 @@ def session_spec() -> SessionSpec:
     ("provider_type", "instruction_file", "skill_root"),
     [
         (ClaudeAgentProvider, "CLAUDE.md", ".claude/skills"),
+        (CodexAgentProvider, "AGENTS.md", ".agents/skills"),
         (CopilotAgentProvider, "AGENTS.md", ".copilot/skills"),
     ],
 )
@@ -523,7 +525,7 @@ def test_provider_parity_preserves_semantic_session_assets(
     assert rendered.allowed_tools
 
 
-@pytest.mark.parametrize("provider_type", [ClaudeAgentProvider, CopilotAgentProvider])
+@pytest.mark.parametrize("provider_type", [ClaudeAgentProvider, CopilotAgentProvider, CodexAgentProvider])
 def test_provider_rejects_skill_without_discovery_frontmatter(tmp_path: Path, provider_type) -> None:
     spec = replace(session_spec(), skills={"diagnose": "# Diagnose\n"})
     transport = CapturingTransport()
@@ -547,6 +549,7 @@ def test_provider_rejects_skill_without_discovery_frontmatter(tmp_path: Path, pr
     ("provider_type", "skill_root"),
     [
         (ClaudeAgentProvider, ".claude/skills"),
+        (CodexAgentProvider, ".agents/skills"),
         (CopilotAgentProvider, ".copilot/skills"),
     ],
 )

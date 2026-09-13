@@ -29,6 +29,7 @@ from autosaddler.v2.plugins.api import (
 from autosaddler.v2.plugins.fake import FakeScenarioSettings, build_fake_components
 from autosaddler.v2.plugins.meta_are.plugin import build_meta_are_components
 from autosaddler.v2.providers.claude import ClaudeAgentProvider, ClaudeProviderConfig
+from autosaddler.v2.providers.codex import CodexAgentProvider, CodexProviderConfig, codex_runtime
 from autosaddler.v2.providers.copilot import (
     CopilotAgentProvider,
     CopilotCustomProviderConfig,
@@ -134,6 +135,7 @@ def default_registry() -> Registry:
         {
             "fake": lambda *, ledger, settings: _fake_provider(ledger, settings),
             "claude": _registered_claude_provider,
+            "codex": _registered_codex_provider,
             "copilot": _registered_copilot_provider,
         }
     )
@@ -217,6 +219,23 @@ def _registered_claude_provider(*, ledger, settings) -> ClaudeAgentProvider:
 def _registered_copilot_provider(*, ledger, settings) -> CopilotAgentProvider:
     del ledger
     return _copilot_provider(settings)
+
+
+def _registered_codex_provider(*, ledger, settings) -> CodexAgentProvider:
+    del ledger
+    required = {"model", "reasoning_effort"}
+    missing = sorted(required - settings.keys())
+    extra = sorted(settings.keys() - required - {"executable", "sandbox_mode"})
+    if missing or extra:
+        raise ValueError(f"Invalid keys at provider.settings for codex: missing={missing}, extra={extra}")
+    return CodexAgentProvider(
+        CodexProviderConfig(
+            model=_string(settings["model"], "provider.settings.model"),
+            reasoning_effort=_optional_string(settings["reasoning_effort"], "provider.settings.reasoning_effort"),
+            executable=_string(settings.get("executable", "codex"), "provider.settings.executable"),
+            sandbox_mode=_optional_string(settings.get("sandbox_mode"), "provider.settings.sandbox_mode"),
+        )
+    )
 
 
 def build_runtime(
@@ -383,7 +402,7 @@ def _resolved_entities(
             "components": ["harness_space", "evaluator", "evidence_builder", "prompt_pack"],
         },
         "resolved/scenario_runtime.json": scenario_registration.resolved_entity(scenario),
-        "resolved/provider_runtime.json": _provider_runtime(config.provider.type),
+        "resolved/provider_runtime.json": _provider_runtime(config.provider.type, config.provider.settings),
         "resolved/policies.json": {
             "task_selection": config.optimization.task_selection.type,
             "acceptance": config.optimization.acceptance.type,
@@ -410,7 +429,18 @@ def _resolved_entities(
     return {**common, **scenario.resolved_entities}
 
 
-def _provider_runtime(provider_type: str) -> Mapping[str, JsonValue]:
+def _provider_runtime(
+    provider_type: str,
+    settings: Mapping[str, JsonValue] | None = None,
+) -> Mapping[str, JsonValue]:
+    if provider_type == "codex":
+        executable = _string((settings or {}).get("executable", "codex"), "provider.settings.executable")
+        return {
+            "schema_version": "autosaddler-provider-runtime/v1",
+            "provider_type": provider_type,
+            "sdk": None,
+            "cli": codex_runtime(executable),
+        }
     distribution = _PROVIDER_SDK_DISTRIBUTIONS.get(provider_type)
     sdk: Mapping[str, JsonValue] | None = None
     if distribution is not None:

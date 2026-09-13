@@ -72,7 +72,7 @@ Repeating the command resumes the same run after validating its resolved inputs.
 ```text
 AutoSaddler/
 ├── configs/                 # V1/V2 configs and benchmark split manifests
-├── docs/                    # Architecture and scenario-integration guides
+├── docs/                    # Architecture, scenario-integration, and provider guides
 ├── figures/                 # README and paper figures
 ├── scripts/                 # Data provisioning and legacy launch scripts
 ├── src/autosaddler/v1/      # Legacy implementation
@@ -108,7 +108,10 @@ The current repository includes:
 | Meta-ARE Default ReAct Agent (`meta_are`) | Git repository | GAIA2 | End-to-end smoke experiments |
 
 V2 supports immutable, content-addressed component-map and Git candidate spaces. Optimizer sessions
-can use the built-in fake provider, Anthropic Claude Agent SDK, or GitHub Copilot SDK transport.
+can use the built-in fake provider, Anthropic Claude Agent SDK, GitHub Copilot SDK, or Codex CLI transport.
+
+> [!WARNING]
+> The Codex provider relies on CLI-based execution and therefore introduces subprocess usage. See the [Codex provider guide](docs/codex-provider.md).
 
 Integrations for additional harnesses (e.g., **OpenClaw** and **Codex**) and benchmarks (e.g., **Terminal-Bench**) are coming. Stay tuned!
 
@@ -132,6 +135,7 @@ Included configurations:
 | Path | Purpose |
 |---|---|
 | `configs/v2/local_template.yaml` | Credential-free deterministic V2 template |
+| `configs/v2/codex_local_smoke.yaml` | Real Codex optimizer with the deterministic local evaluator |
 | `configs/v2/meta_are_smoke.yaml` | Current Meta-ARE/GAIA2 smoke integration |
 | `configs/v1/meta_are.yaml` | Legacy full Meta-ARE/GAIA2 run |
 | `configs/v1/meta_are_smoke.yaml` | Legacy bounded smoke run |
