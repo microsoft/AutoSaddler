@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12-3.14](https://img.shields.io/badge/Python-3.12--3.14-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![arXiv: 2608.23041](https://img.shields.io/badge/arXiv-2608.23041-b31b1b.svg?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.23041)
+[![NeurIPS 2026](https://img.shields.io/badge/NeurIPS-2026-68448B.svg)](https://neurips.cc/Conferences/2026)
 
 **AutoSaddler automatically improves LLM-agent harnesses by diagnosing execution traces, applying structured updates to prompts, tools, and middleware, and selecting changes that generalize.**
 
@@ -20,6 +21,12 @@ Preliminary results report the following test Pass@1 scores across benchmarks an
 | SWE-Bench Pro | SWE-agent | 37.3 | **46.9** | **+9.6 pp** |
 | Terminal-Bench 2.0 | Terminus 2 | 40.0 | **50.0** | **+10.0 pp** |
 
+Papers with Code lists these results as dedicated AutoSaddler held-out test tracks:
+
+[![Papers with Code: GAIA2 AutoSaddler held-out universes](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge.svg?eval=28328&live=1)](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge-link?eval=28328)
+[![Papers with Code: SWE-Bench Pro AutoSaddler held-out repositories](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge.svg?eval=28329&live=1)](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge-link?eval=28329)
+[![Papers with Code: Terminal-Bench 2.0 AutoSaddler 40-task test split](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge.svg?eval=28330&live=1)](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge-link?eval=28330)
+
 See the [paper](https://arxiv.org/abs/2608.23041) and
 [interactive project website](https://autosaddler-projectpage.github.io/) for per-model results,
 ablations, compute-efficiency plots, and optimization trajectories.
@@ -34,6 +41,7 @@ ablations, compute-efficiency plots, and optimization trajectories.
 
 ## 📣 News
 
+- **2026-09-25:** 🎉 The AutoSaddler paper was accepted to [NeurIPS 2026](https://neurips.cc/Conferences/2026) as a poster!
 - **2026-08-25:** Added V2 support for optimizing the [Meta-ARE](https://github.com/pshlego/Meta-ARE) harness on GAIA2.
 - **2026-08-24:** The AutoSaddler paper was released as [arXiv v1](https://arxiv.org/abs/2608.23041), together with the [project website and short video](https://autosaddler-projectpage.github.io/).
 
