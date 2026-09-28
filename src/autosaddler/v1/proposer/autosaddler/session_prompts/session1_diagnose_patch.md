@@ -58,6 +58,8 @@ recorded as bad patterns — avoid them.
 ### Initial Scores (pass rate: {before_pass_rate})
 {before_scores_listing}
 
+{arm_history_section}
+
 ## Patch Types for This Phase
 
 {patch_types_section}

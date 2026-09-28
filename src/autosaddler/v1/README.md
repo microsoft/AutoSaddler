@@ -33,7 +33,7 @@ from autosaddler.v1.proposer.autosaddler import AutoSaddlerProposer
 - Python 3.12-3.14
 - `uv` and Git
 - A compatible Meta-ARE checkout with its dependencies installed
-- Provider credentials required by `configs/v1/meta_are.yaml` or `configs/v1/meta_are_smoke.yaml`
+- Provider credentials required by the selected `configs/v1/*.yaml` config
 
 ## Meta-ARE Setup
 
@@ -61,7 +61,7 @@ uv sync --extra dev
 |---|---|---|
 | `META_ARE_REPO` | Yes | Absolute path to the Meta-ARE checkout |
 | `META_ARE_BASE_BRANCH` | No | Base harness branch; defaults to `main` in the legacy launcher |
-| `OPENAI_API_KEY` | Yes | Agent or judge credential for the default legacy profile |
+| `OPENAI_API_KEY` | Provider-dependent | Required when the task agent or judge uses OpenAI |
 | `ANTHROPIC_API_KEY` | Backend-dependent | Claude Agent SDK credential |
 | `ANTHROPIC_BASE_URL` | No | Claude-compatible endpoint override |
 | `AGENT_MODEL` | No | Task-agent model override |
@@ -69,6 +69,8 @@ uv sync --extra dev
 | `AGENT_MODEL_ENDPOINT` | No | Task-agent endpoint override |
 | `JUDGE_MODEL` | No | Judge model override |
 | `JUDGE_MODEL_PROVIDER` | No | Judge provider override |
+| `SDK_BACKEND` | No | Optimizer SDK for the ActiveSaddler configs: `copilot` (default) or `claude` |
+| `SEED_EVAL_SOURCE` | No | Prior seed development result to reuse instead of re-running it |
 
 ```bash
 export META_ARE_REPO=/path/to/meta-agents-research-environments
@@ -83,6 +85,8 @@ The legacy launchers and configs remain under explicitly named paths:
 bash scripts/legacy/train.sh --config configs/v1/meta_are_smoke.yaml --dry-run
 bash scripts/legacy/train.sh --config configs/v1/meta_are_smoke.yaml
 bash scripts/legacy/train.sh --config configs/v1/meta_are.yaml
+bash scripts/legacy/train.sh --config configs/v1/meta_are_activesaddler_smoke.yaml --dry-run
+bash scripts/legacy/train.sh --config configs/v1/meta_are_activesaddler.yaml
 ```
 
 The equivalent module command is:
@@ -94,11 +98,35 @@ uv run python -m autosaddler.v1.adapters.meta_are_adapter.optimize \
 ```
 
 V1 configuration sections are `dataset`, `adapter`, `optimization`, `autosaddler`, and `sdk`.
-Environment variables support `${VAR}` and `${VAR:-default}` expansion.
+Environment variables support `${VAR}` and `${VAR:-default}` expansion, and `extends:` merges a
+base config.
 
-Legacy training outputs are written below `${META_ARE_REPO}/autosaddler/<timestamp>/` and include
-`evolution_dag.json`, candidate summaries, logs, `state.bin`, worktrees, cycle outputs, and generated
-development outputs. These artifacts are not compatible with the current event store.
+### Sampling strategies
+
+`autosaddler.sampling_strategy` selects how training mini-batches are chosen:
+
+| Strategy | Configs | Behavior |
+|---|---|---|
+| `autosaddler` (default) | `configs/v1/meta_are.yaml`, `configs/v1/meta_are_smoke.yaml` | Passive epoch-shuffled, non-overlapping mini-batches |
+| `activesaddler` | `configs/v1/meta_are_activesaddler.yaml`, `configs/v1/meta_are_activesaddler_smoke.yaml` | Agent-driven infinite-armed bandit curriculum over failure patterns |
+
+ActiveSaddler adds three sessions to each iteration. Session 3 extracts failure patterns from the
+previous iteration's diagnosis and reflection. After Session 0 prepares the harness, Session 3.5
+decides whether to pull a known pattern or draw unseen scenarios, and Session 4 scores every
+pattern before a pull. One pattern is then sampled by softmax over the agent scores. The
+`autosaddler.pattern` and `autosaddler.bandit` sections configure the extraction timeout, the
+softmax temperature, the per-arm probability floor, the activity EMA shown to the agent, and the
+Session 3.5/4 timeout. `capability_transition_mode: full_coverage` switches to steering patches
+only after every training scenario has been sampled once.
+
+Resume an interrupted run in place with `--resume <run-dir>`; `--strict-resume-config` rejects a
+changed config or dataset.
+
+Legacy training outputs are written below the config's `adapter.session_root_base`, for example
+`${META_ARE_REPO}/autosaddler/<timestamp>/`, and include `evolution_dag.json.gz`, candidate
+summaries, logs, `state.bin`, `run_config.json`, worktrees, cycle outputs, and generated development
+outputs. ActiveSaddler runs also write `pattern_registry.json.gz`, `bandit_state.json`, and
+per-iteration sampler traces. These artifacts are not compatible with the current event store.
 
 ## Evaluation
 

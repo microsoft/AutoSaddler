@@ -4,7 +4,8 @@
   filesystem required by the V2 Meta-ARE plugin.
 - `meta_are/provision_gaia2_scenarios.py`: downloads only the GAIA2 scenarios selected by one or
   more split manifests from an immutable dataset revision and verifies idempotent reuse.
-- `legacy/train.sh`: runs a V1 Meta-ARE optimization config.
+- `legacy/train.sh`: runs a V1 Meta-ARE optimization config, including the V1 ActiveSaddler
+  curriculum configs.
 - `legacy/eval.sh`: evaluates the best worktree from a completed V1 run.
 
 Run Python utilities through `uv`, for example:

@@ -1,0 +1,129 @@
+# ─── ActiveSaddler (smoke) ─────────────────────────────────────────────
+#
+# ActiveSaddler: DAG-based harness evolution with an agent-driven
+# infinite-armed bandit curriculum over failure patterns.
+#
+# Reduced dataset (train=6, val=1) for quick feasibility checking.
+#
+# Usage:
+#   bash scripts/legacy/train.sh --config configs/v1/meta_are_activesaddler_smoke.yaml
+#   uv run python -m autosaddler.v1.adapters.meta_are_adapter.optimize --config configs/v1/meta_are_activesaddler_smoke.yaml
+
+# ─── Dataset ────────────────────────────────────────────────────────────
+# Paths are relative to this config file or absolute.
+dataset:
+  train_file: ../datasets/GAIA2/train_smoke.json
+  val_file: ../datasets/GAIA2/val_smoke.json
+
+# ─── Meta-ARE adapter ──────────────────────────────────────────────────
+# Set META_ARE_REPO env var or edit paths below.
+adapter:
+  meta_are_repo: ${META_ARE_REPO}
+  session_root_base: ${META_ARE_REPO}/activesaddler
+  dataset_path: ${META_ARE_REPO}/datasets_local/gaia2
+  activate_command: "source ${META_ARE_REPO}/.venv/bin/activate"
+  import_check_statement: "from are.simulation.agents.default_agent import base_agent"
+  base_branch: ${META_ARE_BASE_BRANCH:-main}
+  agent: default
+  model: ${AGENT_MODEL:-gpt-4.1-mini}
+  model_provider: ${AGENT_MODEL_PROVIDER:-openai}
+  model_endpoint: ${AGENT_MODEL_ENDPOINT}
+  reasoning_effort: ${AGENT_REASONING_EFFORT}
+  judge_model: ${JUDGE_MODEL:-Llama-3.3-70B-Instruct}
+  judge_provider: ${JUDGE_MODEL_PROVIDER:-azure}
+  scenario_timeout: 1800
+  num_runs: 1
+  max_concurrent: 3
+
+# ─── Optimization ──────────────────────────────────────────────────────
+optimization:
+  mutation_strategy: autosaddler
+  max_metric_calls: 50
+  max_candidate_proposals: 5
+  perfect_score: 1.0
+  frontier_type: instance
+  seed: 42
+  display_progress_bar: true
+
+# ─── AutoSaddler proposer ────────────────────────────────────────────
+autosaddler:
+  claude_agent_sdk_model: "Claude Opus 4.6"     # used when sdk.backend=claude
+  diagnosis_patch_timeout: 18000.0
+  reflection_timeout: 3600.0
+  candidate_selection_timeout: 1800.0
+  train_minibatch_size: 3
+  capability_phase_iterations: 0
+  capability_phase_epochs: 1
+  skip_session0: false
+
+  # ActiveSaddler: the agent decides pull-vs-draw (Session 3.5) and scores
+  # each failure-pattern arm by its estimated learning progress (Session 4);
+  # arms are then selected by softmax.
+  sampling_strategy: activesaddler
+  pattern:
+    extraction_timeout: 3600.0       # Session 3 (pattern extraction) timeout
+  bandit:
+    selection:
+      softmax_temperature: 0.15      # temperature tau for stochastic arm sampling (> 0)
+      min_prob: 0.0                  # per-arm minimum sampling probability epsilon in [0, 1)
+    scoring:
+      ema_eta: 0.9                   # EMA smoothing of the failure-activity context shown to the agent
+      agent_timeout: 3600.0          # Session 3.5 / Session 4 timeout
+
+# ─── SDK backend ─────────────────────────────────────────────────────
+# "claude" = Claude Agent SDK (needs ANTHROPIC_API_KEY)
+# "copilot" = GitHub Copilot SDK (needs `copilot login` or COPILOT_GITHUB_TOKEN)
+sdk:
+  backend: ${SDK_BACKEND:-copilot}
+
+  claude:
+    permission_mode: bypassPermissions
+    effort: "max"
+    allowed_tools:
+      - Read
+      - Glob
+      - Grep
+      - Agent
+      - Write
+      - Edit
+      - Bash
+    setting_sources:
+      - project
+    mcp_servers: {}
+    plugins: []
+
+  copilot:
+    model: ${COPILOT_MODEL:-gpt-5.5}
+    effort: ${COPILOT_EFFORT:-xhigh}
+    # BYOK (bring-your-own-key): route the Copilot SDK's LLM calls through a
+    # custom OpenAI-compatible endpoint. Set COPILOT_BASE_URL to the endpoint
+    # base (including /v1), e.g. http://<host>:<port>/v1. Leave it unset to use
+    # the default GitHub Copilot login/endpoint.
+    provider:
+      type: openai
+      base_url: ${COPILOT_BASE_URL:-}
+      api_key: ${COPILOT_API_KEY:-dummy}
+      # gpt-5.x on Copilot are Responses-API only -> "responses".
+      # Use "completions" for chat-completions-only models (e.g. gpt-5-mini).
+      wire_api: ${COPILOT_WIRE_API:-responses}
+      # model_id: gpt-5.5              # well-known base for token limits
+      # wire_model: gpt-5.5            # exact model name sent on the wire
+    allowed_tools:
+      - view
+      - create
+      - edit
+      - bash
+      - write_bash
+      - read_bash
+      - stop_bash
+      - list_bash
+      - glob
+      - grep
+      - skill
+      - report_intent
+      - task
+      - sql
+      - read_agent
+      - list_agents
+      - session_store_sql
+      - fetch_copilot_cli_documentation

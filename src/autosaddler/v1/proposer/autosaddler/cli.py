@@ -35,6 +35,13 @@ def _format_score(score, precision=4):
     return f"{score:.{precision}f}"
 
 
+def _format_cost(cost):
+    """Format a USD cost value for display."""
+    if cost is None:
+        return "n/a"
+    return f"${cost:.4f}"
+
+
 def _node_label(idx):
     """Get display label for a node index."""
     return "seed" if idx == 0 else f"C{idx}"
@@ -96,8 +103,12 @@ def cmd_show_node(args):
     print(f"    Train after:  {_format_score(node.score_train_after)}")
     print(f"    Dev:          {_format_score(node.score_val)} (evaluated: {node.val_evaluated})")
 
+    if node.abandoned:
+        print(f"  Abandoned: True (reason: {node.abandon_reason or 'unknown'})")
+
     if node.accepted is not None:
         print(f"  Accepted by engine: {node.accepted}")
+    print(f"  Sampling completed: {node.sampling_completed}")
 
     if edges:
         print("\n  Parents:")
@@ -128,6 +139,13 @@ def cmd_show_node(args):
         pi = node.patch_intent
         print("\n  Patch Intent:")
         print(f"    Targets: {', '.join(pi.target_scenarios)}")
+        if pi.diagnosis:
+            diag = pi.diagnosis
+            wrapped = textwrap.fill(
+                diag, width=76,
+                initial_indent="    Diagnosis: ", subsequent_indent="               ",
+            )
+            print(wrapped)
         print(f"    Approach: {pi.approach}")
         print(f"    Files: {', '.join(pi.files_changed)}")
         print(f"    Summary: {pi.change_summary}")
@@ -151,20 +169,43 @@ def cmd_show_node(args):
         ss = node.sdk_session_selection
         print("\n  SDK Session (Selection):")
         print(f"    Model: {ss.model} | Tool calls: {ss.tool_call_count} | Turns: {ss.turns}")
+        print(f"    Tokens: in={ss.input_tokens}, out={ss.output_tokens}, cache={ss.cache_read_input_tokens} | LLM calls: {ss.num_turns} | Wall: {ss.wall_clock_s:.1f}s | Cost: {_format_cost(ss.total_cost_usd)}")
         print(f"    JSON: {ss.session_json_path}")
 
     if node.sdk_session_patch:
         sp = node.sdk_session_patch
         print("\n  SDK Session (Patch):")
         print(f"    Model: {sp.model} | Tool calls: {sp.tool_call_count} | Turns: {sp.turns}")
-        print(f"    Tokens: in={sp.input_tokens}, out={sp.output_tokens}, cache={sp.cache_read_input_tokens}")
+        print(f"    Tokens: in={sp.input_tokens}, out={sp.output_tokens}, cache={sp.cache_read_input_tokens} | LLM calls: {sp.num_turns} | Wall: {sp.wall_clock_s:.1f}s | Cost: {_format_cost(sp.total_cost_usd)}")
         print(f"    JSON: {sp.session_json_path}")
 
     if node.sdk_session_reflection:
         sr = node.sdk_session_reflection
         print("\n  SDK Session (Reflection):")
         print(f"    Model: {sr.model} | Tool calls: {sr.tool_call_count} | Turns: {sr.turns}")
+        print(f"    Tokens: in={sr.input_tokens}, out={sr.output_tokens}, cache={sr.cache_read_input_tokens} | LLM calls: {sr.num_turns} | Wall: {sr.wall_clock_s:.1f}s | Cost: {_format_cost(sr.total_cost_usd)}")
         print(f"    JSON: {sr.session_json_path}")
+
+    if getattr(node, "sdk_session_pattern_extraction", None):
+        spe = node.sdk_session_pattern_extraction
+        print("\n  SDK Session (Pattern Extraction):")
+        print(f"    Model: {spe.model} | Tool calls: {spe.tool_call_count} | Turns: {spe.turns}")
+        print(f"    Tokens: in={spe.input_tokens}, out={spe.output_tokens}, cache={spe.cache_read_input_tokens} | LLM calls: {spe.num_turns} | Wall: {spe.wall_clock_s:.1f}s | Cost: {_format_cost(spe.total_cost_usd)}")
+        print(f"    JSON: {spe.session_json_path}")
+
+    if getattr(node, "sdk_session_arm_scoring", None):
+        sas = node.sdk_session_arm_scoring
+        print("\n  SDK Session (Arm Scoring):")
+        print(f"    Model: {sas.model} | Tool calls: {sas.tool_call_count} | Turns: {sas.turns}")
+        print(f"    Tokens: in={sas.input_tokens}, out={sas.output_tokens}, cache={sas.cache_read_input_tokens} | LLM calls: {sas.num_turns} | Wall: {sas.wall_clock_s:.1f}s | Cost: {_format_cost(sas.total_cost_usd)}")
+        print(f"    JSON: {sas.session_json_path}")
+
+    if getattr(node, "sdk_session_unseen_scenario_exploration", None):
+        sue = node.sdk_session_unseen_scenario_exploration
+        print("\n  SDK Session (Unseen Scenario Exploration):")
+        print(f"    Model: {sue.model} | Tool calls: {sue.tool_call_count} | Turns: {sue.turns}")
+        print(f"    Tokens: in={sue.input_tokens}, out={sue.output_tokens}, cache={sue.cache_read_input_tokens} | LLM calls: {sue.num_turns} | Wall: {sue.wall_clock_s:.1f}s | Cost: {_format_cost(sue.total_cost_usd)}")
+        print(f"    JSON: {sue.session_json_path}")
 
 
 def cmd_show_edge(args):
@@ -567,8 +608,6 @@ def _print_scenario_history_entry(dag, node, si):
         # No reflection — show rationale as fallback
         if si.rationale_after:
             rat = si.rationale_after
-            if len(rat) > 300:
-                rat = rat[:300] + "..."
             wrapped = textwrap.fill(
                 rat, width=76,
                 initial_indent="  Rationale: ", subsequent_indent="             ",
@@ -614,6 +653,22 @@ def cmd_show_history(_args):
         print(f"{'=' * 60}")
         print(f"Iteration {node.iteration} (C{node.idx}, parent={parent_label}){verdict_str}{accepted_str}")
         print(f"{'=' * 60}")
+
+        if node.abandoned:
+            if node.abandon_reason == "all_pass":
+                print(
+                    "All scenarios already passing \u2014 no patch (skipped). "
+                    f"train_before pass rate: {_format_score(node.score_train_before)}"
+                )
+                passed = [
+                    sid for sid, e in dag.scenario_registry.items()
+                    if any(s.candidate_idx == node.idx for s in e.history)
+                ]
+                for sid in (passed or node.mini_batch_ids):
+                    print(f"    = {sid}: pass (train_before)")
+            else:
+                print(f"Abandoned ({node.abandon_reason or 'unknown'}) \u2014 no patch produced.")
+            continue
 
         if node.score_train_before is not None and node.score_train_after is not None:
             delta = node.score_train_after - node.score_train_before

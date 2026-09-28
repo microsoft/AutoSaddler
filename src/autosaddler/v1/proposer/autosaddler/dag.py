@@ -18,6 +18,7 @@ from typing import Any
 
 from autosaddler.v1.proposer.autosaddler.models import (
     AccumulatedLessons,
+    ArmPullRecord,
     EvolutionEdge,
     EvolutionNode,
     PatchIntent,
@@ -160,9 +161,10 @@ class EvolutionDAG:
     def save(self) -> None:
         """Serialize the DAG to gzip-compressed JSON.
 
-        Uses atomic write (write to temp file, then rename) to avoid
-        corruption if the process is killed mid-write.
-        No ``indent`` is used to reduce both file size and peak memory.
+        Uses atomic write (write to temp file, then rename) to avoid corruption
+        if the process is killed mid-write. No ``indent`` is used to reduce both
+        file size and peak memory. Edge diffs are stored externally under
+        ``diffs/`` and referenced by path.
         """
         self.metadata["last_updated"] = datetime.now(timezone.utc).isoformat()
 
@@ -268,6 +270,7 @@ class EvolutionDAG:
             created_at=datetime.now(timezone.utc).isoformat(),
             score_val=score_val,
             val_evaluated=True,
+            sampling_completed=True,
             worktree_path=worktree_path,
         )
         self.nodes[node.idx] = node
@@ -283,6 +286,8 @@ class EvolutionDAG:
         worktree_path: str,
         base_parent_idx: int,
         mini_batch_ids: list[str] | None = None,
+        pulled_arm_id: str | None = None,
+        sampling_completed: bool | None = None,
     ) -> EvolutionNode:
         """Add a new candidate node."""
         node = EvolutionNode(
@@ -292,11 +297,89 @@ class EvolutionDAG:
             base_parent_idx=base_parent_idx,
             worktree_path=worktree_path,
             mini_batch_ids=mini_batch_ids or [],
+            pulled_arm_id=pulled_arm_id,
+            sampling_completed=(
+                mini_batch_ids is not None
+                if sampling_completed is None
+                else sampling_completed
+            ),
         )
         self.nodes[node.idx] = node
         self._next_idx += 1
         self.metadata["total_iterations"] = max(self.metadata["total_iterations"], iteration)
         return node
+
+    def set_sampling_result(
+        self,
+        idx: int,
+        mini_batch_ids: list[str],
+        pulled_arm_id: str | None,
+    ) -> None:
+        """Mark a prepared node as sampled and attach its sampler decision."""
+        node = self.nodes[idx]
+        node.mini_batch_ids = list(mini_batch_ids)
+        node.pulled_arm_id = pulled_arm_id
+        node.sampling_completed = True
+
+    def _outcomes_from_scenario_registry(self, node_idx: int) -> list[ScenarioImpact]:
+        """Per-scenario outcomes for a node, sourced from the scenario registry.
+
+        Used for all-pass skips (which have no ``patch_verdict``): the abandon
+        path writes a ``still_passing`` snapshot tagged with ``candidate_idx ==
+        node_idx``, so we reconstruct the pull's per-scenario result (with real
+        scenario NAMES) from those snapshots.
+        """
+        outcomes: list[ScenarioImpact] = []
+        for sid, entry in self.scenario_registry.items():
+            for snap in entry.history:
+                if snap.candidate_idx == node_idx:
+                    outcomes.append(ScenarioImpact(
+                        scenario_id=sid,
+                        score_before=snap.score,
+                        score_after=snap.score,
+                        status_change=(
+                            "still_passing" if snap.status == "pass" else "still_failing"
+                        ),
+                    ))
+                    break
+        return outcomes
+
+    def get_arm_pull_history(
+        self, arm_id: str | None, exclude_idx: int | None = None,
+    ) -> list[ArmPullRecord]:
+        """Complete pull history of the SAME arm (pattern), each pull kind-tagged.
+
+        Matches by ``pulled_arm_id`` (NOT scenario overlap): distinct arms can
+        share a scenario set, so only the pattern id identifies the arm. Unlike a
+        patch-only view this INCLUDES all-pass skips (``abandon_reason ==
+        "all_pass"``) and failed attempts, so both Session 1 (diagnose/patch) and
+        Session 4 (arm scoring) see every prior pull — including iterations where
+        the arm's scenarios already passed (a legitimate "already resolved"
+        outcome). Iteration-ordered. No cap.
+        """
+        if not arm_id:
+            return []
+        records: list[ArmPullRecord] = []
+        for n in self.nodes.values():
+            if n.idx == exclude_idx or n.pulled_arm_id != arm_id:
+                continue
+            if n.patch_verdict is not None:
+                kind = "patched"
+                outcomes = list(n.patch_verdict.scenario_impacts)
+            elif n.abandon_reason == "all_pass" or (
+                n.abandoned and n.abandon_reason is None
+                and n.score_train_before is not None and n.score_train_before >= 1.0
+            ):
+                # Explicit marker (new runs) or best-effort inference for legacy
+                # DAGs that predate ``abandon_reason``.
+                kind = "all_pass_skip"
+                outcomes = self._outcomes_from_scenario_registry(n.idx)
+            else:
+                kind = "failed_attempt"
+                outcomes = []
+            records.append(ArmPullRecord(node=n, kind=kind, scenario_outcomes=outcomes))
+        records.sort(key=lambda r: r.node.iteration)
+        return records
 
     # ------------------------------------------------------------------
     # Edge creation
@@ -424,6 +507,15 @@ class EvolutionDAG:
                 )
                 self.edges[key] = edge
 
+    def clear_selection_decision(self, idx: int) -> None:
+        """Discard a failed Session 0 decision and its cherry-pick edges."""
+        self.nodes[idx].selection_decision = None
+        self.edges = {
+            key: edge
+            for key, edge in self.edges.items()
+            if not (edge.child_idx == idx and edge.edge_type == "cherry_pick")
+        }
+
     def set_reflections(self, idx: int, reflections: list[ReflectionEntry]) -> None:
         """Set the Agent's reflections for a node (called from CLI update-reflection)."""
         if self.nodes[idx].patch_verdict:
@@ -483,6 +575,9 @@ class EvolutionDAG:
         selection: SDKSessionInfo | None = None,
         patch: SDKSessionInfo | None = None,
         reflection: SDKSessionInfo | None = None,
+        pattern_extraction: SDKSessionInfo | None = None,
+        arm_scoring: SDKSessionInfo | None = None,
+        unseen_scenario_exploration: SDKSessionInfo | None = None,
     ) -> None:
         """Set SDK session metadata for a node."""
         if selection is not None:
@@ -491,6 +586,14 @@ class EvolutionDAG:
             self.nodes[idx].sdk_session_patch = patch
         if reflection is not None:
             self.nodes[idx].sdk_session_reflection = reflection
+        if pattern_extraction is not None:
+            self.nodes[idx].sdk_session_pattern_extraction = pattern_extraction
+        if arm_scoring is not None:
+            self.nodes[idx].sdk_session_arm_scoring = arm_scoring
+        if unseen_scenario_exploration is not None:
+            self.nodes[idx].sdk_session_unseen_scenario_exploration = (
+                unseen_scenario_exploration
+            )
 
     def set_commit_hash(self, idx: int, commit_hash: str) -> None:
         """Record the commit hash after patching is complete."""
@@ -516,7 +619,10 @@ class EvolutionDAG:
                 best_val_idx = idx
 
         # Current base parent = non-abandoned node with highest iteration
-        eligible = [n for n in self.nodes.values() if not n.abandoned]
+        eligible = [
+            n for n in self.nodes.values()
+            if not n.abandoned and n.sampling_completed
+        ]
         if not eligible:
             eligible = list(self.nodes.values())
         current_base = max(eligible, key=lambda n: n.iteration) if eligible else None
@@ -572,7 +678,12 @@ class EvolutionDAG:
         if not self.nodes:
             return {"status": "no nodes"}
 
-        latest = max(self.nodes.values(), key=lambda n: n.iteration)
+        sampled_nodes = [
+            node for node in self.nodes.values() if node.sampling_completed
+        ]
+        if not sampled_nodes:
+            return {"status": "no sampled nodes"}
+        latest = max(sampled_nodes, key=lambda n: n.iteration)
         base_edge = None
         for e in self.edges.values():
             if e.child_idx == latest.idx and e.edge_type == "base":

@@ -1,6 +1,7 @@
 # Based on GEPA by Lakshya A Agrawal (github.com/gepa-ai/gepa)
 
 
+import os
 import traceback
 from collections.abc import Sequence
 from typing import Any, Generic
@@ -244,6 +245,79 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
 
         return new_program_idx, linear_pareto_front_program_idx
 
+    def _save_rng_state(self) -> None:
+        """Persist the batch sampler's RNG + epoch-shuffle state next to the
+        checkpoint so a resumed run reproduces the same mini-batch sequence.
+
+        Written atomically at the top of every loop iteration (right after
+        ``state.save``), so on a clean interrupt ``rng_state.pkl`` is in sync
+        with ``state.bin``.
+        """
+        if self.run_dir is None:
+            return
+        import pickle as _pkl
+
+        sampler = getattr(self.reflective_proposer, "_batch_sampler", None)
+        # ActiveSaddlerBanditSampler persists its complete state atomically in
+        # bandit_state.json. rng_state.pkl is exclusively the epoch sampler's
+        # checkpoint and must not become a second, competing source of truth.
+        if sampler is None or not hasattr(sampler, "shuffled_ids"):
+            return
+        rng = getattr(sampler, "rng", None)
+        if rng is None:
+            return
+        data: dict[str, Any] = {"rng_state": rng.getstate()}
+        if hasattr(sampler, "shuffled_ids"):
+            # EpochShuffledBatchSampler internal state (id_freqs is rebuilt in
+            # _update_shuffled, so it need not be persisted).
+            data["sampler_state"] = {
+                "shuffled_ids": sampler.shuffled_ids,
+                "epoch": sampler.epoch,
+                "last_trainset_size": sampler.last_trainset_size,
+            }
+        target = os.path.join(self.run_dir, "rng_state.pkl")
+        tmp = target + ".tmp"
+        with open(tmp, "wb") as f:
+            _pkl.dump(data, f)
+        os.replace(tmp, target)
+
+    def _restore_rng_state(self) -> None:
+        """Restore the batch sampler's RNG + epoch-shuffle state on resume so
+        the mini-batch sequence continues identically to an uninterrupted run.
+        """
+        if self.run_dir is None:
+            return
+        import pickle as _pkl
+
+        sampler = getattr(self.reflective_proposer, "_batch_sampler", None)
+        if sampler is None or not hasattr(sampler, "shuffled_ids"):
+            return
+        state_path = os.path.join(self.run_dir, "rng_state.pkl")
+        if not os.path.exists(state_path):
+            raise RuntimeError(
+                "Cannot deterministically resume epoch sampling: "
+                f"{state_path} is missing."
+            )
+        with open(state_path, "rb") as f:
+            data = _pkl.load(f)
+        rng = getattr(sampler, "rng", None)
+        if rng is not None and "rng_state" in data:
+            rng.setstate(data["rng_state"])
+            self.logger.log("Restored RNG state from rng_state.pkl")
+        if (
+            sampler is not None
+            and hasattr(sampler, "shuffled_ids")
+            and "sampler_state" in data
+        ):
+            ss = data["sampler_state"]
+            sampler.shuffled_ids = ss.get("shuffled_ids", [])
+            sampler.epoch = ss.get("epoch", -1)
+            sampler.last_trainset_size = ss.get("last_trainset_size", 0)
+            self.logger.log(
+                f"Restored batch_sampler state: epoch={sampler.epoch}, "
+                f"shuffled_ids_len={len(sampler.shuffled_ids)}"
+            )
+
     def run(self) -> GEPAState[RolloutOutput, DataId]:
         # Check tqdm availability if progress bar is enabled
         progress_bar = None
@@ -312,8 +386,24 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             ),
         )
 
-        # Evaluate seed candidate on valset (after on_optimization_start callback)
-        seed_valset_evaluation = valset_evaluator(self.seed_candidate)
+        # Evaluate seed candidate on valset (after on_optimization_start callback).
+        # On resume (state.bin already exists) initialize_gepa_state loads the
+        # checkpoint and ignores this seed evaluation, so skip the expensive
+        # full-valset re-evaluation and pass a dummy placeholder instead.
+        _resuming = self.run_dir is not None and os.path.exists(
+            os.path.join(self.run_dir, "state.bin")
+        )
+        if _resuming:
+            self.logger.log(
+                "Resuming from existing checkpoint — skipping seed valset evaluation"
+            )
+            seed_valset_evaluation = ValsetEvaluation(
+                outputs_by_val_id={},
+                scores_by_val_id={},
+                objective_scores_by_val_id=None,
+            )
+        else:
+            seed_valset_evaluation = valset_evaluator(self.seed_candidate)
 
         # Initialize state with pre-computed seed evaluation
         state = initialize_gepa_state(
@@ -325,6 +415,14 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             frontier_type=self.frontier_type,
             evaluation_cache=self._initial_evaluation_cache,
         )
+
+        if _resuming:
+            self.logger.log(
+                f"Resumed from iteration {state.i + 1} with "
+                f"{len(state.program_candidates)} candidates, "
+                f"{state.total_num_evals} metric calls consumed"
+            )
+            self._restore_rng_state()
 
         # Log run configuration
         self.experiment_tracker.log_config(
@@ -421,6 +519,7 @@ class GEPAEngine(Generic[DataId, DataInst, Trajectory, RolloutOutput]):
             iteration_started = False
             try:
                 state.save(self.run_dir, use_cloudpickle=self.use_cloudpickle)
+                self._save_rng_state()
                 notify_callbacks(
                     self.callbacks,
                     "on_state_saved",

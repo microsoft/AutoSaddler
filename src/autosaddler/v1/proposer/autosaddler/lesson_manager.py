@@ -107,12 +107,8 @@ def _extract_task_description(cycle_dir: str, scenario_id: str) -> str | None:
                     if "Message:" in content:
                         msg_idx = content.index("Message:") + len("Message:")
                         task_msg = content[msg_idx:].strip()
-                        if len(task_msg) > 500:
-                            task_msg = task_msg[:497] + "..."
                         return task_msg
-                    # Fallback: return raw content (truncated)
-                    if len(content) > 500:
-                        return content[:497] + "..."
+                    # Fallback: return raw content (full, untruncated)
                     return content
                 break  # only check first agent
         except Exception:
@@ -289,20 +285,16 @@ def update_scenario_registry_from_reflections(
                     fix.prevention_or_next = refl.prevention_or_next
                     break
 
-        # 2. Backfill known_root_causes
+        # 2. Backfill known_root_causes with the concise root cause.
+        #    Unbounded: every accumulated diagnosis is kept so later patch
+        #    sessions can read the full history via `evo-dag show scenario`.
         if refl.status_change in ("fixed", "still_failing"):
             root_cause = refl.root_cause
             if root_cause and len(root_cause) > 10 and root_cause not in entry.known_root_causes:
                 entry.known_root_causes.append(root_cause)
-                # Keep list manageable
-                if len(entry.known_root_causes) > 10:
-                    entry.known_root_causes = entry.known_root_causes[-10:]
 
-        # 2. Extract root causes
+        # 3. Also keep the detailed explanation as a known cause (unbounded).
         if refl.status_change in ("fixed", "still_failing"):
             explanation = refl.explanation
-            if explanation and explanation not in entry.known_root_causes:
-                if len(explanation) > 10:
-                    entry.known_root_causes.append(explanation)
-                    if len(entry.known_root_causes) > 10:
-                        entry.known_root_causes = entry.known_root_causes[-10:]
+            if explanation and len(explanation) > 10 and explanation not in entry.known_root_causes:
+                entry.known_root_causes.append(explanation)

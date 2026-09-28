@@ -11,11 +11,13 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -26,6 +28,21 @@ from autosaddler.v1.core.adapter import EvaluationBatch, GEPAAdapter
 from autosaddler.v1.sdk_session import SdkConfig
 
 logger = logging.getLogger(__name__)
+
+
+class SeedEvalReuseError(RuntimeError):
+    """Raised when reusing a prior seed evaluation fails in a way that must
+    abort the run (e.g. missing source, or the source does not cover the
+    current validation set).
+
+    This is intentionally NOT swallowed by ``evaluate``'s generic error
+    handling so a misconfigured reuse cannot silently corrupt the baseline
+    with 0.0 scores.
+    """
+
+
+class HookConfigEvaluationError(RuntimeError):
+    """Raised when a candidate hook configuration cannot be evaluated."""
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +97,17 @@ class MetaAREAdapterConfig:
     model_provider: str = "openai"
     model_endpoint: str | None = None
     reasoning_effort: str | None = None
+    model_azure_config_dir: str | None = None
     judge_model: str = "gpt-4.1-mini"
     judge_provider: str = "openai"
+    judge_endpoint: str | None = None
+    judge_azure_config_dir: str | None = None
     scenario_timeout: int = 3600
     num_runs: int = 1
     max_concurrent: int = 4
+    # Concurrency for dev-set (valset) evaluations. When None, dev-set
+    # evaluations fall back to ``max_concurrent`` (mini-batch concurrency).
+    max_concurrent_dev: int | None = None
     benchmark_config: str = "search"
     split: str = "validation"
 
@@ -94,6 +117,15 @@ class MetaAREAdapterConfig:
     # Worktree verification (used by proposer for import checks)
     import_check_statement: str = ""
 
+    # Seed-eval reuse (unified evaluation starting point for fair comparison
+    # across methods). When set, the seed evaluation reuses a prior
+    # initial-harness seed_val result instead of re-running the benchmark.
+    # Accepts a ``seed_val_XXXX_hhhhhh`` cycle dir, a run timestamp dir (with
+    # ``cycles/seed_val_*``), or a ``run/`` dir directly. Empty = run from scratch.
+    seed_eval_source: str = ""
+    # "copy" (default) duplicates outputs into the new run; "symlink" saves disk.
+    seed_eval_reuse_mode: str = "copy"
+
 
 def _load_adapter_config(cfg: dict[str, Any]) -> MetaAREAdapterConfig:
     """Build adapter config from a raw dict (e.g. from YAML)."""
@@ -101,9 +133,11 @@ def _load_adapter_config(cfg: dict[str, Any]) -> MetaAREAdapterConfig:
     for key in (
         "meta_are_repo", "session_root_base", "dataset_path", "activate_command",
         "base_branch", "agent", "model", "model_provider", "model_endpoint",
-        "reasoning_effort", "judge_model", "judge_provider", "scenario_timeout",
-        "num_runs", "max_concurrent", "benchmark_config", "split",
-        "import_check_statement",
+        "reasoning_effort", "model_azure_config_dir",
+        "judge_model", "judge_provider", "judge_endpoint",
+        "judge_azure_config_dir", "scenario_timeout", "num_runs", "max_concurrent",
+        "max_concurrent_dev", "benchmark_config", "split", "import_check_statement",
+        "seed_eval_source", "seed_eval_reuse_mode",
     ):
         if key in cfg:
             setattr(ac, key, cfg[key])
@@ -169,6 +203,30 @@ class WorktreePool:
         with self._lock:
             if key in self._pool:
                 return self._pool[key], True
+
+            existing_path = self._worktree_dir / f"seed_{key}"
+            if existing_path.is_dir():
+                try:
+                    existing_repo = git.Repo(existing_path)
+                    existing_repo.head.commit.hexsha
+                    expected_branch = f"autosaddler/seed_{key}"
+                    if (
+                        existing_repo.active_branch.name != expected_branch
+                        or existing_repo.is_dirty(untracked_files=True)
+                    ):
+                        raise ValueError("branch mismatch or uncommitted changes")
+                except Exception:
+                    logger.warning(
+                        "Existing pooled path is not safely reusable: %s",
+                        existing_path,
+                    )
+                else:
+                    self._pool[key] = existing_path
+                    logger.info(
+                        "Reusing existing pooled worktree %s",
+                        existing_path,
+                    )
+                    return existing_path, True
 
         # Determine the git ref to fork from
         base_ref: str | None = None
@@ -327,6 +385,7 @@ class MetaAREAdapter(
         self._iteration = 0
         self._phase = "init"
         self._forced_phase: str | None = None
+        self._reserved_eval: tuple[str, bool] | None = None
 
         # Worktree pool (created in set_session_root)
         self._worktree_pool: WorktreePool | None = None
@@ -334,6 +393,43 @@ class MetaAREAdapter(
     # ------------------------------------------------------------------
     # Session root management
     # ------------------------------------------------------------------
+
+    def _reconstruct_eval_state_from_cycles(self) -> None:
+        """Reconstruct ``_eval_counter``/``_iteration``/``_phase`` from existing
+        cycle directories so a resumed run continues the same eval numbering as
+        an uninterrupted run. No-op on a fresh run (empty cycles/).
+        """
+        import re as _re
+
+        cycles_dir = self._cycles_dir
+        if not cycles_dir.exists():
+            return
+        # Matches <optional iter{N}_><phase>_<4-digit counter>_<hex uid>.
+        # arm_scoring dirs (no counter suffix) are ignored, which is correct:
+        # they are not evaluations and do not advance _eval_counter.
+        pattern = _re.compile(r"^(?:iter(\d+)_)?(.+?)_(\d{4})_[a-f0-9]+$")
+        max_counter = 0
+        max_iteration = 0
+        for entry in cycles_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            m = pattern.match(entry.name)
+            if not m:
+                continue
+            iter_n = int(m.group(1)) if m.group(1) else 0
+            counter = int(m.group(3))
+            if counter > max_counter:
+                max_counter = counter
+            if iter_n > max_iteration:
+                max_iteration = iter_n
+        if max_counter > 0:
+            self._eval_counter = max_counter
+            self._iteration = max_iteration
+            self._phase = "seed_val"
+            logger.info(
+                "Reconstructed eval state from cycles: _eval_counter=%d, "
+                "_iteration=%d", self._eval_counter, self._iteration,
+            )
 
     def set_session_root(self, session_root: Path | str) -> None:
         """Set the session root and create the standard directory layout.
@@ -343,10 +439,19 @@ class MetaAREAdapter(
             <session_root>/
             ├── worktrees/   ← persistent pooled git worktrees
             └── cycles/      ← per-evaluation benchmark outputs
+
+        On resume (when cycles/ already contains directories from a prior
+        run), the adapter reconstructs ``_eval_counter``/``_iteration``/
+        ``_phase`` so subsequent evaluations continue with the correct
+        numbering — identical to an uninterrupted run.
         """
         self._session_root = Path(session_root).resolve()
         self._worktree_dir.mkdir(parents=True, exist_ok=True)
         self._cycles_dir.mkdir(parents=True, exist_ok=True)
+
+        # On resume (cycles/ already populated from a prior run), continue the
+        # eval-directory numbering instead of restarting the counter at 0.
+        self._reconstruct_eval_state_from_cycles()
 
         # Initialize worktree pool for this session
         session_id = self._session_root.name
@@ -390,6 +495,43 @@ class MetaAREAdapter(
         if iteration is not None:
             self._iteration = iteration
 
+    def reserve_eval_cycle(
+        self,
+        phase: str,
+        *,
+        iteration: int,
+        capture_traces: bool,
+    ) -> Path:
+        """Reserve the directory consumed by the next evaluation."""
+        if self._reserved_eval is not None:
+            raise RuntimeError("An evaluation cycle is already reserved")
+        self.set_eval_phase(phase, iteration=iteration)
+        eval_id = self._resolve_eval_id(capture_traces)
+        self._reserved_eval = (eval_id, capture_traces)
+        cycle_dir = self._cycles_dir / eval_id
+        cycle_dir.mkdir(parents=True, exist_ok=True)
+        return cycle_dir
+
+    def cancel_reserved_eval_cycle(self) -> Path | None:
+        """Release an unconsumed reservation while preserving its artifacts."""
+        if self._reserved_eval is None:
+            return None
+        eval_id, _capture_traces = self._reserved_eval
+        self._reserved_eval = None
+        return self._cycles_dir / eval_id
+
+    def _consume_eval_id(self, capture_traces: bool) -> str:
+        if self._reserved_eval is None:
+            return self._resolve_eval_id(capture_traces)
+        eval_id, reserved_capture_traces = self._reserved_eval
+        if capture_traces != reserved_capture_traces:
+            raise RuntimeError(
+                "Reserved evaluation capture_traces mismatch: "
+                f"expected {reserved_capture_traces}, got {capture_traces}"
+            )
+        self._reserved_eval = None
+        return eval_id
+
     def _resolve_eval_id(self, capture_traces: bool) -> str:
         """Generate a structured eval directory name from phase state.
 
@@ -413,8 +555,19 @@ class MetaAREAdapter(
 
         # Explicit override takes priority
         if self._forced_phase is not None:
-            label = f"{self._forced_phase}_{counter}_{uid}"
+            forced_phase = self._forced_phase
+            label = f"{forced_phase}_{counter}_{uid}"
             self._forced_phase = None
+            if forced_phase == "seed_val":
+                self._phase = "seed_val"
+            else:
+                for logical_phase in ("train_before", "train_after", "val"):
+                    if (
+                        forced_phase == logical_phase
+                        or forced_phase.endswith(f"_{logical_phase}")
+                    ):
+                        self._phase = logical_phase
+                        break
             return label
 
         # State-machine inference
@@ -437,8 +590,9 @@ class MetaAREAdapter(
             return f"iter{self._iteration:02d}_val_{counter}_{uid}"
 
         # Fallback for unexpected transitions
+        self._phase = "val"
         prefix = f"iter{self._iteration:02d}_" if self._iteration > 0 else ""
-        return f"{prefix}eval_{counter}_{uid}"
+        return f"{prefix}val_{counter}_{uid}"
 
     # ------------------------------------------------------------------
     # Candidate format detection
@@ -466,7 +620,7 @@ class MetaAREAdapter(
         candidate: dict[str, str],
         capture_traces: bool = False,
     ) -> EvaluationBatch[MetaARETrajectory, MetaAREOutput]:
-        eval_id = self._resolve_eval_id(capture_traces)
+        eval_id = self._consume_eval_id(capture_traces)
 
         # Always write candidate.json for provenance
         cycle_dir = self._cycles_dir / eval_id
@@ -508,16 +662,44 @@ class MetaAREAdapter(
             output_dir = cycle_dir / "run"
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            hook_config_path = self._find_hook_config(worktree_path)
-            self._run_benchmark(
-                worktree_path, scenario_ids, output_dir,
-                hook_config_path=hook_config_path,
+            # Unified evaluation starting point: for the seed evaluation, reuse
+            # a prior initial-harness seed_val result (if configured) instead of
+            # re-running the benchmark. Everything downstream (GEPAState, DAG
+            # seed node, RNG-driven sampling) reproduces identically because it
+            # derives solely from these per-scenario scores.
+            seed_eval_source = (
+                self._resolve_seed_eval_source()
+                if eval_id.startswith("seed_val_")
+                else None
             )
+            if seed_eval_source is not None:
+                self._reuse_seed_eval(
+                    seed_eval_source, output_dir, scenario_ids, cycle_dir,
+                )
+            else:
+                hook_config_path = self._find_hook_config(worktree_path)
+                # Dev-set (valset) evaluations run with capture_traces=False and
+                # may use a higher concurrency than mini-batch evaluations
+                # (capture_traces=True), which are bounded to keep resource usage
+                # in check during the reflective loop.
+                max_concurrent = self.cfg.max_concurrent
+                if not capture_traces and self.cfg.max_concurrent_dev is not None:
+                    max_concurrent = self.cfg.max_concurrent_dev
+                self._run_benchmark(
+                    worktree_path, scenario_ids, output_dir,
+                    hook_config_path=hook_config_path,
+                    max_concurrent=max_concurrent,
+                )
 
             # Parse results
             outputs, scores, trajectories = self._parse_results(
                 output_dir, scenario_ids, capture_traces,
             )
+        except (SeedEvalReuseError, HookConfigEvaluationError):
+            # Harness-integrity failures must abort rather than silently
+            # producing 0.0 scores for a different or incomplete candidate.
+            logger.error("Evaluation integrity failure for %s - aborting", eval_id)
+            raise
         except Exception:
             logger.exception("evaluate failed for %s", eval_id)
             outputs = [
@@ -592,6 +774,232 @@ class MetaAREAdapter(
             return hook_path
         return None
 
+    # ------------------------------------------------------------------
+    # Seed-eval reuse (unified evaluation starting point)
+    # ------------------------------------------------------------------
+
+    def _resolve_seed_eval_source(self) -> Path | None:
+        """Resolve the configured seed-eval reuse source to a ``run/`` dir.
+
+        Returns the source ``run/`` directory whose benchmark outputs should
+        be reused for the seed evaluation, or ``None`` when reuse is disabled.
+
+        Accepts (via ``cfg.seed_eval_source``):
+          - a ``seed_val_XXXX_hhhhhh`` cycle dir (contains ``run/``)
+          - a run timestamp dir (contains ``cycles/seed_val_*``)
+          - a ``run/`` dir directly
+
+        Raises ``SeedEvalReuseError`` if a source is configured but cannot be
+        resolved, so a misconfiguration aborts the run instead of silently
+        running the benchmark from scratch.
+        """
+        raw = (self.cfg.seed_eval_source or "").strip()
+        if not raw:
+            return None
+
+        src = Path(raw).expanduser()
+        if not src.exists():
+            raise SeedEvalReuseError(f"seed_eval_source does not exist: {src}")
+        src = src.resolve()
+
+        # Case 1: already a run/ dir (has output.jsonl or lite/ inside)
+        if src.name == "run" or (src / "output.jsonl").exists() or (src / "lite").is_dir():
+            return src
+
+        # Case 2: a cycle dir containing run/
+        if (src / "run").is_dir():
+            return src / "run"
+
+        # Case 3: a run timestamp dir containing cycles/seed_val_*
+        cycles_dir = src / "cycles"
+        if cycles_dir.is_dir():
+            seed_dirs = sorted(p for p in cycles_dir.glob("seed_val_*") if p.is_dir())
+            if not seed_dirs:
+                raise SeedEvalReuseError(
+                    f"No seed_val_* cycle found under {cycles_dir}"
+                )
+            chosen = seed_dirs[0]
+            if len(seed_dirs) > 1:
+                logger.warning(
+                    "Multiple seed_val_* dirs under %s; using earliest: %s",
+                    cycles_dir, chosen.name,
+                )
+            run_dir = chosen / "run"
+            if not run_dir.is_dir():
+                raise SeedEvalReuseError(
+                    f"Seed cycle {chosen} has no run/ directory"
+                )
+            return run_dir
+
+        raise SeedEvalReuseError(
+            f"Could not locate seed-eval run/ outputs from source: {src}"
+        )
+
+    def _reuse_seed_eval(
+        self,
+        source_run: Path,
+        output_dir: Path,
+        scenario_ids: list[str],
+        cycle_dir: Path,
+    ) -> None:
+        """Reuse a prior seed evaluation's benchmark outputs.
+
+        Copies (or symlinks) the source ``run/`` subtree into ``output_dir``
+        so that ``_parse_results`` yields scores identical to a from-scratch
+        seed evaluation, validates that every requested scenario is covered,
+        and records a provenance manifest.
+
+        Raises ``SeedEvalReuseError`` on any coverage/copy failure so the run
+        aborts rather than silently scoring missing scenarios as 0.0.
+        """
+        mode = (self.cfg.seed_eval_reuse_mode or "copy").strip().lower()
+        logger.info(
+            "Reusing seed evaluation from %s (mode=%s) - skipping benchmark run",
+            source_run, mode,
+        )
+
+        try:
+            for item in sorted(source_run.iterdir()):
+                dest = output_dir / item.name
+                if dest.is_symlink() or dest.is_file():
+                    dest.unlink()
+                elif dest.is_dir():
+                    shutil.rmtree(dest, ignore_errors=True)
+                if mode == "symlink":
+                    dest.symlink_to(item.resolve())
+                elif item.is_dir():
+                    shutil.copytree(item, dest, symlinks=True)
+                else:
+                    shutil.copy2(item, dest)
+        except Exception as e:
+            raise SeedEvalReuseError(
+                f"Failed to {mode} seed-eval outputs from {source_run}: {e}"
+            ) from e
+
+        # Validate coverage against output.jsonl (the score source used by
+        # _parse_results). lite/ may legitimately have fewer files, so it is
+        # NOT authoritative for coverage.
+        covered = self._collect_scored_scenario_ids(output_dir)
+        missing = [sid for sid in scenario_ids if sid not in covered]
+        if missing:
+            raise SeedEvalReuseError(
+                f"Reused seed evaluation covers {len(covered)} scenarios but is "
+                f"missing {len(missing)}/{len(scenario_ids)} requested val "
+                f"scenarios (source={source_run}). The seed_eval_source val set "
+                f"must match this run's val set. First missing: {missing[:5]}"
+            )
+        logger.info(
+            "Seed-eval reuse coverage OK: %d/%d scenarios present",
+            len(scenario_ids), len(scenario_ids),
+        )
+
+        self._write_reuse_manifest(source_run, cycle_dir, scenario_ids, covered)
+
+    @staticmethod
+    def _collect_scored_scenario_ids(output_dir: Path) -> set[str]:
+        """Scenario ids that ``_parse_results`` can score from output.jsonl.
+
+        ``_parse_results`` derives each score from output.jsonl entries
+        (falling back to 0.0 when absent), so coverage must be measured
+    against output.jsonl, not lite traces.
+        """
+        covered: set[str] = set()
+        for jsonl_file in output_dir.rglob("output.jsonl"):
+            try:
+                for entry in MetaAREAdapter._read_jsonl(jsonl_file):
+                    meta = entry.get("metadata", {})
+                    sid = entry.get("task_id") or meta.get("scenario_id", "")
+                    if sid:
+                        covered.add(sid)
+            except Exception as e:
+                logger.warning("Failed reading %s for coverage: %s", jsonl_file, e)
+        return covered
+
+    def _write_reuse_manifest(
+        self,
+        source_run: Path,
+        cycle_dir: Path,
+        scenario_ids: list[str],
+        covered: set[str],
+    ) -> None:
+        """Write a provenance manifest recording the seed-eval reuse."""
+        cfg = self.cfg
+        source_run_id = ""
+        source_cycle = ""
+        try:
+            source_cycle = source_run.parent.name
+            source_run_id = source_run.parent.parent.parent.name
+        except Exception:
+            pass
+
+        manifest = {
+            "reused": True,
+            "source_run": str(source_run),
+            "source_cycle": source_cycle,
+            "source_run_id": source_run_id,
+            "reuse_mode": (cfg.seed_eval_reuse_mode or "copy"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "requested_scenarios": len(scenario_ids),
+            "covered_scenarios": len(covered),
+            "harness_fingerprint": {
+                "base_branch": cfg.base_branch,
+                "agent": cfg.agent,
+                "model": cfg.model,
+                "model_provider": cfg.model_provider,
+                "reasoning_effort": cfg.reasoning_effort,
+                "judge_model": cfg.judge_model,
+                "judge_provider": cfg.judge_provider,
+                "dataset_path": cfg.dataset_path,
+                "split": cfg.split,
+            },
+        }
+        payload = json.dumps(manifest, indent=2, ensure_ascii=False)
+        try:
+            (cycle_dir / "seed_eval_reuse.json").write_text(payload)
+            if self._session_root is not None:
+                (self._session_root / "seed_eval_reuse.json").write_text(payload)
+        except Exception as e:  # best-effort provenance; never abort the run
+            logger.warning("Failed to write seed-eval reuse manifest: %s", e)
+
+        self._maybe_warn_harness_mismatch(source_run)
+
+    def _maybe_warn_harness_mismatch(self, source_run: Path) -> None:
+        """Warn (never abort) if a source reuse manifest's harness differs.
+
+        Only effective when the source itself was produced via reuse (i.e. it
+        carries a ``seed_eval_reuse.json``). From-scratch sources carry no
+        fingerprint, so the check is silently skipped.
+        """
+        candidates = [
+            source_run.parent / "seed_eval_reuse.json",
+            source_run.parent.parent.parent / "seed_eval_reuse.json",
+        ]
+        for man_path in candidates:
+            try:
+                if not man_path.exists():
+                    continue
+                fp = json.loads(man_path.read_text()).get("harness_fingerprint", {})
+            except Exception:
+                continue
+            current = {
+                "base_branch": self.cfg.base_branch,
+                "model": self.cfg.model,
+                "model_provider": self.cfg.model_provider,
+                "judge_model": self.cfg.judge_model,
+                "dataset_path": self.cfg.dataset_path,
+                "split": self.cfg.split,
+            }
+            for key, cur_val in current.items():
+                prior_val = fp.get(key)
+                if prior_val is not None and prior_val != cur_val:
+                    logger.warning(
+                        "Seed-eval reuse harness mismatch on '%s': source=%r "
+                        "current=%r. Reused baseline may not match this run's "
+                        "initial harness.",
+                        key, prior_val, cur_val,
+                    )
+            break
+
     def _run_benchmark(
         self,
         worktree_path: Path,
@@ -599,8 +1007,13 @@ class MetaAREAdapter(
         output_dir: Path,
         *,
         hook_config_path: Path | None = None,
+        max_concurrent: int | None = None,
     ) -> None:
-        """Run are-benchmark in the worktree for the given scenarios."""
+        """Run are-benchmark in the worktree for the given scenarios.
+
+        ``max_concurrent`` overrides the number of scenarios run in parallel;
+        when None it falls back to ``cfg.max_concurrent``.
+        """
         # Stage scenario files into a temp directory
         staging_dir = self._stage_scenarios(scenario_ids)
 
@@ -619,29 +1032,32 @@ class MetaAREAdapter(
             parts.append(f"--endpoint {cfg.model_endpoint}")
         if cfg.reasoning_effort:
             parts.append(f"--reasoning_effort {cfg.reasoning_effort}")
+        if cfg.model_azure_config_dir:
+            parts.append(
+                f"--azure_config_dir {shlex.quote(cfg.model_azure_config_dir)}"
+            )
         if cfg.judge_model:
             parts.append(f"--judge_model {cfg.judge_model}")
         if cfg.judge_provider:
             parts.append(f"--judge_provider {cfg.judge_provider}")
+        if cfg.judge_endpoint:
+            parts.append(f"--judge_endpoint {cfg.judge_endpoint}")
+        if cfg.judge_azure_config_dir:
+            parts.append(
+                "--judge_azure_config_dir "
+                f"{shlex.quote(cfg.judge_azure_config_dir)}"
+            )
 
         parts.append(f"--output_dir {output_dir}")
         parts.append(f"--scenario_timeout {cfg.scenario_timeout}")
         parts.append(f"--num_runs {cfg.num_runs}")
-        parts.append(f"--max_concurrent_scenarios {cfg.max_concurrent}")
+        concurrency = max_concurrent if max_concurrent is not None else cfg.max_concurrent
+        parts.append(f"--max_concurrent_scenarios {concurrency}")
         parts.append("--trace_dump_format both")
 
-        # Pass hook config if available (only if the installed ARE supports it)
+        # A hook file is part of the candidate harness and must be evaluated.
         if hook_config_path and hook_config_path.exists():
-            probe = subprocess.run(
-                f"{cfg.activate_command} && are-benchmark run --help",
-                shell=True, capture_output=True, text=True, timeout=30,
-            )
-            if "--hook-config" in (probe.stdout or ""):
-                parts.append(f"--hook-config {hook_config_path}")
-            else:
-                logger.warning(
-                    "Installed are-benchmark does not support --hook-config; skipping hook config"
-                )
+            parts.append(f"--hook-config {shlex.quote(str(hook_config_path))}")
 
         cmd_str = " ".join(parts)
 
@@ -681,6 +1097,11 @@ class MetaAREAdapter(
                 result.stdout[-2000:] if result.stdout else "",
                 result.stderr[-2000:] if result.stderr else "",
             )
+            if hook_config_path and hook_config_path.exists():
+                raise HookConfigEvaluationError(
+                    "Benchmark failed while evaluating hook config "
+                    f"{hook_config_path} (exit {result.returncode})"
+                )
             # Don't raise — we'll parse whatever partial results exist
 
     def _stage_scenarios(self, scenario_ids: list[str]) -> Path | None:
@@ -742,6 +1163,14 @@ class MetaAREAdapter(
                 traces_by_id[sid] = data
             except Exception as e:
                 logger.warning("Failed to parse lite trace %s: %s", lite_file, e)
+
+        # Also try benchmark_stats.json for supplementary info
+        stats_file = output_dir / "benchmark_stats.json"
+        if stats_file.exists():
+            try:
+                json.loads(stats_file.read_text())
+            except Exception:
+                pass
 
         # Build per-scenario outputs
         outputs: list[MetaAREOutput] = []

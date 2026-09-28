@@ -8,7 +8,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # SDK Session metadata
 # ---------------------------------------------------------------------------
@@ -29,6 +28,29 @@ class SDKSessionInfo:
     cache_read_input_tokens: int
 
     session_json_path: str
+
+    # Timing and richer usage metrics. Defaults keep backward compatibility
+    # with session JSON produced before these fields were tracked.
+    wall_clock_s: float = 0.0
+    duration_ms: int = 0
+    duration_api_ms: int = 0
+    num_turns: int = 0
+    total_cost_usd: float | None = None
+    cache_creation_input_tokens: int = 0
+    model_usage: dict[str, Any] | None = None
+    reasoning_tokens: int = 0
+    llm_call_count: int = 0
+    usage_event_count: int = 0
+    duplicate_usage_event_count: int = 0
+    copilot_nano_aiu: float | None = None
+    reported_cost_usd: float | None = None
+    metered_cost_usd: float | None = None
+    estimated_cost_usd: float | None = None
+    cost_source: str | None = None
+    cost_is_estimate: bool = False
+    attempt_count: int = 1
+    attempt_accounting_complete: bool = True
+    final_attempt_cost_usd: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -240,6 +262,8 @@ class EvolutionNode:
     val_evaluated: bool = False
 
     mini_batch_ids: list[str] = field(default_factory=list)
+    pulled_arm_id: str | None = None  # pattern_id of the pulled arm (None for unseen draws)
+    sampling_completed: bool = False
 
     base_parent_idx: int | None = None
 
@@ -248,15 +272,20 @@ class EvolutionNode:
     patch_verdict: PatchVerdict | None = None
 
     worktree_path: str = ""
-    commit_hash: str | None = None
+    commit_hash: str | None = None  # Post-patch commit (after Session 1)
+    pre_patch_commit: str | None = None  # Pre-patch commit (after Session 0, before Session 1)
     train_before_cycle_dir: str | None = None
     train_after_cycle_dir: str | None = None
 
     sdk_session_selection: SDKSessionInfo | None = None
     sdk_session_patch: SDKSessionInfo | None = None
     sdk_session_reflection: SDKSessionInfo | None = None
+    sdk_session_pattern_extraction: SDKSessionInfo | None = None
+    sdk_session_arm_scoring: SDKSessionInfo | None = None
+    sdk_session_unseen_scenario_exploration: SDKSessionInfo | None = None
 
     abandoned: bool = False  # True if session failed or verification failed
+    abandon_reason: str | None = None  # e.g. all_pass, session1_failed, verify_failed, resume_incomplete
     accepted: bool | None = None  # Engine's acceptance decision (None = not yet decided)
 
     def to_dict(self) -> dict[str, Any]:
@@ -267,6 +296,9 @@ class EvolutionNode:
         d["sdk_session_selection"] = self.sdk_session_selection.to_dict() if self.sdk_session_selection else None
         d["sdk_session_patch"] = self.sdk_session_patch.to_dict() if self.sdk_session_patch else None
         d["sdk_session_reflection"] = self.sdk_session_reflection.to_dict() if self.sdk_session_reflection else None
+        d["sdk_session_pattern_extraction"] = self.sdk_session_pattern_extraction.to_dict() if self.sdk_session_pattern_extraction else None
+        d["sdk_session_arm_scoring"] = self.sdk_session_arm_scoring.to_dict() if self.sdk_session_arm_scoring else None
+        d["sdk_session_unseen_scenario_exploration"] = self.sdk_session_unseen_scenario_exploration.to_dict() if self.sdk_session_unseen_scenario_exploration else None
         return d
 
     @classmethod
@@ -277,6 +309,17 @@ class EvolutionNode:
         sess_sel = SDKSessionInfo.from_dict(d["sdk_session_selection"]) if d.get("sdk_session_selection") else None
         sess_patch = SDKSessionInfo.from_dict(d["sdk_session_patch"]) if d.get("sdk_session_patch") else None
         sess_refl = SDKSessionInfo.from_dict(d["sdk_session_reflection"]) if d.get("sdk_session_reflection") else None
+        sess_pattern = SDKSessionInfo.from_dict(d["sdk_session_pattern_extraction"]) if d.get("sdk_session_pattern_extraction") else None
+        sess_arm = SDKSessionInfo.from_dict(d["sdk_session_arm_scoring"]) if d.get("sdk_session_arm_scoring") else None
+        sess_unseen = SDKSessionInfo.from_dict(d["sdk_session_unseen_scenario_exploration"]) if d.get("sdk_session_unseen_scenario_exploration") else None
+        legacy_sampling_completed = (
+            int(d.get("iteration", 0)) == 0
+            or bool(d.get("mini_batch_ids"))
+            or d.get("patch_verdict") is not None
+            or d.get("train_before_cycle_dir") is not None
+            or bool(d.get("abandoned", False))
+            or d.get("accepted") is not None
+        )
         return cls(
             idx=d["idx"],
             iteration=d["iteration"],
@@ -286,20 +329,60 @@ class EvolutionNode:
             score_val=d.get("score_val"),
             val_evaluated=d.get("val_evaluated", False),
             mini_batch_ids=d.get("mini_batch_ids", []),
+            pulled_arm_id=d.get("pulled_arm_id"),
+            sampling_completed=d.get(
+                "sampling_completed",
+                legacy_sampling_completed,
+            ),
             base_parent_idx=d.get("base_parent_idx"),
             selection_decision=sel_dec,
             patch_intent=intent,
             patch_verdict=verdict,
             worktree_path=d.get("worktree_path", ""),
             commit_hash=d.get("commit_hash"),
+            pre_patch_commit=d.get("pre_patch_commit"),
             train_before_cycle_dir=d.get("train_before_cycle_dir"),
             train_after_cycle_dir=d.get("train_after_cycle_dir"),
             sdk_session_selection=sess_sel,
             sdk_session_patch=sess_patch,
             sdk_session_reflection=sess_refl,
+            sdk_session_pattern_extraction=sess_pattern,
+            sdk_session_arm_scoring=sess_arm,
+            sdk_session_unseen_scenario_exploration=sess_unseen,
             abandoned=d.get("abandoned", False),
+            abandon_reason=d.get("abandon_reason"),
             accepted=d.get("accepted"),
         )
+
+
+@dataclass
+class ArmPullRecord:
+    """One pull of an arm (pattern) with its per-scenario outcome.
+
+    Unifies the kinds of pull a single arm can have across iterations so that
+    BOTH Session 1 (diagnose/patch) and Session 4 (arm scoring) render the same
+    history:
+
+    * ``"patched"`` — the pull produced a patch; ``scenario_outcomes`` are the
+      before→after impacts and ``node.patch_verdict`` carries the reflections.
+    * ``"all_pass_skip"`` — every mini-batch scenario already passed in
+      train_before, so the iteration was abandoned with no patch;
+      ``scenario_outcomes`` are all ``still_passing``.
+    * ``"failed_attempt"`` — the diagnose/patch session or verification failed,
+      producing no usable patch; ``scenario_outcomes`` may be empty.
+    """
+
+    node: EvolutionNode
+    kind: str  # "patched" | "all_pass_skip" | "failed_attempt"
+    scenario_outcomes: list[ScenarioImpact] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "idx": self.node.idx,
+            "iteration": self.node.iteration,
+            "kind": self.kind,
+            "scenario_outcomes": [si.to_dict() for si in self.scenario_outcomes],
+        }
 
 
 # ---------------------------------------------------------------------------
