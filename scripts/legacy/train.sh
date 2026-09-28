@@ -2,19 +2,17 @@
 # ============================================================================
 # AutoSaddler — Train Script
 #
-# Runs legacy V1 AutoSaddler or ActiveSaddler optimization on the Meta-ARE default agent.
-# Supports the Claude Agent SDK and the GitHub Copilot SDK.
+# Runs AutoSaddler optimization on Meta-ARE default agent.
+# Uses Claude Agent SDK for agent sessions and OpenAI API for judge.
 #
 # Required environment variables:
 #   META_ARE_REPO    — path to Meta-ARE repository
-# Optional environment variables:
-#   META_ARE_BASE_BRANCH — base harness branch in META_ARE_REPO (default: main)
-#   Azure CLI profile directories referenced by the selected config
+#   OPENAI_API_KEY   — OpenAI API key (for judge model)
+#   ANTHROPIC_API_KEY — Anthropic API key (for Claude Agent SDK, if not set in config)
 #
 # Usage:
 #   bash scripts/legacy/train.sh --config configs/v1/meta_are.yaml
-#   bash scripts/legacy/train.sh --config configs/v1/meta_are_activesaddler.yaml
-#   bash scripts/legacy/train.sh --config configs/v1/meta_are_activesaddler_smoke.yaml --dry-run
+#   bash scripts/legacy/train.sh --config configs/v1/meta_are_smoke.yaml --dry-run
 # ============================================================================
 
 # NOTE: Do NOT use 'set -e' here. The main training loop (python optimize)
@@ -25,17 +23,6 @@
 AUTOSADDLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="${AUTOSADDLER_DIR}/logs"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-
-print_usage() {
-    echo "Usage: bash scripts/legacy/train.sh --config <config.yaml> [--dry-run]"
-}
-
-for arg in "$@"; do
-    if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
-        print_usage
-        exit 0
-    fi
-done
 
 # ─── Parse arguments ─────────────────────────────────────────────────
 CONFIG=""
@@ -55,7 +42,7 @@ for arg in "$@"; do
 done
 
 if [[ -z "$CONFIG" ]]; then
-    print_usage
+    echo "Usage: bash scripts/legacy/train.sh --config <config.yaml> [--dry-run]"
     exit 1
 fi
 
@@ -69,86 +56,20 @@ export PYTHONPATH="${AUTOSADDLER_DIR}/src:${PYTHONPATH:-}"
 
 # ─── Verify environment variables ────────────────────────────────────
 : "${META_ARE_REPO:?ERROR: META_ARE_REPO not set. Export it to point to your Meta-ARE repo.}"
-
+: "${OPENAI_API_KEY:?ERROR: OPENAI_API_KEY not set. Export it for judge model access.}"
 export META_ARE_BASE_BRANCH="${META_ARE_BASE_BRANCH:-main}"
 
-CONFIG_FACTS="$(python - "$CONFIG" <<'PY'
-import sys
-from autosaddler.v1.adapters.meta_are_adapter.optimize import load_config
-
-config = load_config(sys.argv[1])
-sdk = config.get("sdk", {})
-claude = sdk.get("claude") if isinstance(sdk.get("claude"), dict) else sdk
-adapter = config.get("adapter", {})
-print("|".join([
-    str(sdk.get("backend", "claude")),
-    str(claude.get("auth_mode", "api_key")),
-    str(claude.get("azure_config_dir") or ""),
-    str(adapter.get("model_azure_config_dir") or ""),
-    str(adapter.get("judge_azure_config_dir") or ""),
-    str(adapter.get("model_provider") or ""),
-    str(adapter.get("judge_provider") or ""),
-]))
-PY
-)"
-if [[ $? -ne 0 || -z "$CONFIG_FACTS" ]]; then
-    echo "ERROR: failed to load config: $CONFIG" >&2
-    exit 1
-fi
-IFS='|' read -r CONFIG_SDK_BACKEND CLAUDE_AUTH_MODE SDK_AZURE_DIR MODEL_AZURE_DIR JUDGE_AZURE_DIR MODEL_PROVIDER JUDGE_PROVIDER <<< "$CONFIG_FACTS"
-
-if [[ "$MODEL_PROVIDER" == "openai" || "$JUDGE_PROVIDER" == "openai" ]]; then
-    : "${OPENAI_API_KEY:?ERROR: OPENAI_API_KEY not set for the selected OpenAI model or judge provider.}"
-fi
-if [[ "$CONFIG_SDK_BACKEND" == "claude" && "$CLAUDE_AUTH_MODE" == "api_key" \
-      && -z "${ANTHROPIC_API_KEY:-}" && -z "${ANTHROPIC_BASE_URL:-}" ]]; then
+# ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL must be set for Claude Agent SDK
+if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${ANTHROPIC_BASE_URL:-}" ]]; then
     echo "WARNING: Neither ANTHROPIC_API_KEY nor ANTHROPIC_BASE_URL is set."
     echo "         Claude Agent SDK sessions will fail unless configured in the YAML."
 fi
 
-if [[ -n "$SDK_AZURE_DIR" || -n "$MODEL_AZURE_DIR" || -n "$JUDGE_AZURE_DIR" ]]; then
-    command -v az >/dev/null 2>&1 || {
-        echo "ERROR: Azure CLI (az) is not installed or not on PATH."
-        exit 1
-    }
-fi
-
-verify_azure_profile() {
-    local label="$1"
-    local profile_dir="$2"
-
-    if [[ ! -d "$profile_dir" ]]; then
-        echo "ERROR: ${label} Azure profile directory not found: ${profile_dir}"
-        exit 1
-    fi
-    if ! AZURE_CONFIG_DIR="$profile_dir" az account show --query state -o tsv 2>/dev/null | grep -qx "Enabled"; then
-        echo "ERROR: ${label} Azure profile is not logged in: ${profile_dir}"
-        exit 1
-    fi
-}
-
-if [[ "$CLAUDE_AUTH_MODE" == "azure_cli_helper" ]]; then
-    verify_azure_profile "Claude SDK" "$SDK_AZURE_DIR"
-fi
-if [[ -n "$MODEL_AZURE_DIR" ]]; then
-    verify_azure_profile "Agent model" "$MODEL_AZURE_DIR"
-fi
-if [[ -n "$JUDGE_AZURE_DIR" ]]; then
-    verify_azure_profile "Judge" "$JUDGE_AZURE_DIR"
-fi
-
 # ─── Pre-flight checks ───────────────────────────────────────────────
-if [[ "$CONFIG_SDK_BACKEND" == "copilot" ]]; then
-    python -c "import copilot" 2>/dev/null || {
-        echo "ERROR: github-copilot-sdk not installed. Run: uv sync"
-        exit 1
-    }
-else
-    python -c "import claude_agent_sdk" 2>/dev/null || {
-        echo "ERROR: claude-agent-sdk not installed. Run: uv sync"
-        exit 1
-    }
-fi
+python -c "import claude_agent_sdk; print(f'claude-agent-sdk {claude_agent_sdk.__version__}')" 2>/dev/null || {
+    echo "ERROR: claude_agent_sdk not installed. Run: uv pip install -e '.'"
+    exit 1
+}
 
 python -c "import git" 2>/dev/null || {
     echo "ERROR: gitpython not installed"

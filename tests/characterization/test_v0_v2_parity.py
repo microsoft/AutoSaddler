@@ -77,7 +77,6 @@ def test_v1_meta_are_cli_dispatches_to_v1_optimize(monkeypatch: pytest.MonkeyPat
         "optimization": {"max_metric_calls": 1},
         "sdk": {},
     }
-    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     monkeypatch.setattr(optimize_cli, "load_config", lambda path: config)
     monkeypatch.setattr(optimize_cli, "load_scenario_ids", lambda path: [Path(path).stem])
     monkeypatch.setattr(optimize_cli, "_build_autosaddler_proposer", lambda **kwargs: "proposer")
@@ -97,7 +96,6 @@ def test_v1_meta_are_cli_dispatches_to_v1_optimize(monkeypatch: pytest.MonkeyPat
     assert optimize_calls[0]["valset"] == ["val"]
     result_files = list((tmp_path / "runs").glob("*/best_candidate.json"))
     assert len(result_files) == 1
-    assert (result_files[0].parent / "run_config.json").is_file()
 
 
 def test_v1_meta_are_cli_dry_run_does_not_construct_adapter(

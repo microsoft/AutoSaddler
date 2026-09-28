@@ -4,7 +4,7 @@
 #
 # Evaluates the best worktree from a completed AutoSaddler training run.
 # Automatically finds the best candidate (highest dev score, latest iteration)
-# from evolution_dag.json(.gz) and runs are-benchmark on specified test scenarios.
+# from evolution_dag.json and runs are-benchmark on specified test scenarios.
 #
 # Required environment variables:
 #   META_ARE_REPO    — path to Meta-ARE repository
@@ -93,23 +93,16 @@ if [[ -n "$WORKTREE_OVERRIDE" ]]; then
     BEST_WORKTREE="$WORKTREE_OVERRIDE"
     echo "Using manually specified worktree: $BEST_WORKTREE"
 else
-    # Current runs write gzip-compressed DAGs; older runs wrote plain JSON.
-    DAG_JSON="${TRAIN_OUTPUT}/evolution_dag.json.gz"
+    DAG_JSON="${TRAIN_OUTPUT}/evolution_dag.json"
     if [[ ! -f "$DAG_JSON" ]]; then
-        DAG_JSON="${TRAIN_OUTPUT}/evolution_dag.json"
-    fi
-    if [[ ! -f "$DAG_JSON" ]]; then
-        echo "ERROR: evolution_dag.json(.gz) not found in $TRAIN_OUTPUT"
+        echo "ERROR: evolution_dag.json not found at $DAG_JSON"
         exit 1
     fi
 
     BEST_WORKTREE=$(python3 -c "
-import gzip, json, sys
+import json, sys
 
-path = '$DAG_JSON'
-opener = gzip.open if path.endswith('.gz') else open
-with opener(path, 'rt', encoding='utf-8') as handle:
-    dag = json.load(handle)
+dag = json.load(open('$DAG_JSON'))
 nodes = dag['nodes']
 
 # Find nodes with val scores

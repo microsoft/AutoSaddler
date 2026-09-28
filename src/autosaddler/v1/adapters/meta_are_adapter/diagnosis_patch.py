@@ -13,7 +13,7 @@ No re-evaluation is performed.  The purpose is to collect:
 Usage:
     python -m autosaddler.v1.adapters.meta_are_adapter.diagnosis_patch \\
         --initial-harness /path/to/initial_harness/train_YYYYMMDD-HHMMSS \\
-        --config configs/train_activesaddler.yaml \\
+        --config configs/v1/meta_are.yaml \
         [--phase capability] \\
         [--scenario-filter id1,id2] \\
         [--dry-run]
@@ -46,44 +46,48 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _load_config(config_path: str) -> dict[str, Any]:
-    """Load an environment-expanded YAML config with optional overlays."""
-    from autosaddler.v1.utils.config import load_yaml_config
+    """Load YAML config with env-var expansion."""
+    import re
 
-    return load_yaml_config(config_path)
+    import yaml
+
+    with open(config_path) as f:
+        raw = f.read()
+
+    def _expand_var(match: re.Match) -> str:
+        var_name = match.group(1)
+        default = match.group(3)
+        val = os.environ.get(var_name, "")
+        if val:
+            return val
+        if default is not None:
+            return default
+        return ""
+
+    expanded = re.sub(r'\$\{([^}:]+)(:-([^}]*))?\}', _expand_var, raw)
+    expanded = os.path.expandvars(expanded)
+    return yaml.safe_load(expanded)
 
 
 def _build_sdk_config(cfg: dict[str, Any]) -> Any:
     """Build SdkConfig from the full config dict."""
-    from autosaddler.v1.sdk_session import (
-        SdkConfig,
-        build_copilot_provider,
-        build_sdk_retry_config,
-    )
+    from autosaddler.v1.sdk_session import SdkConfig
 
     sdk_cfg = cfg.get("sdk", {})
-    claude_cfg = sdk_cfg.get("claude")
-    if not isinstance(claude_cfg, dict):
-        claude_cfg = sdk_cfg
+    claude_cfg = sdk_cfg.get("claude", {})
     copilot_cfg = sdk_cfg.get("copilot", {})
 
     return SdkConfig(
         backend=sdk_cfg.get("backend", "claude"),
-        claude_base_url=(
-            os.environ.get("ANTHROPIC_BASE_URL")
-            or claude_cfg.get("base_url", "https://api.anthropic.com")
+        claude_base_url=os.environ.get(
+            "ANTHROPIC_BASE_URL",
+            claude_cfg.get("base_url", "https://api.anthropic.com"),
         ),
-        claude_api_key=(
-            os.environ.get("ANTHROPIC_API_KEY")
-            or claude_cfg.get("api_key", "")
-            or "EMPTY"
-        ),
+        claude_api_key=os.environ.get(
+            "ANTHROPIC_API_KEY", claude_cfg.get("api_key", ""),
+        ) or "EMPTY",
         claude_permission_mode=claude_cfg.get("permission_mode", "bypassPermissions"),
         claude_model=claude_cfg.get("model"),
-        claude_auth_mode=claude_cfg.get("auth_mode", "api_key"),
-        claude_azure_config_dir=claude_cfg.get("azure_config_dir"),
-        claude_azure_resource=claude_cfg.get("azure_resource"),
-        claude_custom_headers=claude_cfg.get("custom_headers", {}),
-        claude_token_helper_ttl_ms=claude_cfg.get("token_helper_ttl_ms", 2_700_000),
         claude_effort=claude_cfg.get("effort", "max"),
         claude_allowed_tools=claude_cfg.get("allowed_tools"),
         claude_setting_sources=claude_cfg.get("setting_sources"),
@@ -92,8 +96,6 @@ def _build_sdk_config(cfg: dict[str, Any]) -> Any:
         copilot_model=copilot_cfg.get("model"),
         copilot_effort=copilot_cfg.get("effort", "max"),
         copilot_allowed_tools=copilot_cfg.get("allowed_tools"),
-        copilot_provider=build_copilot_provider(copilot_cfg),
-        retry=build_sdk_retry_config(sdk_cfg),
     )
 
 
@@ -280,56 +282,14 @@ def _run_sdk_session_with_retry(
     timeout: float,
     sdk_config: Any,
     extra_env: dict[str, str] | None = None,
-    session_type: str | None = None,
-    iteration: int | None = None,
-    candidate_idx: int | None = None,
-    artifact_dir: str | Path | None = None,
     max_retries: int = 5,
     initial_backoff: float = 60.0,
 ) -> dict[str, Any] | None:
-    """Run an SDK session with rate-limit and content-filter retries."""
-    from autosaddler.v1.proposer.autosaddler.proposer import AutoSaddlerProposer
-    from autosaddler.v1.sdk_session import (
-        ContentFilterError,
-        RateLimitError,
-        run_sdk_session,
-    )
+    """Run an SDK session with exponential backoff on rate-limit errors."""
+    from autosaddler.v1.sdk_session import RateLimitError, run_sdk_session
 
     backoff = initial_backoff
-    rate_limit_failures = 0
-    content_filter_retries = 0
-    attempt_count = 0
-    failed_attempts: list[dict[str, Any]] = []
-    worktree_snapshot = AutoSaddlerProposer._capture_worktree_retry_state(
-        worktree_path
-    )
-    retry_file_snapshot = AutoSaddlerProposer._capture_retry_files(
-        AutoSaddlerProposer._sdk_retry_state_paths(
-            extra_env,
-            session_type=None,
-            iteration=None,
-            candidate_idx=None,
-            artifact_dir=None,
-        )
-    )
-    error_artifact_path = AutoSaddlerProposer._sdk_error_artifact_path(
-        session_type=session_type,
-        iteration=iteration,
-        candidate_idx=candidate_idx,
-        artifact_dir=artifact_dir,
-    )
-    if error_artifact_path is not None:
-        error_artifact_path.unlink(missing_ok=True)
-
-    def restore_attempt_state() -> None:
-        AutoSaddlerProposer._restore_worktree_retry_state(
-            worktree_path,
-            worktree_snapshot,
-        )
-        AutoSaddlerProposer._restore_retry_files(retry_file_snapshot)
-
-    while True:
-        attempt_count += 1
+    for attempt in range(1, max_retries + 1):
         old_env: dict[str, str | None] = {}
         if extra_env:
             for key, value in extra_env.items():
@@ -346,124 +306,20 @@ def _run_sdk_session_with_retry(
                     track_events=True,
                 )
             )
-            result["retry"] = {
-                "attempt_count": attempt_count,
-                "content_filter_retries": content_filter_retries,
-                "rate_limit_retries": rate_limit_failures,
-            }
-            final_attempt = {
-                "attempt": attempt_count,
-                "classification": "success",
-                "will_retry": False,
-                **AutoSaddlerProposer._sdk_attempt_metrics(result),
-            }
-            result["attempts"] = [*failed_attempts, final_attempt]
-            result_meta = result.setdefault("result_meta", {})
-            result_meta["final_attempt_cost_usd"] = result_meta.get(
-                "total_cost_usd"
-            )
-            result_meta.update(
-                AutoSaddlerProposer._logical_attempt_totals(result["attempts"])
-            )
             return result
-        except ContentFilterError as exc:
-            can_retry = (
-                content_filter_retries < sdk_config.retry.content_filter_max_retries
-            )
-            retry_number = content_filter_retries + 1
-            delay = (
-                sdk_config.retry.delay_for_content_filter_retry(retry_number)
-                if can_retry
-                else 0.0
-            )
-            failed_attempts.append(
-                {
-                    "attempt": attempt_count,
-                    "classification": "content_filter",
-                    **exc.to_dict(),
-                    "will_retry": can_retry,
-                    "retry_delay_s": delay,
-                    **AutoSaddlerProposer._sdk_attempt_metrics(exc),
-                }
-            )
-            restore_attempt_state()
-            if can_retry:
-                content_filter_retries += 1
-                logger.warning(
-                    "Content filter blocked SDK session (retry %d/%d). "
-                    "Starting a fresh session in %.0fs...",
-                    content_filter_retries,
-                    sdk_config.retry.content_filter_max_retries,
-                    delay,
-                )
-                if delay > 0:
-                    time.sleep(delay)
-            else:
-                logger.error(
-                    "Content filter still blocked the SDK session after %d "
-                    "additional retries",
-                    content_filter_retries,
-                )
-                AutoSaddlerProposer._write_sdk_error_artifact(
-                    error_artifact_path,
-                    session_type=session_type,
-                    iteration=iteration,
-                    candidate_idx=candidate_idx,
-                    attempts=failed_attempts,
-                )
-                return None
-        except RateLimitError as exc:
-            rate_limit_failures += 1
-            can_retry = rate_limit_failures < max_retries
-            failed_attempts.append(
-                {
-                    "attempt": attempt_count,
-                    "classification": "rate_limit",
-                    "message": str(exc),
-                    "will_retry": can_retry,
-                    "retry_delay_s": backoff if can_retry else 0.0,
-                    **AutoSaddlerProposer._sdk_attempt_metrics(exc),
-                }
-            )
-            restore_attempt_state()
-            if can_retry:
+        except RateLimitError:
+            if attempt < max_retries:
                 logger.warning(
                     "Rate-limited (attempt %d/%d). Retrying in %.0fs...",
-                    rate_limit_failures, max_retries, backoff,
+                    attempt, max_retries, backoff,
                 )
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 600.0)
             else:
                 logger.error("Rate-limited after %d retries — giving up", max_retries)
-                AutoSaddlerProposer._write_sdk_error_artifact(
-                    error_artifact_path,
-                    session_type=session_type,
-                    iteration=iteration,
-                    candidate_idx=candidate_idx,
-                    attempts=failed_attempts,
-                )
                 return None
-        except Exception as exc:
-            failed_attempts.append(
-                {
-                    "attempt": attempt_count,
-                    "classification": "non_retryable",
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
-                    "will_retry": False,
-                    "retry_delay_s": 0.0,
-                    **AutoSaddlerProposer._sdk_attempt_metrics(exc),
-                }
-            )
-            restore_attempt_state()
+        except Exception:
             logger.exception("SDK session failed")
-            AutoSaddlerProposer._write_sdk_error_artifact(
-                error_artifact_path,
-                session_type=session_type,
-                iteration=iteration,
-                candidate_idx=candidate_idx,
-                attempts=failed_attempts,
-            )
             return None
         finally:
             if extra_env:
@@ -485,8 +341,6 @@ def _extract_session_info(
 ) -> Path | None:
     """Extract session info and write patch.json. Returns the JSON path."""
     try:
-        from autosaddler.v1.sdk_session import aggregate_model_usage
-
         tool_calls = session_result.get("tool_calls", [])
         turns = session_result.get("turns", 0)
         usage = session_result.get("usage") or []
@@ -494,7 +348,6 @@ def _extract_session_info(
         input_tokens = 0
         output_tokens = 0
         cache_read = 0
-        reasoning_tokens = 0
         for u in usage:
             if isinstance(u, dict):
                 input_tokens += u.get("input_tokens", 0) or u.get("promptTokens", 0) or 0
@@ -504,40 +357,6 @@ def _extract_session_info(
                     or u.get("cache_read_tokens", 0)
                     or 0
                 )
-                reasoning_tokens += u.get("reasoning_tokens", 0) or 0
-        result_meta = session_result.get("result_meta") or {}
-        attempts = session_result.get("attempts") or []
-        attempt_accounting_complete = result_meta.get(
-            "attempt_accounting_complete",
-            not attempts or len(attempts) == 1,
-        )
-        model_usage = result_meta.get("model_usage")
-        inclusive_usage = aggregate_model_usage(model_usage)
-        cache_creation = 0
-        if inclusive_usage is not None:
-            input_tokens = int(inclusive_usage["input_tokens"])
-            output_tokens = int(inclusive_usage["output_tokens"])
-            cache_read = int(inclusive_usage["cache_read_input_tokens"])
-            cache_creation = int(inclusive_usage["cache_creation_input_tokens"])
-        total_cost_usd = result_meta.get("total_cost_usd")
-        if attempts:
-            total_cost_usd = (
-                result_meta.get("logical_total_cost_usd")
-                if attempt_accounting_complete
-                else None
-            )
-        if (
-            total_cost_usd is None
-            and inclusive_usage is not None
-            and (not attempts or attempt_accounting_complete)
-        ):
-            total_cost_usd = float(inclusive_usage["total_cost_usd"])
-        if result_meta.get("logical_input_tokens") is not None:
-            input_tokens = int(result_meta["logical_input_tokens"])
-            output_tokens = int(result_meta["logical_output_tokens"])
-            cache_read = int(result_meta["logical_cache_read_input_tokens"])
-            cache_creation = int(result_meta["logical_cache_creation_input_tokens"])
-            reasoning_tokens = int(result_meta["logical_reasoning_tokens"])
 
         out_path = Path(output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
@@ -554,60 +373,12 @@ def _extract_session_info(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_read_input_tokens": cache_read,
-            "cache_creation_input_tokens": cache_creation,
-            "wall_clock_s": session_result.get("wall_clock_s", 0.0) or 0.0,
-            "duration_ms": result_meta.get("duration_ms"),
-            "duration_api_ms": result_meta.get("duration_api_ms"),
-            "num_turns": result_meta.get("num_turns"),
-            "llm_call_count": result_meta.get(
-                "logical_llm_call_count",
-                result_meta.get("llm_call_count", len(usage)),
-            ),
-            "usage_event_count": result_meta.get("usage_event_count", len(usage)),
-            "duplicate_usage_event_count": result_meta.get(
-                "duplicate_usage_event_count", 0
-            ),
-            "reasoning_tokens": reasoning_tokens,
-            "copilot_nano_aiu": result_meta.get(
-                "logical_copilot_nano_aiu", result_meta.get("copilot_nano_aiu")
-            ),
-            "reported_cost_usd": result_meta.get(
-                "logical_reported_cost_usd", result_meta.get("reported_cost_usd")
-            ),
-            "metered_cost_usd": result_meta.get(
-                "logical_metered_cost_usd", result_meta.get("metered_cost_usd")
-            ),
-            "estimated_cost_usd": result_meta.get(
-                "logical_estimated_cost_usd", result_meta.get("estimated_cost_usd")
-            ),
-            "total_cost_usd": total_cost_usd,
-            "final_attempt_cost_usd": result_meta.get("final_attempt_cost_usd"),
-            "attempt_count": len(attempts) or 1,
-            "attempt_accounting_complete": attempt_accounting_complete,
-            "cost_source": result_meta.get("cost_source"),
-            "cost_is_estimate": result_meta.get("cost_is_estimate", False),
-            "session_id": result_meta.get("session_id"),
-            "model_usage": model_usage,
-            "retry": session_result.get("retry"),
-            "attempts": attempts,
             "tool_calls": tool_calls,
             "usage": usage,
             "raw_response": session_result.get("raw_response", ""),
         }
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(session_data, f, indent=2, ensure_ascii=False)
-
-        try:
-            from autosaddler.v1.sdk_metrics import (
-                session_root_from_artifact_dir,
-                write_run_sdk_metrics,
-            )
-
-            metrics_root = session_root_from_artifact_dir(out_path)
-            if metrics_root is not None:
-                write_run_sdk_metrics(metrics_root)
-        except Exception:
-            logger.exception("Failed to rebuild run-level SDK metrics")
 
         return json_path
     except Exception:
@@ -734,11 +505,11 @@ def _run_one_scenario(
 ) -> dict[str, Any]:
     """Run diagnosis-patch for a single scenario. Returns a result dict."""
     from autosaddler.v1.proposer.autosaddler.prompt_builder import (
+        build_claude_md,
         build_session1_prompt,
         build_skill_prefix,
         install_evo_dag_cli,
         install_prompts_and_skills,
-        resolve_prompt_bundle,
     )
 
     scenario_id = scenario["scenario_id"]
@@ -763,13 +534,8 @@ def _run_one_scenario(
         result["worktree"] = str(worktree)
 
         # 2. Install CLAUDE.md + skills
-        prompt_bundle = resolve_prompt_bundle(session_scope="diagnosis_only")
-        install_prompts_and_skills(
-            str(worktree),
-            prompt_bundle.claude_md,
-            phase=phase,
-            skill_names=prompt_bundle.skill_names,
-        )
+        claude_md = build_claude_md()
+        install_prompts_and_skills(str(worktree), claude_md, phase=phase)
 
         # 3. Install evo-dag CLI
         cli_env = install_evo_dag_cli(session_root, str(worktree))
@@ -799,11 +565,7 @@ def _run_one_scenario(
         )
 
         full_prompt = (
-            build_skill_prefix(
-                session=1,
-                phase=phase,
-                sampling_strategy=prompt_bundle.strategy.name.value,
-            ) + session1_prompt
+            build_skill_prefix(session=1, phase=phase) + session1_prompt
         )
 
         # 6. Run SDK session
@@ -815,10 +577,6 @@ def _run_one_scenario(
             timeout=diagnosis_patch_timeout,
             sdk_config=sdk_config,
             extra_env=cli_env,
-            session_type="patch",
-            iteration=1,
-            candidate_idx=candidate_idx,
-            artifact_dir=cycle_dir,
         )
 
         if session_result is None:
@@ -954,11 +712,26 @@ def main() -> None:
     session_root_base = Path(adapter_cfg.get("session_root_base", str(meta_are_repo / "autosaddler")))
     session_ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     session_root = session_root_base / f"diagnosis_{session_ts}"
+    session_root.mkdir(parents=True, exist_ok=True)
+
+    worktree_dir = session_root / "worktrees"
+    worktree_dir.mkdir(parents=True, exist_ok=True)
+    cycles_dir = session_root / "cycles"
+    cycles_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Session root: %s", session_root)
     logger.info("Phase: %s", args.phase)
     logger.info("Model: %s (backend: %s)", model, sdk_config.backend)
     logger.info("Timeout per scenario: %.0fs", diagnosis_patch_timeout)
+
+    # ── Initialize minimal DAG ────────────────────────────────────────
+    from autosaddler.v1.proposer.autosaddler.dag import EvolutionDAG
+
+    dag = EvolutionDAG(str(session_root))
+    dag.add_seed_node(
+        worktree_path=str(initial_harness_dir / "worktree"),
+        score_val=0.0,  # placeholder
+    )
 
     # ── Dry run ───────────────────────────────────────────────────────
     if args.dry_run:
@@ -972,21 +745,6 @@ def main() -> None:
             logger.info("  %d. %s — %s", i, sid, rationale)
         logger.info("Session root would be: %s", session_root)
         return
-
-    session_root.mkdir(parents=True, exist_ok=True)
-    worktree_dir = session_root / "worktrees"
-    worktree_dir.mkdir(parents=True, exist_ok=True)
-    cycles_dir = session_root / "cycles"
-    cycles_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── Initialize minimal DAG ────────────────────────────────────────
-    from autosaddler.v1.proposer.autosaddler.dag import EvolutionDAG
-
-    dag = EvolutionDAG(str(session_root))
-    dag.add_seed_node(
-        worktree_path=str(initial_harness_dir / "worktree"),
-        score_val=0.0,  # placeholder
-    )
 
     # ── Process each scenario ─────────────────────────────────────────
     results: list[dict[str, Any]] = []

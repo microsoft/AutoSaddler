@@ -377,7 +377,7 @@ Each iteration produces output directories with the following layout:
 **Session root** (shared across iterations):
 ```
 <session_root>/
-├── evolution_dag.json.gz         ← Compressed DAG state (all nodes, edges, lessons)
+├── evolution_dag.json            ← DAG state (all nodes, edges, lessons)
 └── bin/evo-dag                   ← CLI tool
 ```
 
