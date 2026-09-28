@@ -209,6 +209,10 @@ class LocalRunStore:
             self.run_dir / "strategy" / "lessons.json",
             canonical_json(_extension_projection(events, "autosaddler.lessons")) + "\n",
         )
+        _atomic_write(
+            self.run_dir / "strategy" / "curriculum.json",
+            canonical_json(_extension_projection(events, "autosaddler.curriculum")) + "\n",
+        )
         metric_rows = metrics_records(events)
         _atomic_write(
             self.run_dir / "metrics.jsonl",

@@ -25,6 +25,7 @@ class TaskSelectionConfig:
     type: str
     batch_size: int
     seed: int
+    settings: Mapping[str, JsonValue]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,8 @@ class OptimizationConfig:
     diagnosis_patch_timeout_seconds: float
     selection_timeout_seconds: float
     reflection_timeout_seconds: float
+    pattern_extraction_timeout_seconds: float
+    arm_scoring_timeout_seconds: float
     session_retries: int
     session_retry_backoff_seconds: float
 
@@ -95,6 +98,8 @@ class RunConfig:
         optional_optimization = {
             "selection_timeout_seconds",
             "reflection_timeout_seconds",
+            "pattern_extraction_timeout_seconds",
+            "arm_scoring_timeout_seconds",
             "session_retries",
             "session_retry_backoff_seconds",
         }
@@ -123,7 +128,7 @@ class RunConfig:
         _required_and_allowed(
             task_selection,
             {"type", "batch_size"},
-            {"type", "batch_size", "seed"},
+            {"type", "batch_size", "seed", "settings"},
             "optimization.task_selection",
         )
         acceptance = _named_policy(optimization_value["acceptance"], "optimization.acceptance")
@@ -142,6 +147,14 @@ class RunConfig:
         reflection_timeout = _positive_number(
             optimization_value.get("reflection_timeout_seconds", diagnosis_patch_timeout),
             "optimization.reflection_timeout_seconds",
+        )
+        pattern_extraction_timeout = _positive_number(
+            optimization_value.get("pattern_extraction_timeout_seconds", diagnosis_patch_timeout),
+            "optimization.pattern_extraction_timeout_seconds",
+        )
+        arm_scoring_timeout = _positive_number(
+            optimization_value.get("arm_scoring_timeout_seconds", diagnosis_patch_timeout),
+            "optimization.arm_scoring_timeout_seconds",
         )
         session_retries = _nonnegative_int(
             optimization_value.get("session_retries", 2),
@@ -165,6 +178,10 @@ class RunConfig:
                     type=_required_string(task_selection, "type", "optimization.task_selection"),
                     batch_size=_positive_int(task_selection["batch_size"], "optimization.task_selection.batch_size"),
                     seed=_nonnegative_int(task_selection.get("seed", 0), "optimization.task_selection.seed"),
+                    settings=_json_mapping(
+                        task_selection.get("settings", {}),
+                        "optimization.task_selection.settings",
+                    ),
                 ),
                 acceptance=acceptance,
                 development=development,
@@ -176,6 +193,8 @@ class RunConfig:
                 diagnosis_patch_timeout_seconds=diagnosis_patch_timeout,
                 selection_timeout_seconds=selection_timeout,
                 reflection_timeout_seconds=reflection_timeout,
+                pattern_extraction_timeout_seconds=pattern_extraction_timeout,
+                arm_scoring_timeout_seconds=arm_scoring_timeout,
                 session_retries=session_retries,
                 session_retry_backoff_seconds=retry_backoff,
             ),

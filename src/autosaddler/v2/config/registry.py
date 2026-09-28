@@ -11,6 +11,7 @@ from autosaddler.v2.core.domain import JsonValue
 from autosaddler.v2.core.engine import AutoSaddlerEngine
 from autosaddler.v2.core.policies import (
     BudgetPolicy,
+    ActiveSaddlerTaskSelectionPolicy,
     EpochShuffledTaskSelectionPolicy,
     FixedTaskSelectionPolicy,
     FullOnAcceptDevelopment,
@@ -101,7 +102,7 @@ class Registry:
         self.providers: dict[str, Callable[..., AgentProvider]] = {}
         self.task_selection: dict[
             str,
-            Callable[..., FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy],
+            Callable[..., FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy | ActiveSaddlerTaskSelectionPolicy],
         ] = {}
         self.acceptance: dict[str, Callable[[], MatchedValidStrictImprovement]] = {}
         self.development: dict[str, Callable[[], FullOnAcceptDevelopment]] = {}
@@ -139,11 +140,9 @@ def default_registry() -> Registry:
             "copilot": _registered_copilot_provider,
         }
     )
-    registry.task_selection["fixed"] = lambda *, batch_size, seed: FixedTaskSelectionPolicy(batch_size=batch_size)
-    registry.task_selection["epoch_shuffled"] = lambda *, batch_size, seed: EpochShuffledTaskSelectionPolicy(
-        batch_size=batch_size,
-        seed=seed,
-    )
+    registry.task_selection["fixed"] = _fixed_task_selection
+    registry.task_selection["epoch_shuffled"] = _epoch_shuffled_task_selection
+    registry.task_selection["activesaddler"] = _activesaddler_task_selection
     registry.acceptance["matched_valid_strict_improvement"] = MatchedValidStrictImprovement
     registry.development["full_on_accept"] = FullOnAcceptDevelopment
     registry.ranking["mean_development_score"] = MeanDevelopmentRanking
@@ -282,6 +281,7 @@ def build_runtime(
         task_selection=task_selection_factory(
             batch_size=config.optimization.task_selection.batch_size,
             seed=config.optimization.task_selection.seed,
+            settings=config.optimization.task_selection.settings,
         ),
         acceptance=acceptance_factory(),
         development=development_factory(),
@@ -291,6 +291,12 @@ def build_runtime(
             max_iterations=config.optimization.budget.max_iterations,
         ),
     )
+    unsupported_kinds = sorted(policies.task_selection.required_session_kinds - scenario.supported_session_kinds)
+    if unsupported_kinds:
+        raise ValueError(
+            f"Scenario {scenario.name!r} does not support session kinds required by "
+            f"task selection {config.optimization.task_selection.type!r}: {unsupported_kinds}"
+        )
     resolved_entities = _resolved_entities(
         config,
         scenario,
@@ -306,10 +312,59 @@ def build_runtime(
         diagnosis_patch_timeout_seconds=config.optimization.diagnosis_patch_timeout_seconds,
         selection_timeout_seconds=config.optimization.selection_timeout_seconds,
         reflection_timeout_seconds=config.optimization.reflection_timeout_seconds,
+        pattern_extraction_timeout_seconds=config.optimization.pattern_extraction_timeout_seconds,
+        arm_scoring_timeout_seconds=config.optimization.arm_scoring_timeout_seconds,
         session_retries=config.optimization.session_retries,
         session_retry_backoff_seconds=config.optimization.session_retry_backoff_seconds,
     )
     return Runtime(config, store, scenario, provider, policies, engine, ledger)
+
+
+def _fixed_task_selection(*, batch_size: int, seed: int, settings: Mapping[str, JsonValue]) -> FixedTaskSelectionPolicy:
+    del seed
+    _exact_task_selection_settings(settings, set(), "fixed")
+    return FixedTaskSelectionPolicy(batch_size=batch_size)
+
+
+def _epoch_shuffled_task_selection(
+    *,
+    batch_size: int,
+    seed: int,
+    settings: Mapping[str, JsonValue],
+) -> EpochShuffledTaskSelectionPolicy:
+    _exact_task_selection_settings(settings, set(), "epoch_shuffled")
+    return EpochShuffledTaskSelectionPolicy(batch_size=batch_size, seed=seed)
+
+
+def _activesaddler_task_selection(
+    *,
+    batch_size: int,
+    seed: int,
+    settings: Mapping[str, JsonValue],
+) -> ActiveSaddlerTaskSelectionPolicy:
+    _exact_task_selection_settings(settings, {"softmax_temperature", "min_prob", "ema_eta"}, "activesaddler")
+    return ActiveSaddlerTaskSelectionPolicy(
+        batch_size=batch_size,
+        seed=seed,
+        softmax_temperature=_number(settings["softmax_temperature"], "optimization.task_selection.settings.softmax_temperature"),
+        min_prob=_number(settings["min_prob"], "optimization.task_selection.settings.min_prob"),
+        ema_eta=_number(settings["ema_eta"], "optimization.task_selection.settings.ema_eta"),
+    )
+
+
+def _exact_task_selection_settings(value: Mapping[str, JsonValue], expected: set[str], policy: str) -> None:
+    missing = sorted(expected - value.keys())
+    extra = sorted(value.keys() - expected)
+    if missing or extra:
+        raise ValueError(
+            f"Invalid keys at optimization.task_selection.settings for {policy}: missing={missing}, extra={extra}"
+        )
+
+
+def _number(value: JsonValue, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{path} must be a number")
+    return float(value)
 
 
 def _fake_settings(value: Mapping[str, JsonValue]) -> FakeScenarioSettings:
@@ -405,6 +460,11 @@ def _resolved_entities(
         "resolved/provider_runtime.json": _provider_runtime(config.provider.type, config.provider.settings),
         "resolved/policies.json": {
             "task_selection": config.optimization.task_selection.type,
+            **(
+                {"task_selection_settings": policies.task_selection.settings_record()}
+                if policies.task_selection.settings_record()
+                else {}
+            ),
             "acceptance": config.optimization.acceptance.type,
             "development": config.optimization.development.type,
             "ranking": config.optimization.ranking.type,
@@ -420,7 +480,12 @@ def _resolved_entities(
         },
         "resolved/schemas/session_outputs.json": {
             "$id": "autosaddler-session-outputs/v1",
-            "kinds": ["evolve", "diagnose_patch", "reflect"],
+            "kinds": [
+                "evolve",
+                "diagnose_patch",
+                "reflect",
+                *sorted(policies.task_selection.required_session_kinds),
+            ],
         },
     }
     overlap = sorted(common.keys() & scenario.resolved_entities.keys())

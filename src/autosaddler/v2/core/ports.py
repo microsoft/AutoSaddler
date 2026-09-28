@@ -149,6 +149,9 @@ class AgentProvider(Protocol):
     async def run(self, request: SessionRequest) -> SessionResult: ...
 
 
+BASE_SESSION_KINDS = frozenset({"evolve", "diagnose_patch", "reflect"})
+
+
 @dataclass(frozen=True, slots=True)
 class ScenarioComponents:
     name: str
@@ -162,10 +165,13 @@ class ScenarioComponents:
     required_capabilities: frozenset[Capability]
     evaluation_repetitions: int = 1
     resolved_entities: Mapping[str, str | Mapping[str, JsonValue]] = field(default_factory=dict)
+    supported_session_kinds: frozenset[SessionKind] = BASE_SESSION_KINDS
 
     def __post_init__(self) -> None:
         if not self.name or not self.version:
             raise ValueError("Scenario name and version must be non-empty")
+        if not BASE_SESSION_KINDS <= self.supported_session_kinds:
+            raise ValueError("Scenarios must support the evolve, diagnose_patch, and reflect session kinds")
         if self.evaluation_repetitions < 1:
             raise ValueError("Scenario evaluation_repetitions must be positive")
         train_ids = {case.case_id for case in self.train_cases}
