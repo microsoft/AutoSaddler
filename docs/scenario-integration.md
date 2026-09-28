@@ -161,6 +161,19 @@ Implement `PromptPack.session(kind, context)` for:
 - `diagnose_patch`: inspect train evidence and produce a candidate change; and
 - `reflect`: derive lessons from allowed before/after evidence and aggregate feedback.
 
+To support the ActiveSaddler curriculum (`task_selection.type: activesaddler`), also implement
+the optional curriculum kinds and add them to `ScenarioComponents.supported_session_kinds`:
+
+- `extract_patterns`: abstract the listed pre- and post-patch training failures into failure
+  patterns and tags;
+- `decide_arm`: choose whether the next batch pulls a known pattern or draws unseen cases; and
+- `score_arms`: rate every listed arm on severity, fixability, breadth, and side-effect risk.
+
+Build their output contracts with the schema helpers in `autosaddler.v2.prompting.curriculum`,
+because the engine interprets those outputs, and render `build_curriculum_bundle` into the
+workspace when the context contains a `curriculum` object. Runtime assembly rejects the curriculum
+policy for a scenario that does not declare these kinds.
+
 Each `SessionSpec` must provide an executable JSON Schema output contract. Keep scenario-specific
 instructions and skills in the plugin package. Compose shared methodology assets through
 `autosaddler.v2.prompting.assets` so the resolved source, order, and digest are persisted.
@@ -251,7 +264,7 @@ At minimum, cover:
 - materialization cleanup after exceptions;
 - repetition preservation and resume deduplication;
 - rejection of non-training evidence;
-- all three prompt kinds and JSON Schema contracts;
+- all three prompt kinds and JSON Schema contracts, plus the curriculum kinds when declared;
 - prompt asset provenance and composition order;
 - provider capability mismatch; and
 - registry construction plus one deterministic end-to-end run;

@@ -106,6 +106,17 @@ Candidate updates are verified on sampled training cases and gated on the develo
 its rollout budget is exhausted, AutoSaddler returns the highest-ranked development candidate. See
 the [V2 architecture guide](docs/v2-architecture.md) for the event lifecycle and invariants.
 
+Training batches come from the configured task-selection policy. Besides passive fixed and
+epoch-shuffled batches, the **ActiveSaddler** curriculum (`task_selection.type: activesaddler`)
+treats failure patterns as bandit arms and adds three sessions:
+
+- **Pattern Extraction:** after reflection, abstracts pre- and post-patch failures into
+  symptom-level failure patterns and tags the failing cases.
+- **Arm Decision:** decides whether the next batch pulls a known pattern or draws never-executed
+  cases to discover new patterns.
+- **Arm Scoring:** before a pull, rates every pattern's expected learning progress on severity,
+  fixability, breadth, and side-effect risk; one arm is then sampled by softmax over those scores.
+
 ## 🎯 Supported Harnesses and Benchmarks
 
 The current repository includes:
@@ -138,13 +149,29 @@ explicit ownership areas:
 | `provider` | Optimizer provider, capabilities, model, endpoint, and provider-specific settings |
 | `storage` | Durable run root |
 
+Task-selection policies:
+
+| `optimization.task_selection.type` | Behavior | `settings` |
+|---|---|---|
+| `fixed` | Rolling window over the training cases | none |
+| `epoch_shuffled` | Non-overlapping batches from a seeded per-epoch shuffle | none |
+| `activesaddler` | Agent-driven failure-pattern bandit curriculum | `softmax_temperature`, `min_prob`, `ema_eta` |
+
+`activesaddler` requires a scenario that supports the `extract_patterns`, `decide_arm`, and
+`score_arms` session kinds; both built-in scenarios do. Their timeouts are
+`optimization.pattern_extraction_timeout_seconds` and `optimization.arm_scoring_timeout_seconds`.
+
 Included configurations:
 
 | Path | Purpose |
 |---|---|
 | `configs/v2/local_template.yaml` | Credential-free deterministic V2 template |
+| `configs/v2/local_activesaddler_template.yaml` | Credential-free template for the ActiveSaddler curriculum |
 | `configs/v2/codex_local_smoke.yaml` | Real Codex optimizer with the deterministic local evaluator |
 | `configs/v2/meta_are_smoke.yaml` | Current Meta-ARE/GAIA2 smoke integration |
+| `configs/v2/meta_are_full.yaml` | Full Meta-ARE/GAIA2 run with epoch-shuffled batches |
+| `configs/v2/meta_are_activesaddler_smoke.yaml` | Meta-ARE/GAIA2 smoke run with the ActiveSaddler curriculum |
+| `configs/v2/meta_are_activesaddler_full.yaml` | Full Meta-ARE/GAIA2 run with the ActiveSaddler curriculum |
 | `configs/v1/meta_are.yaml` | Legacy full Meta-ARE/GAIA2 run |
 | `configs/v1/meta_are_smoke.yaml` | Legacy bounded smoke run |
 | `configs/datasets/GAIA2/` | Shared train, development, and test split manifests |
@@ -232,6 +259,11 @@ uv run --project ../AutoSaddler \
 Runs are written under `working_dir/outputs/v2_meta_are/runs/<run-id>/`. Success writes
 `result.json` with `"iterations": 2` and prints the selected candidate and development score.
 
+To run the same smoke setup with the ActiveSaddler curriculum, use
+`configs/v2/meta_are_activesaddler_smoke.yaml`. Its runs are written under
+`working_dir/outputs/v2_meta_are_activesaddler/runs/<run-id>/`, and the replayed failure-pattern
+registry is projected to `strategy/curriculum.json`.
+
 ### Run artifacts and resumption
 
 A run is self-contained and can include:
@@ -245,6 +277,7 @@ A run is self-contained and can include:
 ├── metrics.jsonl
 ├── metrics-summary.json
 ├── result.json
+├── strategy/         # Lessons and curriculum projections
 ├── resolved/
 ├── candidates/
 ├── evaluations/

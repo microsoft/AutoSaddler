@@ -1,7 +1,6 @@
-# Full V2 Meta-ARE/GAIA2 run using the sandbox sibling layout and official OpenAI API.
-# V2 reruns the 65-case seed development evaluation because legacy seed reuse is
-# not supported, and uses deterministic epoch-shuffled sampling. See
-# meta_are_activesaddler_full.yaml for the agent-driven failure-pattern curriculum.
+# Full V2 Meta-ARE/GAIA2 run with the ActiveSaddler failure-pattern curriculum.
+# Same scenario, provider, and budget as meta_are_full.yaml; only task selection,
+# the capability transition, and the curriculum session timeouts differ.
 schema_version: autosaddler/v2
 
 scenario:
@@ -55,15 +54,23 @@ scenario:
     max_concurrent: 3
     infrastructure_retries: 1
     import_check: from are.simulation.agents.default_agent import base_agent
-    capability_phase_iterations: 25
-    capability_transition_mode: iterations
+    # Switch to steering only after every training case has been sampled once; the
+    # curriculum re-pulls known arms, so an iteration count does not imply coverage.
+    capability_phase_iterations: 0
+    capability_transition_mode: full_coverage
     capability_phase_max_iterations: 0
 
 optimization:
   task_selection:
-    type: epoch_shuffled
+    # Agent-driven failure-pattern bandit: decide_arm chooses pull or draw, score_arms
+    # rates every arm, and one arm is pulled by softmax over the agent scores.
+    type: activesaddler
     batch_size: 3
     seed: 42
+    settings:
+      softmax_temperature: 0.15   # tau for stochastic arm sampling (> 0)
+      min_prob: 0.0               # per-arm probability floor epsilon in [0, 1)
+      ema_eta: 0.9                # EMA of failure activity shown to the agent; not used for selection
   acceptance:
     type: matched_valid_strict_improvement
   development:
@@ -76,6 +83,8 @@ optimization:
   diagnosis_patch_timeout_seconds: 18000
   selection_timeout_seconds: 1800
   reflection_timeout_seconds: 3600
+  pattern_extraction_timeout_seconds: 3600
+  arm_scoring_timeout_seconds: 3600
   session_retries: 2
   session_retry_backoff_seconds: 15
 
@@ -94,4 +103,4 @@ provider:
 
 storage:
   type: local
-  run_root: ../../../working_dir/outputs/v2_meta_are_full/runs
+  run_root: ../../../working_dir/outputs/v2_meta_are_activesaddler_full/runs

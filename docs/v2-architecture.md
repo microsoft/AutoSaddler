@@ -130,6 +130,55 @@ Train evidence can include case-level traces and scores. Development data is qua
 diagnosis: it is used for ranking and exposed to reflection only through permitted aggregate
 feedback. Test payloads are outside optimization and are not opened by the engine.
 
+## Failure-Pattern Curriculum
+
+`task_selection.type: activesaddler` replaces passive batches with the ActiveSaddler curriculum.
+Every failure pattern that owns at least one training case is a bandit arm. The policy is still a
+pure function of replayed state; the agent decisions that feed it are recorded before sampling.
+
+```mermaid
+sequenceDiagram
+    participant Engine
+    participant Provider
+    participant Policy
+    Engine->>Provider: evolve (no batch yet)
+    alt known arms exist
+        Engine->>Provider: decide_arm (pull or draw)
+        opt pull
+            Engine->>Provider: score_arms (every arm)
+        end
+    end
+    Engine->>Policy: select_curriculum(replayed state, action)
+    Engine->>Engine: BatchSampled, train-before, diagnose_patch, train-after, gates
+    Engine->>Provider: deferred reflect, then extract_patterns
+```
+
+- **Order.** The working parent is prepared before the batch is sampled, so the evolution session
+  receives no training case IDs and the batch is chosen for the prepared harness.
+- **Draw.** Takes the next never-executed cases from a fixed permutation seeded by
+  `task_selection.seed`. A cold start with no arm always draws without a decision session.
+- **Pull.** Samples one arm with probability `softmax(phi / softmax_temperature)` floored at
+  `min_prob`, where `phi = (severity + fixability + breadth + (1 - side_effect)) / 4` is the agent's
+  score for the current iteration, and evaluates up to `batch_size` of the arm's cases. The random
+  generator is derived from the seed and iteration, so no RNG state is stored.
+- **Extraction.** After a successful reflection with failing cases, a deferred `extract_patterns`
+  session returns new patterns and pre- or post-patch tags as structured output. The engine derives
+  pattern IDs deterministically and records post-patch activity observations; a pattern created
+  only from this iteration's post-patch tags is not observed. An all-pass batch observes every
+  overlapping arm as inactive.
+- **State.** Patterns, tags, observations, decisions, and scores are `ExtensionStateChanged` events
+  in the `autosaddler.curriculum` namespace; the sampler snapshot is `BatchSampled.provenance`;
+  executed cases and probe points are derived from existing events. `strategy/curriculum.json`
+  projects the namespace, and sessions read `.autosaddler/curriculum/` for the replayed registry.
+- **Failures.** An exhausted arm decision falls back to a pull. Exhausted arm scoring fails the run
+  because unrated arms would silently score zero. Exhausted extraction abandons that obligation
+  after recording observations.
+
+The activity EMA (`ema_eta`) is shown to the agent only and does not influence selection. The
+Meta-ARE scenario pairs the curriculum with `capability_transition_mode: full_coverage`, which
+switches from capability to steering patches after every training case has been sampled once,
+because repeated pulls make an iteration count a poor proxy for coverage.
+
 ## Harness Spaces
 
 `ComponentMapHarnessSpace` stores a mapping of named text components and is useful for prompt-only or
@@ -153,7 +202,9 @@ them even when evaluation fails.
 ## Provider Sessions And Prompts
 
 The provider contract accepts a `SessionRequest` and returns a structured `SessionResult`. Prompt
-packs produce a `SessionSpec` for `evolve`, `diagnose_patch`, and `reflect`, including:
+packs produce a `SessionSpec` for `evolve`, `diagnose_patch`, and `reflect`, and, when a scenario
+declares them in `supported_session_kinds`, for the curriculum kinds `extract_patterns`,
+`decide_arm`, and `score_arms`. Each spec includes:
 
 - system and task prompts;
 - skills and workspace context files;
@@ -184,6 +235,7 @@ result files are projections that can be rebuilt from events plus immutable arti
 |-- metrics.jsonl
 |-- metrics-summary.json
 |-- result.json
+|-- strategy/
 |-- resolved/
 |-- candidates/
 |-- evaluations/
