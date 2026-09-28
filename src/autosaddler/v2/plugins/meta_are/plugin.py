@@ -7,12 +7,13 @@ from autosaddler.v2.core.domain import JsonValue
 from autosaddler.v2.core.curriculum import CURRICULUM_SESSION_KINDS
 from autosaddler.v2.core.ports import BASE_SESSION_KINDS, ScenarioComponents
 from autosaddler.v2.harness.git import GitHarnessSpace
-from autosaddler.v2.prompting.assets import prompt_source_entities
+from autosaddler.v2.prompting.assets import curriculum_prompt_source_entities, prompt_source_entities
 from autosaddler.v2.plugins.meta_are.config import MetaARESettings
 from autosaddler.v2.plugins.meta_are.evaluator import MetaAREEvaluator
 from autosaddler.v2.plugins.meta_are.evidence import MetaAREEvidenceBuilder
 from autosaddler.v2.plugins.meta_are.prompt_pack import (
     MetaAREPromptPack,
+    meta_are_curriculum_composition_entity,
     meta_are_prompt_composition_entity,
 )
 from autosaddler.v2.plugins.meta_are.runner import MetaARERunner
@@ -77,7 +78,7 @@ def build_meta_are_components(
         store=store,
         writable_paths=resolved.writable_paths,
         capability_phase_iterations=resolved.capability_phase_iterations,
-        capability_transition_mode=resolved.capability_transition_mode,
+        capability_transition_mode=resolved.capability_transition_mode or "iterations",
         capability_phase_max_iterations=resolved.capability_phase_max_iterations,
         train_case_ids=tuple(case.case_id for case in train_cases),
     )
@@ -94,16 +95,28 @@ def build_meta_are_components(
         evaluation_repetitions=resolved.repetitions,
         resolved_entities=_resolved_entities(resolved, train_cases, development_cases),
         supported_session_kinds=BASE_SESSION_KINDS | CURRICULUM_SESSION_KINDS,
+        task_selection_resolved_entities={
+            **curriculum_prompt_source_entities(plugin_root=Path(__file__).parent, plugin_name="meta_are"),
+            "resolved/prompts/curriculum/compositions.json": meta_are_curriculum_composition_entity(),
+        },
     )
 
 
-def _resolved_entities(settings, train_cases, development_cases):
+def meta_are_prompt_entities() -> dict[str, str | Mapping[str, JsonValue]]:
+    """Prompt provenance recorded for every Meta-ARE run; curriculum assets are recorded separately."""
     return {
         **prompt_source_entities(
             plugin_root=Path(__file__).parent,
             plugin_name="meta_are",
+            exclude=("curriculum",),
         ),
         "resolved/prompts/compositions.json": meta_are_prompt_composition_entity(),
+    }
+
+
+def _resolved_entities(settings, train_cases, development_cases):
+    return {
+        **meta_are_prompt_entities(),
         "resolved/sources/harness.json": {
             "type": "git",
             "source_repo": str(settings.source_repo),
@@ -160,8 +173,14 @@ def _resolved_entities(settings, train_cases, development_cases):
             "writable_paths": [path.as_posix() for path in settings.writable_paths],
             "forbidden_paths": [path.as_posix() for path in settings.forbidden_paths],
             "capability_phase_iterations": settings.capability_phase_iterations,
-            "capability_transition_mode": settings.capability_transition_mode,
-            "capability_phase_max_iterations": settings.capability_phase_max_iterations,
+            **(
+                {
+                    "capability_transition_mode": settings.capability_transition_mode,
+                    "capability_phase_max_iterations": settings.capability_phase_max_iterations,
+                }
+                if settings.capability_transition_mode is not None
+                else {}
+            ),
             "verification_timeout_seconds": settings.verification_timeout_seconds,
         },
     }

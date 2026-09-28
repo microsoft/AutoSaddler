@@ -71,6 +71,8 @@ optimization:
       softmax_temperature: 0.15   # tau for stochastic arm sampling (> 0)
       min_prob: 0.0               # per-arm probability floor epsilon in [0, 1)
       ema_eta: 0.9                # EMA of failure activity shown to the agent; not used for selection
+      pattern_extraction_timeout_seconds: 3600   # extract_patterns session timeout
+      arm_scoring_timeout_seconds: 3600          # decide_arm and score_arms session timeout
   acceptance:
     type: matched_valid_strict_improvement
   development:
@@ -83,8 +85,6 @@ optimization:
   diagnosis_patch_timeout_seconds: 18000
   selection_timeout_seconds: 1800
   reflection_timeout_seconds: 3600
-  pattern_extraction_timeout_seconds: 3600
-  arm_scoring_timeout_seconds: 3600
   session_retries: 2
   session_retry_backoff_seconds: 15
 

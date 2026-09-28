@@ -69,9 +69,10 @@ _EXPECTED_KEYS = {
     "infrastructure_retries",
     "import_check",
     "capability_phase_iterations",
-    "capability_transition_mode",
-    "capability_phase_max_iterations",
 }
+# Optional: omitting both keeps the iteration-count phase schedule and the execution
+# fingerprint of configs written before the full-coverage transition existed.
+_CAPABILITY_TRANSITION_KEYS = {"capability_transition_mode", "capability_phase_max_iterations"}
 CAPABILITY_TRANSITION_MODES = frozenset({"iterations", "full_coverage"})
 
 
@@ -113,18 +114,18 @@ class MetaARESettings:
     infrastructure_retries: int
     import_check: str
     capability_phase_iterations: int
-    capability_transition_mode: str
-    capability_phase_max_iterations: int
     pyproject_sha256: str
     uv_lock_sha256: str
     responses_runtime_sha256: str | None
     demo_filesystem_digest: str
     execution_fingerprint: str
+    capability_transition_mode: str | None = None
+    capability_phase_max_iterations: int = 0
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, JsonValue], *, base_dir: Path) -> "MetaARESettings":
         missing = sorted(_EXPECTED_KEYS - value.keys())
-        extra = sorted(value.keys() - _EXPECTED_KEYS)
+        extra = sorted(value.keys() - _EXPECTED_KEYS - _CAPABILITY_TRANSITION_KEYS)
         if missing or extra:
             raise ValueError(f"Invalid Meta-ARE settings keys: missing={missing}, unexpected={extra}")
 
@@ -260,10 +261,7 @@ class MetaARESettings:
             "capability_phase_iterations": _nonnegative_int(
                 value["capability_phase_iterations"], "capability_phase_iterations"
             ),
-            "capability_transition_mode": _capability_transition_mode(value),
-            "capability_phase_max_iterations": _nonnegative_int(
-                value["capability_phase_max_iterations"], "capability_phase_max_iterations"
-            ),
+            **_capability_transition(value),
         }
         fingerprint = sha256_digest(canonical_json(resolved))
         return cls(
@@ -303,8 +301,6 @@ class MetaARESettings:
             infrastructure_retries=int(resolved["infrastructure_retries"]),
             import_check=str(resolved["import_check"]),
             capability_phase_iterations=int(resolved["capability_phase_iterations"]),
-            capability_transition_mode=str(resolved["capability_transition_mode"]),
-            capability_phase_max_iterations=int(resolved["capability_phase_max_iterations"]),
             pyproject_sha256=str(resolved["pyproject_sha256"]),
             uv_lock_sha256=str(resolved["uv_lock_sha256"]),
             responses_runtime_sha256=_as_optional_string(
@@ -312,6 +308,8 @@ class MetaARESettings:
             ),
             demo_filesystem_digest=demo_digest,
             execution_fingerprint=fingerprint,
+            capability_transition_mode=_as_optional_string(resolved.get("capability_transition_mode")),
+            capability_phase_max_iterations=int(resolved.get("capability_phase_max_iterations", 0)),
         )
 
     def load_cases(self) -> tuple[tuple[Case, ...], tuple[Case, ...]]:
@@ -658,15 +656,21 @@ def _nonnegative_int(value: JsonValue, label: str) -> int:
     return value
 
 
-def _capability_transition_mode(value: Mapping[str, JsonValue]) -> str:
-    """Validate the capability-to-steering switch and reject settings the mode ignores."""
+def _capability_transition(value: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    """Validate the optional capability-to-steering transition; both keys or neither."""
+    present = _CAPABILITY_TRANSITION_KEYS & value.keys()
+    if not present:
+        return {}
+    if present != _CAPABILITY_TRANSITION_KEYS:
+        raise ValueError(f"Meta-ARE settings require both or neither of {sorted(_CAPABILITY_TRANSITION_KEYS)}")
     mode = _string(value["capability_transition_mode"], "capability_transition_mode")
     if mode not in CAPABILITY_TRANSITION_MODES:
         raise ValueError(
             f"capability_transition_mode must be one of {sorted(CAPABILITY_TRANSITION_MODES)}, got {mode!r}"
         )
-    if mode == "iterations" and value["capability_phase_max_iterations"] != 0:
+    max_iterations = _nonnegative_int(value["capability_phase_max_iterations"], "capability_phase_max_iterations")
+    if mode == "iterations" and max_iterations != 0:
         raise ValueError("capability_phase_max_iterations applies only to full_coverage transitions")
     if mode == "full_coverage" and value["capability_phase_iterations"] != 0:
         raise ValueError("capability_phase_iterations must be 0 for full_coverage transitions")
-    return mode
+    return {"capability_transition_mode": mode, "capability_phase_max_iterations": max_iterations}

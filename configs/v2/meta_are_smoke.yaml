@@ -55,8 +55,6 @@ scenario:
     infrastructure_retries: 1
     import_check: from are.simulation.agents.default_agent import base_agent
     capability_phase_iterations: 1
-    capability_transition_mode: iterations
-    capability_phase_max_iterations: 0
 
 optimization:
   task_selection:

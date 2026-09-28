@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from autosaddler.v2.config.models import RunConfig
+from autosaddler.v2.core.curriculum import ActiveSaddlerTaskSelectionPolicy
 from autosaddler.v2.core.domain import JsonValue
 from autosaddler.v2.core.engine import AutoSaddlerEngine
 from autosaddler.v2.core.policies import (
     BudgetPolicy,
-    ActiveSaddlerTaskSelectionPolicy,
     EpochShuffledTaskSelectionPolicy,
     FixedTaskSelectionPolicy,
     FullOnAcceptDevelopment,
@@ -20,6 +20,7 @@ from autosaddler.v2.core.policies import (
     PolicyBundle,
 )
 from autosaddler.v2.core.ports import AgentProvider, ScenarioComponents
+from autosaddler.v2.core.scheduling import AdaptiveTaskSelectionPolicy
 from autosaddler.v2.plugins.api import (
     SCENARIO_PLUGIN_API_VERSION,
     SCENARIO_PLUGIN_ENTRY_POINT_GROUP,
@@ -102,7 +103,7 @@ class Registry:
         self.providers: dict[str, Callable[..., AgentProvider]] = {}
         self.task_selection: dict[
             str,
-            Callable[..., FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy | ActiveSaddlerTaskSelectionPolicy],
+            Callable[..., FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy | AdaptiveTaskSelectionPolicy],
         ] = {}
         self.acceptance: dict[str, Callable[[], MatchedValidStrictImprovement]] = {}
         self.development: dict[str, Callable[[], FullOnAcceptDevelopment]] = {}
@@ -140,8 +141,11 @@ def default_registry() -> Registry:
             "copilot": _registered_copilot_provider,
         }
     )
-    registry.task_selection["fixed"] = _fixed_task_selection
-    registry.task_selection["epoch_shuffled"] = _epoch_shuffled_task_selection
+    registry.task_selection["fixed"] = lambda *, batch_size, seed: FixedTaskSelectionPolicy(batch_size=batch_size)
+    registry.task_selection["epoch_shuffled"] = lambda *, batch_size, seed: EpochShuffledTaskSelectionPolicy(
+        batch_size=batch_size,
+        seed=seed,
+    )
     registry.task_selection["activesaddler"] = _activesaddler_task_selection
     registry.acceptance["matched_valid_strict_improvement"] = MatchedValidStrictImprovement
     registry.development["full_on_accept"] = FullOnAcceptDevelopment
@@ -277,12 +281,17 @@ def build_runtime(
     if missing_capabilities:
         raise ValueError(f"Configured provider lacks required capabilities: {missing_capabilities}")
     provider = provider_factory(ledger=ledger, settings=config.provider.settings)
+    task_selection_config = config.optimization.task_selection
+    task_selection_arguments: dict[str, Any] = {
+        "batch_size": task_selection_config.batch_size,
+        "seed": task_selection_config.seed,
+    }
+    if task_selection_config.settings is not None:
+        if task_selection_config.type not in _TASK_SELECTION_WITH_SETTINGS:
+            raise ValueError(f"optimization.task_selection.settings is not supported by {task_selection_config.type!r}")
+        task_selection_arguments["settings"] = task_selection_config.settings
     policies = PolicyBundle(
-        task_selection=task_selection_factory(
-            batch_size=config.optimization.task_selection.batch_size,
-            seed=config.optimization.task_selection.seed,
-            settings=config.optimization.task_selection.settings,
-        ),
+        task_selection=task_selection_factory(**task_selection_arguments),
         acceptance=acceptance_factory(),
         development=development_factory(),
         ranking=ranking_factory(),
@@ -291,12 +300,14 @@ def build_runtime(
             max_iterations=config.optimization.budget.max_iterations,
         ),
     )
-    unsupported_kinds = sorted(policies.task_selection.required_session_kinds - scenario.supported_session_kinds)
-    if unsupported_kinds:
-        raise ValueError(
-            f"Scenario {scenario.name!r} does not support session kinds required by "
-            f"task selection {config.optimization.task_selection.type!r}: {unsupported_kinds}"
-        )
+    adaptive = policies.task_selection if isinstance(policies.task_selection, AdaptiveTaskSelectionPolicy) else None
+    if adaptive is not None:
+        unsupported_kinds = sorted(adaptive.required_session_kinds - scenario.supported_session_kinds)
+        if unsupported_kinds:
+            raise ValueError(
+                f"Scenario {scenario.name!r} does not support session kinds required by "
+                f"task selection {task_selection_config.type!r}: {unsupported_kinds}"
+            )
     resolved_entities = _resolved_entities(
         config,
         scenario,
@@ -312,53 +323,49 @@ def build_runtime(
         diagnosis_patch_timeout_seconds=config.optimization.diagnosis_patch_timeout_seconds,
         selection_timeout_seconds=config.optimization.selection_timeout_seconds,
         reflection_timeout_seconds=config.optimization.reflection_timeout_seconds,
-        pattern_extraction_timeout_seconds=config.optimization.pattern_extraction_timeout_seconds,
-        arm_scoring_timeout_seconds=config.optimization.arm_scoring_timeout_seconds,
         session_retries=config.optimization.session_retries,
         session_retry_backoff_seconds=config.optimization.session_retry_backoff_seconds,
     )
     return Runtime(config, store, scenario, provider, policies, engine, ledger)
 
 
-def _fixed_task_selection(*, batch_size: int, seed: int, settings: Mapping[str, JsonValue]) -> FixedTaskSelectionPolicy:
-    del seed
-    _exact_task_selection_settings(settings, set(), "fixed")
-    return FixedTaskSelectionPolicy(batch_size=batch_size)
-
-
-def _epoch_shuffled_task_selection(
-    *,
-    batch_size: int,
-    seed: int,
-    settings: Mapping[str, JsonValue],
-) -> EpochShuffledTaskSelectionPolicy:
-    _exact_task_selection_settings(settings, set(), "epoch_shuffled")
-    return EpochShuffledTaskSelectionPolicy(batch_size=batch_size, seed=seed)
+_TASK_SELECTION_WITH_SETTINGS = frozenset({"activesaddler"})
 
 
 def _activesaddler_task_selection(
     *,
     batch_size: int,
     seed: int,
-    settings: Mapping[str, JsonValue],
+    settings: Mapping[str, JsonValue] | None = None,
 ) -> ActiveSaddlerTaskSelectionPolicy:
-    _exact_task_selection_settings(settings, {"softmax_temperature", "min_prob", "ema_eta"}, "activesaddler")
+    if settings is None:
+        raise ValueError("optimization.task_selection.settings is required for 'activesaddler'")
+    expected = {
+        "softmax_temperature",
+        "min_prob",
+        "ema_eta",
+        "pattern_extraction_timeout_seconds",
+        "arm_scoring_timeout_seconds",
+    }
+    missing = sorted(expected - settings.keys())
+    extra = sorted(settings.keys() - expected)
+    if missing or extra:
+        raise ValueError(
+            f"Invalid keys at optimization.task_selection.settings for activesaddler: missing={missing}, extra={extra}"
+        )
+    path = "optimization.task_selection.settings"
     return ActiveSaddlerTaskSelectionPolicy(
         batch_size=batch_size,
         seed=seed,
-        softmax_temperature=_number(settings["softmax_temperature"], "optimization.task_selection.settings.softmax_temperature"),
-        min_prob=_number(settings["min_prob"], "optimization.task_selection.settings.min_prob"),
-        ema_eta=_number(settings["ema_eta"], "optimization.task_selection.settings.ema_eta"),
+        softmax_temperature=_number(settings["softmax_temperature"], f"{path}.softmax_temperature"),
+        min_prob=_number(settings["min_prob"], f"{path}.min_prob"),
+        ema_eta=_number(settings["ema_eta"], f"{path}.ema_eta"),
+        pattern_extraction_timeout_seconds=_number(
+            settings["pattern_extraction_timeout_seconds"],
+            f"{path}.pattern_extraction_timeout_seconds",
+        ),
+        arm_scoring_timeout_seconds=_number(settings["arm_scoring_timeout_seconds"], f"{path}.arm_scoring_timeout_seconds"),
     )
-
-
-def _exact_task_selection_settings(value: Mapping[str, JsonValue], expected: set[str], policy: str) -> None:
-    missing = sorted(expected - value.keys())
-    extra = sorted(value.keys() - expected)
-    if missing or extra:
-        raise ValueError(
-            f"Invalid keys at optimization.task_selection.settings for {policy}: missing={missing}, extra={extra}"
-        )
 
 
 def _number(value: JsonValue, path: str) -> float:
@@ -460,11 +467,6 @@ def _resolved_entities(
         "resolved/provider_runtime.json": _provider_runtime(config.provider.type, config.provider.settings),
         "resolved/policies.json": {
             "task_selection": config.optimization.task_selection.type,
-            **(
-                {"task_selection_settings": policies.task_selection.settings_record()}
-                if policies.task_selection.settings_record()
-                else {}
-            ),
             "acceptance": config.optimization.acceptance.type,
             "development": config.optimization.development.type,
             "ranking": config.optimization.ranking.type,
@@ -480,18 +482,29 @@ def _resolved_entities(
         },
         "resolved/schemas/session_outputs.json": {
             "$id": "autosaddler-session-outputs/v1",
-            "kinds": [
-                "evolve",
-                "diagnose_patch",
-                "reflect",
-                *sorted(policies.task_selection.required_session_kinds),
-            ],
+            "kinds": ["evolve", "diagnose_patch", "reflect"],
         },
     }
-    overlap = sorted(common.keys() & scenario.resolved_entities.keys())
+    scenario_entities = dict(scenario.resolved_entities)
+    task_selection = policies.task_selection
+    if isinstance(task_selection, AdaptiveTaskSelectionPolicy):
+        # Adaptive-only provenance; settings-free policies keep their earlier resolved entities.
+        common["resolved/policies.json"] = {
+            **cast(Mapping[str, JsonValue], common["resolved/policies.json"]),
+            "task_selection_settings": task_selection.settings_record(),
+        }
+        common["resolved/schemas/session_outputs.json"] = {
+            "$id": "autosaddler-session-outputs/v1",
+            "kinds": ["evolve", "diagnose_patch", "reflect", *sorted(task_selection.required_session_kinds)],
+        }
+        extension_overlap = sorted(scenario_entities.keys() & scenario.task_selection_resolved_entities.keys())
+        if extension_overlap:
+            raise ValueError(f"Scenario task-selection entities collide with scenario entities: {extension_overlap}")
+        scenario_entities.update(scenario.task_selection_resolved_entities)
+    overlap = sorted(common.keys() & scenario_entities.keys())
     if overlap:
         raise ValueError(f"Scenario resolved entities collide with common entities: {overlap}")
-    return {**common, **scenario.resolved_entities}
+    return {**common, **scenario_entities}
 
 
 def _provider_runtime(

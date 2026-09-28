@@ -165,13 +165,14 @@ class ScenarioComponents:
     required_capabilities: frozenset[Capability]
     evaluation_repetitions: int = 1
     resolved_entities: Mapping[str, str | Mapping[str, JsonValue]] = field(default_factory=dict)
+    # Session kinds the prompt pack renders; adaptive task-selection policies may require more.
     supported_session_kinds: frozenset[SessionKind] = BASE_SESSION_KINDS
+    # Provenance recorded only when an adaptive task-selection policy is configured.
+    task_selection_resolved_entities: Mapping[str, str | Mapping[str, JsonValue]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.name or not self.version:
             raise ValueError("Scenario name and version must be non-empty")
-        if not BASE_SESSION_KINDS <= self.supported_session_kinds:
-            raise ValueError("Scenarios must support the evolve, diagnose_patch, and reflect session kinds")
         if self.evaluation_repetitions < 1:
             raise ValueError("Scenario evaluation_repetitions must be positive")
         train_ids = {case.case_id for case in self.train_cases}
@@ -185,3 +186,10 @@ class ScenarioComponents:
         if any(case.split != "development" for case in self.development_cases):
             raise ValueError("development_cases may contain the development split only")
         object.__setattr__(self, "resolved_entities", MappingProxyType(dict(self.resolved_entities)))
+        if not BASE_SESSION_KINDS <= self.supported_session_kinds:
+            raise ValueError("Scenarios must support the evolve, diagnose_patch, and reflect session kinds")
+        object.__setattr__(
+            self,
+            "task_selection_resolved_entities",
+            MappingProxyType(dict(self.task_selection_resolved_entities)),
+        )

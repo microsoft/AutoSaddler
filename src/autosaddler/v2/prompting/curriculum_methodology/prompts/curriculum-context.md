@@ -5,7 +5,7 @@ curriculum. Each failure pattern that owns at least one training case is an
 arm. An iteration either draws never-executed training cases to discover new
 failure patterns or pulls one known arm and evaluates that arm's cases.
 
-`.autosaddler/session_context.json` contains a `curriculum` object with the
+`.autosaddler/session_context.json` contains a `task_selection` object with the
 curriculum settings and, once the batch is sampled, the `sampling_action` and
 `pulled_arm_id`. `.autosaddler/curriculum/manifest.json` indexes the
 read-only pattern registry: `patterns.json` lists every pattern with its

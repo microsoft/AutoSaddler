@@ -1,8 +1,11 @@
 """Pin the passive task-selection path to the inputs and events of the pre-curriculum engine.
 
-The fixture was captured from origin/main at e841543 by running this module as a script:
+The fixture was captured from origin/main at e841543, where the Meta-ARE prompt entities
+were ``prompt_source_entities(plugin_root=<meta_are>, plugin_name="meta_are")`` plus
+``meta_are_prompt_composition_entity()``; ``meta_are_prompt_entities()`` must still
+produce exactly those values. Regenerate only intentionally, by running this module:
 
-    PYTHONPATH=<origin-main>/src python tests/characterization/test_epoch_invariance.py
+    python tests/characterization/test_epoch_invariance.py
 
 Fixed and epoch-shuffled runs must keep byte-identical resolved inputs, so runs created
 before the adaptive task-selection interface existed can still be resumed.
@@ -19,9 +22,7 @@ from pathlib import Path
 import yaml
 
 from autosaddler.v2.config.registry import build_runtime
-from autosaddler.v2.plugins.meta_are import plugin as meta_are_plugin
-from autosaddler.v2.plugins.meta_are.prompt_pack import meta_are_prompt_composition_entity
-from autosaddler.v2.prompting.assets import prompt_source_entities
+from autosaddler.v2.plugins.meta_are.plugin import meta_are_prompt_entities
 
 FIXTURE = Path(__file__).parent / "fixtures" / "epoch_invariance.json"
 VOLATILE_KEYS = frozenset({"timestamp", "wall_seconds", "run_invocation_id"})
@@ -108,10 +109,7 @@ def summarize(root: Path) -> dict:
         runs[name] = {"resolved": resolved, "events": events}
     meta_are_prompts = {
         path: _digest(value if isinstance(value, str) else json.dumps(value, sort_keys=True))
-        for path, value in {
-            **prompt_source_entities(plugin_root=Path(meta_are_plugin.__file__).parent, plugin_name="meta_are"),
-            "resolved/prompts/compositions.json": meta_are_prompt_composition_entity(),
-        }.items()
+        for path, value in meta_are_prompt_entities().items()
     }
     return {"runs": runs, "meta_are_prompts": meta_are_prompts}
 

@@ -7,7 +7,8 @@ from pathlib import PurePosixPath
 
 from autosaddler.v2.core.curriculum import CurriculumState, FailurePattern, activity_ema
 from autosaddler.v2.core.domain import JsonValue, canonical_json, to_json_value
-from autosaddler.v2.prompting.history import HISTORY_ROOT, iteration_records
+from autosaddler.v2.core.events import RunEvent
+from autosaddler.v2.prompting.history import HISTORY_ROOT
 from autosaddler.v2.storage.local import LocalRunStore
 
 CURRICULUM_ROOT = ".autosaddler/curriculum"
@@ -117,15 +118,15 @@ def arm_scoring_schema(schema_version: str, arm_ids: Sequence[str]) -> Mapping[s
 
 def build_curriculum_bundle(store: LocalRunStore, context: Mapping[str, JsonValue]) -> dict[str, str]:
     """Render the replayed failure-pattern registry as read-only workspace files."""
-    curriculum = context.get("curriculum")
+    curriculum = context.get("task_selection")
     if not isinstance(curriculum, Mapping):
-        raise TypeError("Curriculum sessions require a curriculum context object")
+        raise TypeError("Curriculum sessions require a task_selection context object")
     eta = curriculum.get("ema_eta")
     if isinstance(eta, bool) or not isinstance(eta, (int, float)):
         raise TypeError("Curriculum context requires a numeric ema_eta")
     events = store.events()
     state = CurriculumState.replay(events)
-    iterations = iteration_records(events)
+    iterations = _iteration_outcomes(events)
     files: dict[str, str] = {}
     table: list[dict[str, JsonValue]] = []
     for pattern_id, pattern in state.patterns.items():
@@ -219,6 +220,34 @@ def _pull_records(
                 "history_iteration_path": f"{HISTORY_ROOT}/iterations/{pull.iteration:04d}.json",
             }
         )
+    return records
+
+
+def _iteration_outcomes(events: Sequence[RunEvent]) -> dict[int, dict[str, JsonValue]]:
+    """Per-iteration outcome, diagnosis, training scores, and development aggregates."""
+    records: dict[int, dict[str, JsonValue]] = {}
+    for event in events:
+        payload = event.payload
+        if event.event_type == "IterationCompleted":
+            key = payload.get("iteration")
+            fields = {"outcome": payload.get("outcome")}
+        elif event.event_type == "DeferredWorkScheduled" and payload.get("session_kind") == "reflect":
+            key = payload.get("owning_iteration")
+            fields = {
+                name: payload.get(name)
+                for name in (
+                    "diagnosis",
+                    "train_before_case_scores",
+                    "train_after_case_scores",
+                    "candidate_development_aggregate",
+                    "parent_development_aggregate",
+                )
+            }
+        else:
+            continue
+        if isinstance(key, bool) or not isinstance(key, int):
+            raise TypeError(f"{event.event_type} event must contain an integer iteration")
+        records.setdefault(key, {}).update(fields)
     return records
 
 

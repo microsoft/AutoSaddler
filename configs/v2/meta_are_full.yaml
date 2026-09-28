@@ -1,7 +1,7 @@
 # Full V2 Meta-ARE/GAIA2 run using the sandbox sibling layout and official OpenAI API.
-# V2 reruns the 65-case seed development evaluation because legacy seed reuse is
-# not supported, and uses deterministic epoch-shuffled sampling. See
-# meta_are_activesaddler_full.yaml for the agent-driven failure-pattern curriculum.
+# V2 reruns the 65-case seed development evaluation and uses deterministic
+# epoch-shuffled sampling because legacy seed reuse and agent-bandit sampling
+# are not supported by the V2 engine.
 schema_version: autosaddler/v2
 
 scenario:
@@ -56,8 +56,6 @@ scenario:
     infrastructure_retries: 1
     import_check: from are.simulation.agents.default_agent import base_agent
     capability_phase_iterations: 25
-    capability_transition_mode: iterations
-    capability_phase_max_iterations: 0
 
 optimization:
   task_selection:

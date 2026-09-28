@@ -7,62 +7,14 @@ from pathlib import Path
 import pytest
 import yaml
 
-from autosaddler.v2.config.registry import build_runtime, default_registry
+from autosaddler.v2.config.registry import build_runtime
 from autosaddler.v2.core.curriculum import CURRICULUM_NAMESPACE, CurriculumState
 from autosaddler.v2.core.domain import Cost, canonical_json
-from autosaddler.v2.core.engine import AutoSaddlerEngine, SessionRetriesExhausted
-from autosaddler.v2.core.policies import (
-    ActiveSaddlerTaskSelectionPolicy,
-    BudgetPolicy,
-    FullOnAcceptDevelopment,
-    MatchedValidStrictImprovement,
-    MeanDevelopmentRanking,
-    PolicyBundle,
-)
+from autosaddler.v2.core.engine import SessionRetriesExhausted
 from autosaddler.v2.core.ports import BASE_SESSION_KINDS
-from autosaddler.v2.plugins.fake import FakeScenarioSettings, build_fake_components
 from autosaddler.v2.prompting.models import SessionResult
-from autosaddler.v2.providers.fake import FakeAgentProvider, PaidWorkLedger
+from autosaddler.v2.providers.fake import FakeAgentProvider
 from autosaddler.v2.storage.local import LocalRunStore
-
-TRAIN_CASES = ["train-a", "train-b", "train-c", "train-d"]
-
-
-def curriculum_config(root: Path, *, max_iterations: int = 2) -> dict:
-    return {
-        "schema_version": "autosaddler/v2",
-        "scenario": {
-            "type": "fake",
-            "settings": {
-                "baseline": {"instruction": "baseline"},
-                "target_component": "instruction",
-                "improved_text": "improved",
-                "train_case_ids": TRAIN_CASES,
-                "development_case_ids": ["dev-a", "dev-b"],
-            },
-        },
-        "optimization": {
-            "task_selection": {
-                "type": "activesaddler",
-                "batch_size": 2,
-                "seed": 0,
-                "settings": {"softmax_temperature": 0.15, "min_prob": 0.0, "ema_eta": 0.9},
-            },
-            "acceptance": {"type": "matched_valid_strict_improvement"},
-            "development": {"type": "full_on_accept"},
-            "ranking": {"type": "mean_development_score"},
-            "budget": {"max_rollouts": 100, "max_iterations": max_iterations},
-            "diagnosis_patch_timeout_seconds": 10,
-            "pattern_extraction_timeout_seconds": 11,
-            "arm_scoring_timeout_seconds": 12,
-        },
-        "provider": {
-            "type": "fake",
-            "capabilities": ["read_workspace", "edit_workspace", "load_skills"],
-            "settings": {},
-        },
-        "storage": {"type": "local", "run_root": str(root / "runs")},
-    }
 
 
 def write_config(root: Path, value: dict) -> Path:
@@ -84,8 +36,60 @@ def session_stages(store: LocalRunStore) -> list[str]:
     return [str(event.payload.get("stage")) for event in store.events_of_type("SessionStarted")]
 
 
-def test_activesaddler_runtime_orders_curriculum_sessions(tmp_path: Path) -> None:
-    runtime = build_runtime(write_config(tmp_path, curriculum_config(tmp_path)), run_id="curriculum")
+class ScriptedCurriculumProvider:
+    """Fake provider that can fail chosen kinds and build on the newest accepted candidate."""
+
+    def __init__(self, ledger, *failing_kinds: str, latest_parent: bool = False) -> None:
+        self.delegate = FakeAgentProvider(ledger)
+        self.failing_kinds = frozenset(failing_kinds)
+        self.latest_parent = latest_parent
+
+    async def run(self, request):
+        if request.spec.kind in self.failing_kinds:
+            return SessionResult(
+                status="failed",
+                structured_output=None,
+                raw_response="",
+                tool_calls=(),
+                usage=(),
+                cost=Cost(sessions=1),
+                error=f"persistent {request.spec.kind} failure",
+            )
+        if self.latest_parent and request.spec.kind == "evolve":
+            context = json.loads(request.spec.workspace_files["session_context.json"])
+            response = {
+                "schema_version": "autosaddler-evolution/v1",
+                "parent_ids": [context["candidate_ids"][-1]],
+                "component_sources": {},
+                "rationale": "Build on the newest accepted candidate.",
+            }
+            files = dict(request.spec.workspace_files)
+            files[".autosaddler/fake_response.json"] = canonical_json(response) + "\n"
+            request = replace(request, spec=replace(request.spec, workspace_files=files))
+        return await self.delegate.run(request)
+
+
+def scripted_runtime(tmp_path, registry, config, *failing_kinds: str, latest_parent: bool = False):
+    registry.providers["fake"] = lambda *, ledger, settings: ScriptedCurriculumProvider(
+        ledger,
+        *failing_kinds,
+        latest_parent=latest_parent,
+    )
+    value = config(tmp_path)
+    value["optimization"]["session_retries"] = 0
+    return build_runtime(write_config(tmp_path, value), run_id="scripted", registry=registry)
+
+
+def test_activesaddler_runs_through_the_adaptive_task_selection_interface(
+    tmp_path: Path,
+    curriculum_registry,
+    activesaddler_config,
+) -> None:
+    runtime = build_runtime(
+        write_config(tmp_path, activesaddler_config(tmp_path)),
+        run_id="curriculum",
+        registry=curriculum_registry,
+    )
     result = runtime.engine.run()
     store = runtime.store
 
@@ -115,8 +119,14 @@ def test_activesaddler_runtime_orders_curriculum_sessions(tmp_path: Path) -> Non
         "patterns_extracted",
         "observations_recorded",
     ]
-    first_decision = curriculum_changes(store)[0]
-    assert first_decision["requested_action"] is None and first_decision["action"] == "unseen_draw"
+    operations = [
+        event.operation_id.split(":", 1)[1]
+        for event in store.events_of_type("ExtensionStateChanged")
+        if event.payload.get("namespace") == CURRICULUM_NAMESPACE
+    ]
+    assert operations[0] == "iteration:0:selection:arm-decision"
+    assert operations[3:5] == ["iteration:1:selection:decide-arm", "iteration:1:selection:score-arms"]
+    assert curriculum_changes(store)[0]["requested_action"] is None
 
     state = CurriculumState.replay(store.events())
     (pattern,) = state.patterns.values()
@@ -137,151 +147,108 @@ def test_activesaddler_runtime_orders_curriculum_sessions(tmp_path: Path) -> Non
         "decide_arm": 12.0,
         "score_arms": 12.0,
     }
+    evolve_request = store.read_json(str(store.events_of_type("SessionStarted")[0].payload["request"]["uri"]))
+    evolve_context = json.loads(evolve_request["spec"]["workspace_files"]["session_context.json"])
+    assert evolve_context["train_case_ids"] == []
+    assert evolve_context["task_selection"]["policy"] == "activesaddler"
     policies = json.loads((store.run_dir / "resolved/policies.json").read_text())
-    assert policies["task_selection"] == "activesaddler"
-    assert policies["task_selection_settings"] == {"softmax_temperature": 0.15, "min_prob": 0.0, "ema_eta": 0.9}
+    assert policies["task_selection_settings"]["arm_scoring_timeout_seconds"] == 12
     kinds = json.loads((store.run_dir / "resolved/schemas/session_outputs.json").read_text())["kinds"]
     assert kinds == ["evolve", "diagnose_patch", "reflect", "decide_arm", "extract_patterns", "score_arms"]
+    resolved_config = yaml.safe_load((store.run_dir / "resolved_config.yaml").read_text())
+    assert resolved_config["optimization"]["task_selection"]["settings"]["ema_eta"] == 0.9
     projection = json.loads((store.run_dir / "strategy/curriculum.json").read_text())
-    assert projection["namespace"] == CURRICULUM_NAMESPACE
-    assert len(projection["changes"]) == 7
-    paid = runtime.ledger.entries()
-    assert sum(entry["kind"] == "session" for entry in paid) == 10
+    assert projection["namespace"] == CURRICULUM_NAMESPACE and len(projection["changes"]) == 7
+    assert sum(entry["kind"] == "session" for entry in runtime.ledger.entries()) == 10
 
 
-class LatestParentProvider:
-    """Fake provider whose evolution session always builds on the newest accepted candidate."""
+def test_all_pass_pull_records_inactive_observation_without_diagnosis(
+    tmp_path: Path,
+    curriculum_registry,
+    activesaddler_config,
+) -> None:
+    runtime = scripted_runtime(tmp_path, curriculum_registry, activesaddler_config, latest_parent=True)
 
-    def __init__(self, ledger: PaidWorkLedger, *failing_kinds: str) -> None:
-        self.delegate = FakeAgentProvider(ledger)
-        self.failing_kinds = frozenset(failing_kinds)
-
-    async def run(self, request):
-        if request.spec.kind in self.failing_kinds:
-            return SessionResult(
-                status="failed",
-                structured_output=None,
-                raw_response="",
-                tool_calls=(),
-                usage=(),
-                cost=Cost(sessions=1),
-                error=f"persistent {request.spec.kind} failure",
-            )
-        if request.spec.kind == "evolve":
-            context = json.loads(request.spec.workspace_files["session_context.json"])
-            response = {
-                "schema_version": "autosaddler-evolution/v1",
-                "parent_ids": [context["candidate_ids"][-1]],
-                "component_sources": {},
-                "rationale": "Build on the newest accepted candidate.",
-            }
-            files = dict(request.spec.workspace_files)
-            files[".autosaddler/fake_response.json"] = canonical_json(response) + "\n"
-            request = replace(request, spec=replace(request.spec, workspace_files=files))
-        return await self.delegate.run(request)
-
-
-def direct_engine(tmp_path: Path, *failing_kinds: str, max_iterations: int = 2) -> tuple[AutoSaddlerEngine, LocalRunStore]:
-    run_dir = tmp_path / "run"
-    store = LocalRunStore(run_dir=run_dir, run_id="direct-curriculum")
-    store.initialize(
-        resolved_config={"schema_version": "autosaddler/v2"},
-        resolved_entities={"resolved/component_graph.json": {"scenario": "fake", "provider": "fake"}},
-    )
-    ledger = PaidWorkLedger(run_dir / "audit/fake_paid_work.jsonl")
-    scenario = build_fake_components(
-        settings=FakeScenarioSettings(
-            baseline={"instruction": "baseline"},
-            target_component="instruction",
-            improved_text="improved",
-            train_case_ids=tuple(TRAIN_CASES),
-            development_case_ids=("dev-a", "dev-b"),
-        ),
-        run_dir=run_dir,
-        store=store,
-        ledger=ledger,
-    )
-    engine = AutoSaddlerEngine(
-        store=store,
-        scenario=scenario,
-        provider=LatestParentProvider(ledger, *failing_kinds),
-        policies=PolicyBundle(
-            task_selection=ActiveSaddlerTaskSelectionPolicy(
-                batch_size=2,
-                seed=0,
-                softmax_temperature=0.15,
-                min_prob=0.0,
-                ema_eta=0.9,
-            ),
-            acceptance=MatchedValidStrictImprovement(),
-            development=FullOnAcceptDevelopment(),
-            ranking=MeanDevelopmentRanking(),
-            budget=BudgetPolicy(max_rollouts=100, max_iterations=max_iterations),
-        ),
-        session_retries=0,
-    )
-    return engine, store
-
-
-def test_all_pass_pull_records_inactive_observation_without_diagnosis(tmp_path: Path) -> None:
-    engine, store = direct_engine(tmp_path)
-
-    engine.run()
+    runtime.engine.run()
+    store = runtime.store
 
     outcomes = [event.payload["outcome"] for event in store.events_of_type("IterationCompleted")]
     assert outcomes == ["accepted", "no_training_failures"]
-    observation_events = [
-        change for change in curriculum_changes(store) if change["change"] == "observations_recorded"
-    ]
-    assert [change["iteration"] for change in observation_events] == [0, 1]
-    assert observation_events[1]["observations"][0]["active"] == 0.0
-    assert observation_events[1]["observations"][0]["tagged_case_ids"] == []
+    observations = [change for change in curriculum_changes(store) if change["change"] == "observations_recorded"]
+    assert [change["iteration"] for change in observations] == [0, 1]
+    assert observations[1]["observations"][0]["active"] == 0.0
+    assert observations[1]["observations"][0]["tagged_case_ids"] == []
     assert session_stages(store).count("proposal.patch") == 1
 
 
-def test_failed_arm_decision_defaults_to_pull(tmp_path: Path) -> None:
-    engine, store = direct_engine(tmp_path, "decide_arm")
+def test_failed_arm_decision_defaults_to_pull(tmp_path: Path, curriculum_registry, activesaddler_config) -> None:
+    runtime = scripted_runtime(tmp_path, curriculum_registry, activesaddler_config, "decide_arm", latest_parent=True)
 
-    engine.run()
+    runtime.engine.run()
 
     decision = next(
-        change for change in curriculum_changes(store) if change["change"] == "arm_decision" and change["iteration"] == 1
+        change
+        for change in curriculum_changes(runtime.store)
+        if change["change"] == "arm_decision" and change["iteration"] == 1
     )
     assert decision["requested_action"] == "pull"
     assert decision["action"] == "arm_pull"
     assert "decide_arm failure" in decision["fallback_reason"]
-    assert "proposal.arm_scoring" in session_stages(store)
+    assert "proposal.arm_scoring" in session_stages(runtime.store)
 
 
-def test_failed_arm_scoring_fails_the_run(tmp_path: Path) -> None:
-    engine, store = direct_engine(tmp_path, "score_arms")
+def test_failed_arm_scoring_fails_the_run(tmp_path: Path, curriculum_registry, activesaddler_config) -> None:
+    runtime = scripted_runtime(tmp_path, curriculum_registry, activesaddler_config, "score_arms", latest_parent=True)
 
     with pytest.raises(SessionRetriesExhausted):
-        engine.run()
+        runtime.engine.run()
 
-    assert store.events()[-1].event_type == "RunFailed"
-    assert len(store.events_of_type("BatchSampled")) == 1
+    assert runtime.store.events()[-1].event_type == "RunFailed"
+    assert len(runtime.store.events_of_type("BatchSampled")) == 1
 
 
-def test_failed_pattern_extraction_is_abandoned_and_next_iteration_draws(tmp_path: Path) -> None:
-    engine, store = direct_engine(tmp_path, "extract_patterns")
+def test_failed_pattern_extraction_is_abandoned_and_next_iteration_draws(
+    tmp_path: Path,
+    curriculum_registry,
+    activesaddler_config,
+) -> None:
+    runtime = scripted_runtime(
+        tmp_path,
+        curriculum_registry,
+        activesaddler_config,
+        "extract_patterns",
+        latest_parent=True,
+    )
 
-    engine.run()
+    runtime.engine.run()
+    store = runtime.store
 
-    assert [event.payload["obligation_id"] for event in store.events_of_type("DeferredWorkAbandoned")]
+    assert store.events_of_type("DeferredWorkAbandoned")
     assert CurriculumState.replay(store.events()).patterns == {}
     actions = [event.payload["provenance"]["action"] for event in store.events_of_type("BatchSampled")]
     assert actions == ["unseen_draw", "unseen_draw"]
     assert "proposal.arm_decision" not in session_stages(store)
 
 
-def test_runtime_rejects_scenarios_without_curriculum_session_kinds(tmp_path: Path) -> None:
-    registry = default_registry()
-    builtin = registry.scenarios["fake"]
+def test_runtime_rejects_scenarios_without_curriculum_session_kinds(
+    tmp_path: Path,
+    curriculum_registry,
+    activesaddler_config,
+) -> None:
+    curriculum_factory = curriculum_registry.scenarios["fake"]
+    curriculum_registry.scenarios["fake"] = lambda **kwargs: replace(
+        curriculum_factory(**kwargs),
+        supported_session_kinds=BASE_SESSION_KINDS,
+    )
 
-    def base_only(**kwargs):
-        return replace(builtin(**kwargs), supported_session_kinds=BASE_SESSION_KINDS)
-
-    registry.scenarios["fake"] = base_only
     with pytest.raises(ValueError, match="does not support session kinds"):
-        build_runtime(write_config(tmp_path, curriculum_config(tmp_path)), run_id="unsupported", registry=registry)
+        build_runtime(
+            write_config(tmp_path, activesaddler_config(tmp_path)),
+            run_id="unsupported",
+            registry=curriculum_registry,
+        )
+
+
+def test_builtin_fake_scenario_does_not_declare_curriculum_kinds(tmp_path: Path, activesaddler_config) -> None:
+    with pytest.raises(ValueError, match="does not support session kinds"):
+        build_runtime(write_config(tmp_path, activesaddler_config(tmp_path)), run_id="builtin")

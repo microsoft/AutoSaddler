@@ -7,6 +7,7 @@ import pytest
 from autosaddler.v2.core.curriculum import (
     CURRICULUM_NAMESPACE,
     CURRICULUM_SCHEMA_VERSION,
+    ActiveSaddlerTaskSelectionPolicy,
     ArmScore,
     CurriculumState,
     PatternObservation,
@@ -19,7 +20,7 @@ from autosaddler.v2.core.curriculum import (
 )
 from autosaddler.v2.core.domain import Case
 from autosaddler.v2.core.events import RunEvent
-from autosaddler.v2.core.policies import ActiveSaddlerTaskSelectionPolicy
+from autosaddler.v2.core.scheduling import AdaptiveTaskSelectionPolicy
 
 BEFORE = "sha256:before"
 AFTER = "sha256:after"
@@ -243,7 +244,15 @@ def test_pattern_ids_and_failures_are_deterministic() -> None:
 
 
 def policy(**overrides) -> ActiveSaddlerTaskSelectionPolicy:
-    values = {"batch_size": 2, "seed": 7, "softmax_temperature": 0.15, "min_prob": 0.0, "ema_eta": 0.9}
+    values = {
+        "batch_size": 2,
+        "seed": 7,
+        "softmax_temperature": 0.15,
+        "min_prob": 0.0,
+        "ema_eta": 0.9,
+        "pattern_extraction_timeout_seconds": 30.0,
+        "arm_scoring_timeout_seconds": 20.0,
+    }
     values.update(overrides)
     return ActiveSaddlerTaskSelectionPolicy(**values)
 
@@ -297,3 +306,20 @@ def test_activesaddler_rejects_infeasible_actions_and_settings() -> None:
         policy(min_prob=1.0)
     with pytest.raises(ValueError, match="ema_eta"):
         policy(ema_eta=0.0)
+    with pytest.raises(ValueError, match="timeouts"):
+        policy(arm_scoring_timeout_seconds=0.0)
+
+
+def test_activesaddler_implements_the_adaptive_interface() -> None:
+    selector = policy()
+
+    assert isinstance(selector, AdaptiveTaskSelectionPolicy)
+    assert selector.namespace == CURRICULUM_NAMESPACE
+    assert selector.session_timeouts() == {"extract_patterns": 30.0, "decide_arm": 20.0, "score_arms": 20.0}
+
+
+def test_passive_policies_are_not_adaptive() -> None:
+    from autosaddler.v2.core.policies import EpochShuffledTaskSelectionPolicy, FixedTaskSelectionPolicy
+
+    assert not isinstance(FixedTaskSelectionPolicy(batch_size=1), AdaptiveTaskSelectionPolicy)
+    assert not isinstance(EpochShuffledTaskSelectionPolicy(batch_size=1, seed=0), AdaptiveTaskSelectionPolicy)

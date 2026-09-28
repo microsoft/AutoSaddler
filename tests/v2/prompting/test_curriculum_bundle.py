@@ -20,51 +20,28 @@ from autosaddler.v2.prompting.history import build_history_bundle
 from autosaddler.v2.prompting.models import session_output_validation_error
 
 
-def run_curriculum(tmp_path: Path):
-    value = {
-        "schema_version": "autosaddler/v2",
-        "scenario": {
-            "type": "fake",
-            "settings": {
-                "baseline": {"instruction": "baseline"},
-                "target_component": "instruction",
-                "improved_text": "improved",
-                "train_case_ids": ["train-a", "train-b", "train-c"],
-                "development_case_ids": ["dev-a"],
-            },
-        },
-        "optimization": {
-            "task_selection": {
-                "type": "activesaddler",
-                "batch_size": 2,
-                "seed": 0,
-                "settings": {"softmax_temperature": 0.15, "min_prob": 0.0, "ema_eta": 0.9},
-            },
-            "acceptance": {"type": "matched_valid_strict_improvement"},
-            "development": {"type": "full_on_accept"},
-            "ranking": {"type": "mean_development_score"},
-            "budget": {"max_rollouts": 100, "max_iterations": 2},
-            "diagnosis_patch_timeout_seconds": 10,
-        },
-        "provider": {
-            "type": "fake",
-            "capabilities": ["read_workspace", "edit_workspace", "load_skills"],
-            "settings": {},
-        },
-        "storage": {"type": "local", "run_root": str(tmp_path / "runs")},
-    }
+def run_curriculum(tmp_path: Path, registry, config):
+    value = config(
+        tmp_path,
+        train_case_ids=("train-a", "train-b", "train-c"),
+        development_case_ids=("dev-a",),
+    )
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(value, sort_keys=False))
-    runtime = build_runtime(path, run_id="bundle")
+    runtime = build_runtime(path, run_id="bundle", registry=registry)
     runtime.engine.run()
     return runtime.store
 
 
-def test_curriculum_bundle_renders_patterns_pull_history_and_decisions(tmp_path: Path) -> None:
-    store = run_curriculum(tmp_path)
+def test_curriculum_bundle_renders_patterns_pull_history_and_decisions(
+    tmp_path: Path,
+    curriculum_registry,
+    activesaddler_config,
+) -> None:
+    store = run_curriculum(tmp_path, curriculum_registry, activesaddler_config)
     (pattern_id,) = CurriculumState.replay(store.events()).patterns
 
-    files = build_curriculum_bundle(store, {"iteration": 2, "curriculum": {"ema_eta": 0.9}})
+    files = build_curriculum_bundle(store, {"iteration": 2, "task_selection": {"ema_eta": 0.9}})
 
     manifest = json.loads(files[f"{CURRICULUM_ROOT}/manifest.json"])
     assert manifest["num_patterns"] == 1
@@ -84,14 +61,17 @@ def test_curriculum_bundle_renders_patterns_pull_history_and_decisions(tmp_path:
 
     history = build_history_bundle(store, {"train_case_ids": []}).workspace_files
     iteration = json.loads(history[".autosaddler/history/iterations/0001.json"])
-    assert iteration["sampling_action"] == "arm_pull"
-    assert iteration["pulled_arm_id"] == pattern_id
+    assert "sampling_action" not in iteration
 
 
-def test_curriculum_bundle_requires_curriculum_context(tmp_path: Path) -> None:
-    store = run_curriculum(tmp_path)
+def test_curriculum_bundle_requires_task_selection_context(
+    tmp_path: Path,
+    curriculum_registry,
+    activesaddler_config,
+) -> None:
+    store = run_curriculum(tmp_path, curriculum_registry, activesaddler_config)
 
-    with pytest.raises(TypeError, match="curriculum context"):
+    with pytest.raises(TypeError, match="task_selection context"):
         build_curriculum_bundle(store, {"iteration": 0})
 
 

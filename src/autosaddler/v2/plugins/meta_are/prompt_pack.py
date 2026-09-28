@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
+from autosaddler.v2.core.curriculum import CURRICULUM_SESSION_KINDS
 from autosaddler.v2.core.domain import JsonValue, canonical_json, sha256_digest
 from autosaddler.v2.prompting.assets import (
     PromptComposition,
@@ -29,19 +30,7 @@ _TRAINING_EVIDENCE_PATH = ".autosaddler/training_evidence.json"
 _PROMPT_ASSETS_PATH = ".autosaddler/prompt_assets.json"
 _EVIDENCE_BEFORE_PATH = ".autosaddler/training_evidence_before.json"
 _EVIDENCE_AFTER_PATH = ".autosaddler/training_evidence_after.json"
-_CURRICULUM_CONTEXT_KINDS = frozenset({"evolve", "diagnose_patch"})
-_SHARED_SKILLS = {
-    "history-analysis": "methodology/skills/history-analysis/SKILL.md",
-    "diagnose": "methodology/skills/causal-diagnosis/SKILL.md",
-    "patch-verification": "methodology/skills/verification-baseline/SKILL.md",
-    "symptom-extract": "methodology/skills/symptom-extraction/SKILL.md",
-    "symptom-normalize": "methodology/skills/symptom-normalization/SKILL.md",
-    "progress-scoring": "methodology/skills/progress-scoring/SKILL.md",
-}
-_METHOD_NAMES = {
-    "diagnose_patch": "diagnose",
-    "evolve": "evolve",
-    "reflect": "reflect",
+_CURRICULUM_METHOD_NAMES = {
     "extract_patterns": "extract-patterns",
     "decide_arm": "decide-arm",
     "score_arms": "score-arms",
@@ -61,8 +50,10 @@ class MetaAREPromptPack:
     ) -> None:
         if not writable_paths:
             raise ValueError("Meta-ARE prompt pack requires writable paths")
-        if capability_phase_iterations < 0 or capability_phase_max_iterations < 0:
+        if capability_phase_iterations < 0:
             raise ValueError("Meta-ARE capability phase iterations cannot be negative")
+        if capability_phase_max_iterations < 0:
+            raise ValueError("Meta-ARE capability phase max iterations cannot be negative")
         if capability_transition_mode not in {"iterations", "full_coverage"}:
             raise ValueError(f"Unknown Meta-ARE capability transition mode: {capability_transition_mode}")
         if capability_transition_mode == "full_coverage" and not train_case_ids:
@@ -88,7 +79,7 @@ class MetaAREPromptPack:
             _SESSION_CONTEXT_PATH: canonical_json(rendered_context) + "\n",
         }
         workspace_files.update(build_history_bundle(self.store, context).workspace_files)
-        curriculum = "curriculum" in context
+        curriculum = _is_curriculum(context)
         if curriculum:
             workspace_files.update(build_curriculum_bundle(self.store, context))
 
@@ -115,32 +106,30 @@ class MetaAREPromptPack:
             schema = _reflection_schema()
             skill_paths = {"history-analysis": None}
             mutation_label = None
-        elif kind == "extract_patterns":
-            curriculum_inputs = _curriculum(context)
-            workspace_files[_EVIDENCE_BEFORE_PATH] = self._evidence(curriculum_inputs.get("train_before_evidence"))
-            workspace_files[_EVIDENCE_AFTER_PATH] = self._evidence(curriculum_inputs.get("train_after_evidence"))
-            failing = [
-                str(item["case_id"])
-                for key in ("pre_patch_failures", "post_patch_failures")
-                for item in _case_records(context.get(key), key)
-            ]
-            schema = pattern_extraction_schema("autosaddler-meta-are-pattern-extraction/v1", failing)
-            skill_paths = {"history-analysis": None, "symptom-extract": None, "symptom-normalize": None}
+        elif kind in CURRICULUM_SESSION_KINDS and curriculum:
+            task_selection = _task_selection(context)
             mutation_label = None
-        elif kind == "decide_arm":
-            _curriculum(context)
-            schema = arm_decision_schema("autosaddler-meta-are-arm-decision/v1")
-            skill_paths = {"history-analysis": None}
-            mutation_label = None
-        elif kind == "score_arms":
-            arm_ids = _strings(_curriculum(context).get("arm_ids"), "curriculum.arm_ids")
-            schema = arm_scoring_schema("autosaddler-meta-are-arm-scoring/v1", arm_ids)
-            skill_paths = {"history-analysis": None, "progress-scoring": None}
-            mutation_label = None
+            if kind == "extract_patterns":
+                workspace_files[_EVIDENCE_BEFORE_PATH] = self._evidence(task_selection.get("train_before_evidence"))
+                workspace_files[_EVIDENCE_AFTER_PATH] = self._evidence(task_selection.get("train_after_evidence"))
+                failing = [
+                    str(item["case_id"])
+                    for key in ("pre_patch_failures", "post_patch_failures")
+                    for item in _case_records(context.get(key), key)
+                ]
+                schema = pattern_extraction_schema("autosaddler-meta-are-pattern-extraction/v1", failing)
+                skill_paths = {"history-analysis": None, "symptom-extract": None, "symptom-normalize": None}
+            elif kind == "decide_arm":
+                schema = arm_decision_schema("autosaddler-meta-are-arm-decision/v1")
+                skill_paths = {"history-analysis": None}
+            else:
+                arm_ids = _strings(task_selection.get("arm_ids"), "task_selection.arm_ids")
+                schema = arm_scoring_schema("autosaddler-meta-are-arm-scoring/v1", arm_ids)
+                skill_paths = {"history-analysis": None, "progress-scoring": None}
         else:
             raise ValueError(f"Unknown Meta-ARE session kind: {kind}")
 
-        resolved = _resolved_assets(kind, skill_paths, curriculum=curriculum and kind in _CURRICULUM_CONTEXT_KINDS)
+        resolved = _resolved_assets(kind, skill_paths, curriculum=curriculum)
         workspace_files[_PROMPT_ASSETS_PATH] = _provenance_manifest(resolved)
 
         return SessionSpec(
@@ -295,23 +284,44 @@ def _resolved_assets(
     *,
     curriculum: bool = False,
 ) -> ResolvedPromptAssets:
-    shared_skills = _SHARED_SKILLS
-    curriculum_assets = (
-        (_shared_asset("methodology/prompts/curriculum-context.md", "methodology.prompt.curriculum_context"),)
-        if curriculum
-        else ()
-    )
+    shared_skills = {
+        "history-analysis": "methodology/skills/history-analysis/SKILL.md",
+        "diagnose": "methodology/skills/causal-diagnosis/SKILL.md",
+        "patch-verification": "methodology/skills/verification-baseline/SKILL.md",
+        "symptom-extract": "curriculum_methodology/skills/symptom-extraction/SKILL.md",
+        "symptom-normalize": "curriculum_methodology/skills/symptom-normalization/SKILL.md",
+        "progress-scoring": "curriculum_methodology/skills/progress-scoring/SKILL.md",
+    }
+    if kind in CURRICULUM_SESSION_KINDS:
+        task_assets = (
+            _shared_asset(
+                f"curriculum_methodology/prompts/{_CURRICULUM_METHOD_NAMES[kind]}-method.md",
+                f"methodology.prompt.{kind}",
+            ),
+            _plugin_asset(f"curriculum/prompts/{kind}.md", f"meta_are.prompt.{kind}"),
+        )
+    else:
+        task_assets = (
+            _shared_asset(f"methodology/prompts/{_method_name(kind)}-method.md", f"methodology.prompt.{kind}"),
+            _plugin_asset(f"prompts/{kind}.md", f"meta_are.prompt.{kind}"),
+            *(
+                (
+                    _shared_asset(
+                        "curriculum_methodology/prompts/curriculum-context.md",
+                        "methodology.prompt.curriculum_context",
+                    ),
+                )
+                if curriculum
+                else ()
+            ),
+        )
     return resolve_prompt_composition(
         PromptComposition(
             system_assets=(
                 _shared_asset("methodology/system/optimizer-invariants.md", "methodology.system.invariants"),
                 _plugin_asset("SYSTEM.md", "meta_are.system"),
             ),
-            task_assets=(
-                _shared_asset(f"methodology/prompts/{_method_name(kind)}-method.md", f"methodology.prompt.{kind}"),
-                _plugin_asset(f"prompts/{kind}.md", f"meta_are.prompt.{kind}"),
-                *curriculum_assets,
-            ),
+            task_assets=task_assets,
             skill_assets={
                 name: (
                     *(
@@ -332,6 +342,40 @@ def _resolved_assets(
 
 
 def meta_are_prompt_composition_entity() -> Mapping[str, JsonValue]:
+    return prompt_composition_record(
+        plugin_name="meta_are",
+        compositions={
+            "evolve": _resolved_assets(
+                "evolve",
+                {"history-analysis": None},
+            ),
+            "diagnose_patch.capability": _resolved_assets(
+                "diagnose_patch",
+                {
+                    "history-analysis": None,
+                    "diagnose": None,
+                    "capability-patch": "skills/capability-patch/SKILL.md",
+                    "patch-verification": "skills/patch-verification/SKILL.md",
+                },
+            ),
+            "diagnose_patch.steering": _resolved_assets(
+                "diagnose_patch",
+                {
+                    "history-analysis": None,
+                    "diagnose": None,
+                    "steering-patch": "skills/steering-patch/SKILL.md",
+                    "patch-verification": "skills/patch-verification/SKILL.md",
+                },
+            ),
+            "reflect": _resolved_assets(
+                "reflect",
+                {"history-analysis": None},
+            ),
+        },
+    )
+
+
+def meta_are_curriculum_composition_entity() -> Mapping[str, JsonValue]:
     diagnose_skills = {
         phase: {
             "history-analysis": None,
@@ -341,40 +385,39 @@ def meta_are_prompt_composition_entity() -> Mapping[str, JsonValue]:
         }
         for phase in ("capability", "steering")
     }
-    compositions = {
-        "evolve": _resolved_assets("evolve", {"history-analysis": None}),
-        "diagnose_patch.capability": _resolved_assets("diagnose_patch", diagnose_skills["capability"]),
-        "diagnose_patch.steering": _resolved_assets("diagnose_patch", diagnose_skills["steering"]),
-        "reflect": _resolved_assets("reflect", {"history-analysis": None}),
-        "evolve.curriculum": _resolved_assets("evolve", {"history-analysis": None}, curriculum=True),
-        "diagnose_patch.capability.curriculum": _resolved_assets(
-            "diagnose_patch",
-            diagnose_skills["capability"],
-            curriculum=True,
-        ),
-        "diagnose_patch.steering.curriculum": _resolved_assets(
-            "diagnose_patch",
-            diagnose_skills["steering"],
-            curriculum=True,
-        ),
-        "extract_patterns": _resolved_assets(
-            "extract_patterns",
-            {"history-analysis": None, "symptom-extract": None, "symptom-normalize": None},
-        ),
-        "decide_arm": _resolved_assets("decide_arm", {"history-analysis": None}),
-        "score_arms": _resolved_assets("score_arms", {"history-analysis": None, "progress-scoring": None}),
-    }
-    return prompt_composition_record(plugin_name="meta_are", compositions=compositions)
+    return prompt_composition_record(
+        plugin_name="meta_are",
+        compositions={
+            "evolve.curriculum": _resolved_assets("evolve", {"history-analysis": None}, curriculum=True),
+            "diagnose_patch.capability.curriculum": _resolved_assets(
+                "diagnose_patch",
+                diagnose_skills["capability"],
+                curriculum=True,
+            ),
+            "diagnose_patch.steering.curriculum": _resolved_assets(
+                "diagnose_patch",
+                diagnose_skills["steering"],
+                curriculum=True,
+            ),
+            "extract_patterns": _resolved_assets(
+                "extract_patterns",
+                {"history-analysis": None, "symptom-extract": None, "symptom-normalize": None},
+            ),
+            "decide_arm": _resolved_assets("decide_arm", {"history-analysis": None}),
+            "score_arms": _resolved_assets("score_arms", {"history-analysis": None, "progress-scoring": None}),
+        },
+    )
 
 
-def _method_name(kind: str) -> str:
-    return _METHOD_NAMES[kind]
+def _is_curriculum(context: Mapping[str, JsonValue]) -> bool:
+    value = context.get("task_selection")
+    return isinstance(value, Mapping) and value.get("policy") == "activesaddler"
 
 
-def _curriculum(context: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
-    value = context.get("curriculum")
+def _task_selection(context: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    value = context.get("task_selection")
     if not isinstance(value, Mapping):
-        raise TypeError("Meta-ARE curriculum sessions require a curriculum context object")
+        raise TypeError("Meta-ARE curriculum sessions require a task_selection context object")
     return value
 
 
@@ -384,6 +427,10 @@ def _case_records(value: JsonValue | None, label: str) -> list[Mapping[str, Json
     ):
         raise TypeError(f"Meta-ARE prompt context {label} must be a list of case records")
     return [item for item in value if isinstance(item, Mapping)]
+
+
+def _method_name(kind: str) -> str:
+    return "diagnose" if kind == "diagnose_patch" else kind
 
 
 def _shared_asset(relative_path: str, asset_id: str):

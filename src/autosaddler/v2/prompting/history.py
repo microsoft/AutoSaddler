@@ -24,7 +24,7 @@ def build_history_bundle(
 ) -> HistoryBundle:
     events = store.events()
     state = RunState.replay(events)
-    all_iterations = iteration_records(events)
+    all_iterations = _iteration_records(events)
     iteration_ids = sorted(all_iterations)
     iterations = {iteration: all_iterations[iteration] for iteration in iteration_ids}
     all_lessons = _lessons(events)
@@ -259,7 +259,7 @@ def build_history_bundle(
     return HistoryBundle(workspace_files=files, compatibility_history=compatibility)
 
 
-def iteration_records(events: tuple[RunEvent, ...]) -> dict[int, dict[str, JsonValue]]:
+def _iteration_records(events: tuple[RunEvent, ...]) -> dict[int, dict[str, JsonValue]]:
     records: dict[int, dict[str, JsonValue]] = {}
     for event in events:
         if event.event_type not in {
@@ -280,10 +280,6 @@ def iteration_records(events: tuple[RunEvent, ...]) -> dict[int, dict[str, JsonV
         record = records.setdefault(iteration, {"iteration": iteration})
         if event.event_type == "BatchSampled":
             record["train_case_ids"] = to_json_value(payload.get("case_ids", []))
-            provenance = payload.get("provenance")
-            if isinstance(provenance, Mapping) and provenance.get("policy") == "activesaddler":
-                record["sampling_action"] = to_json_value(provenance.get("action"))
-                record["pulled_arm_id"] = to_json_value(provenance.get("chosen_arm"))
         elif event.event_type == "MutationRejected":
             record["mutation_rejected"] = True
             record["verification_failure"] = to_json_value(payload.get("verification_failure"))

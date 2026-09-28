@@ -209,10 +209,11 @@ class LocalRunStore:
             self.run_dir / "strategy" / "lessons.json",
             canonical_json(_extension_projection(events, "autosaddler.lessons")) + "\n",
         )
-        _atomic_write(
-            self.run_dir / "strategy" / "curriculum.json",
-            canonical_json(_extension_projection(events, "autosaddler.curriculum")) + "\n",
-        )
+        for namespace in _extension_namespaces(events) - {"autosaddler.lessons"}:
+            _atomic_write(
+                self.run_dir / "strategy" / f"{_projection_name(namespace)}.json",
+                canonical_json(_extension_projection(events, namespace)) + "\n",
+            )
         metric_rows = metrics_records(events)
         _atomic_write(
             self.run_dir / "metrics.jsonl",
@@ -474,6 +475,21 @@ def _extension_projection(events: tuple[RunEvent, ...], namespace: str) -> dict[
         "namespace": namespace,
         "changes": changes,
     }
+
+
+def _extension_namespaces(events: tuple[RunEvent, ...]) -> set[str]:
+    return {
+        namespace
+        for event in events
+        if event.event_type == "ExtensionStateChanged" and isinstance(namespace := event.payload.get("namespace"), str)
+    }
+
+
+def _projection_name(namespace: str) -> str:
+    name = namespace.removeprefix("autosaddler.")
+    if not name or PurePosixPath(name).name != name:
+        raise ValueError(f"Unsafe extension namespace: {namespace}")
+    return name
 
 
 def _atomic_write(path: Path, text: str) -> None:

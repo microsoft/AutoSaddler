@@ -10,16 +10,6 @@ from pathlib import Path
 from typing import Any, cast
 
 from autosaddler.v2.core.attempts import EventEvaluationAttemptSink
-from autosaddler.v2.core.curriculum import (
-    CURRICULUM_NAMESPACE,
-    CURRICULUM_SCHEMA_VERSION,
-    ArmAction,
-    CurriculumState,
-    derive_pattern_id,
-    failing_case_ids,
-    pattern_observations,
-    resolve_action,
-)
 from autosaddler.v2.core.domain import (
     ArtifactRef,
     Candidate,
@@ -30,9 +20,9 @@ from autosaddler.v2.core.domain import (
     canonical_json,
     sha256_digest,
 )
-from autosaddler.v2.core.events import ITERATION_COMPLETION_SCHEMA_VERSION, operation_id
+from autosaddler.v2.core.events import ITERATION_COMPLETION_SCHEMA_VERSION, RunEvent, operation_id
 from autosaddler.v2.core.metrics import EventModelUsageSink
-from autosaddler.v2.core.policies import ActiveSaddlerTaskSelectionPolicy, DevelopmentDecision, PolicyBundle
+from autosaddler.v2.core.policies import DevelopmentDecision, PolicyBundle, TaskSelection
 from autosaddler.v2.core.ports import (
     AgentProvider,
     CompositionPlan,
@@ -44,6 +34,18 @@ from autosaddler.v2.core.ports import (
     WorkspaceDelta,
 )
 from autosaddler.v2.core.run_state import RunState
+from autosaddler.v2.core.scheduling import (
+    MAX_SELECTION_STEPS,
+    AdaptiveTaskSelectionPolicy,
+    DeferredRequest,
+    IterationFeedback,
+    NoSelection,
+    SelectionRequest,
+    SessionStep,
+    StatePayload,
+    StateStep,
+    iteration_feedback_from,
+)
 from autosaddler.v2.core.serde import candidate_from, evaluation_from, record, session_result_from
 from autosaddler.v2.prompting.models import (
     SessionRequest,
@@ -78,8 +80,6 @@ class AutoSaddlerEngine:
         diagnosis_patch_timeout_seconds: float = 30.0,
         selection_timeout_seconds: float | None = None,
         reflection_timeout_seconds: float | None = None,
-        pattern_extraction_timeout_seconds: float | None = None,
-        arm_scoring_timeout_seconds: float | None = None,
         session_retries: int = 2,
         session_retry_backoff_seconds: float = 0.0,
     ) -> None:
@@ -94,10 +94,6 @@ class AutoSaddlerEngine:
         self.diagnosis_patch_timeout_seconds = diagnosis_patch_timeout_seconds
         self.selection_timeout_seconds = selection_timeout_seconds or diagnosis_patch_timeout_seconds
         self.reflection_timeout_seconds = reflection_timeout_seconds or diagnosis_patch_timeout_seconds
-        self.pattern_extraction_timeout_seconds = (
-            pattern_extraction_timeout_seconds or diagnosis_patch_timeout_seconds
-        )
-        self.arm_scoring_timeout_seconds = arm_scoring_timeout_seconds or diagnosis_patch_timeout_seconds
         self.session_retries = session_retries
         self.session_retry_backoff_seconds = session_retry_backoff_seconds
         self.run_invocation_id = uuid4().hex
@@ -234,13 +230,14 @@ class AutoSaddlerEngine:
         self._iteration_started_at[iteration] = time.monotonic()
         self.store.append("IterationStarted", iteration_operation, {"iteration": iteration})
 
-        curriculum_policy = self._curriculum_policy()
-        batch_operation = operation_id(self.store.run_id, "iteration", iteration, "batch")
-        if curriculum_policy is None:
+        adaptive = self._adaptive_task_selection()
+        cases_by_id = {case.case_id: case for case in self.scenario.train_cases}
+        if adaptive is None:
+            batch_operation = operation_id(self.store.run_id, "iteration", iteration, "batch")
             batch_event = self.store.find("BatchSampled", batch_operation)
             if batch_event is None:
                 task_selection = self.policies.task_selection
-                assert not isinstance(task_selection, ActiveSaddlerTaskSelectionPolicy)
+                assert not isinstance(task_selection, AdaptiveTaskSelectionPolicy)
                 selection = task_selection.select(self.scenario.train_cases, iteration)
                 batch_event = self.store.append(
                     "BatchSampled",
@@ -253,8 +250,9 @@ class AutoSaddlerEngine:
                 )
             case_ids = _string_list(batch_event.payload.get("case_ids"), "sampled case_ids")
         else:
-            # The curriculum samples after the working parent is prepared, as in ActiveSaddler.
+            # Adaptive policies choose the batch for the prepared working parent.
             case_ids = ()
+        cases = tuple(cases_by_id[case_id] for case_id in case_ids)
 
         state = self._state()
         component_source_options: dict[str, list[str]] = {}
@@ -270,8 +268,8 @@ class AutoSaddlerEngine:
             "component_source_options": cast(JsonValue, component_source_options),
             "train_case_ids": list(case_ids),
         }
-        if curriculum_policy is not None:
-            evolve_context["curriculum"] = curriculum_policy.curriculum_context()
+        if adaptive is not None:
+            evolve_context["task_selection"] = adaptive.prompt_context(self.store.events(), iteration)
         evolve_spec = self.scenario.prompt_pack.session("evolve", evolve_context)
         evolve = await self._ensure_session(
             logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, "evolve"),
@@ -297,15 +295,20 @@ class AutoSaddlerEngine:
                 parent = candidate_from(composition_event.payload.get("candidate"))
         else:
             parent = selected_parent
-        if curriculum_policy is not None:
-            sampled = await self._ensure_curriculum_batch(
-                iteration=iteration,
-                policy=curriculum_policy,
-                parent=parent,
-                selected_parent=selected_parent,
-                selection_plan=selection_plan,
+        if adaptive is not None:
+            sampled = await self._ensure_adaptive_batch(
+                adaptive,
+                SelectionRequest(
+                    iteration=iteration,
+                    train_cases=self.scenario.train_cases,
+                    working_parent_id=parent.candidate_id,
+                    selected_parent_id=selected_parent.candidate_id,
+                    selection_parent_ids=selection_plan.parents,
+                    component_sources=selection_plan.selections,
+                    selection_rationale=selection_plan.rationale,
+                ),
             )
-            if sampled is None:
+            if isinstance(sampled, NoSelection):
                 self._complete_iteration(
                     iteration=iteration,
                     resulting_candidate=selected_parent,
@@ -315,12 +318,12 @@ class AutoSaddlerEngine:
                     details={
                         "selection_parent_ids": list(selection_plan.parents),
                         "component_sources": dict(selection_plan.selections),
+                        "no_selection_reason": sampled.reason,
                     },
                 )
                 return
             case_ids = sampled
-        cases_by_id = {case.case_id: case for case in self.scenario.train_cases}
-        cases = tuple(cases_by_id[case_id] for case_id in case_ids)
+            cases = tuple(cases_by_id[case_id] for case_id in case_ids)
         parent_evaluation = await self._ensure_evaluation(
             logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, "train-before"),
             candidate=parent,
@@ -329,12 +332,27 @@ class AutoSaddlerEngine:
             iteration=iteration,
         )
         if all(observation.disposition == "success" for observation in parent_evaluation.observations):
-            if curriculum_policy is not None:
-                self._record_pattern_observations(
-                    logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, "observations"),
-                    iteration=iteration,
-                    batch_case_ids=case_ids,
-                    after_evaluation_id=None,
+            if adaptive is not None:
+                self._record_task_selection_changes(
+                    adaptive,
+                    operation_id(self.store.run_id, "iteration", iteration, "feedback"),
+                    adaptive.iteration_changes(
+                        self.store.events(),
+                        IterationFeedback(
+                            iteration=iteration,
+                            outcome="no_training_failures",
+                            case_ids=case_ids,
+                            working_parent_id=parent.candidate_id,
+                            child_id=None,
+                            train_before_evaluation_id=parent_evaluation.evaluation_id,
+                            train_after_evaluation_id=None,
+                            train_before_case_scores=_case_aggregate_scores(parent_evaluation),
+                            train_after_case_scores=None,
+                            train_before_evidence=None,
+                            train_after_evidence=None,
+                            diagnosis=None,
+                        ),
+                    ),
                 )
             self._complete_iteration(
                 iteration=iteration,
@@ -356,8 +374,8 @@ class AutoSaddlerEngine:
             "train_case_ids": list(case_ids),
             "evidence": record(evidence),
         }
-        if curriculum_policy is not None:
-            diagnosis_context["curriculum"] = self._sampled_curriculum_context(curriculum_policy, iteration)
+        if adaptive is not None:
+            diagnosis_context["task_selection"] = adaptive.prompt_context(self.store.events(), iteration)
         diagnosis_spec = self.scenario.prompt_pack.session("diagnose_patch", diagnosis_context)
         mutation_context = MutationContext(
             iteration=iteration,
@@ -513,16 +531,24 @@ class AutoSaddlerEngine:
         obligation_id = sha256_digest(
             canonical_json({"iteration": iteration, "candidate_id": child.candidate_id, "kind": "reflect"})
         )
-        curriculum_inputs: dict[str, JsonValue] = {}
-        if curriculum_policy is not None:
-            curriculum_inputs["curriculum"] = {
-                **self._sampled_curriculum_context(curriculum_policy, iteration),
-                "working_parent_candidate_id": parent.candidate_id,
-                "train_before_evaluation_id": parent_evaluation.evaluation_id,
-                "train_after_evaluation_id": child_evaluation.evaluation_id,
-                "train_before_evidence": record(evidence),
-                "train_after_evidence": record(self.scenario.evidence_builder.build(child_evaluation)),
-            }
+        task_selection_feedback: dict[str, JsonValue] = {}
+        if adaptive is not None:
+            task_selection_feedback["task_selection_feedback"] = record(
+                IterationFeedback(
+                    iteration=iteration,
+                    outcome="accepted" if verdict.accepted else "declined",
+                    case_ids=case_ids,
+                    working_parent_id=parent.candidate_id,
+                    child_id=child.candidate_id,
+                    train_before_evaluation_id=parent_evaluation.evaluation_id,
+                    train_after_evaluation_id=child_evaluation.evaluation_id,
+                    train_before_case_scores=_case_aggregate_scores(parent_evaluation),
+                    train_after_case_scores=_case_aggregate_scores(child_evaluation),
+                    train_before_evidence=evidence,
+                    train_after_evidence=self.scenario.evidence_builder.build(child_evaluation),
+                    diagnosis=_optional_session_string(diagnosis, "diagnosis"),
+                )
+            )
         self.store.append(
             "DeferredWorkScheduled",
             operation_id(self.store.run_id, "iteration", iteration, "deferred-reflect"),
@@ -551,7 +577,7 @@ class AutoSaddlerEngine:
                 "diagnosis": _optional_session_string(diagnosis, "diagnosis"),
                 "patch_phase": mutation_context.patch_label,
                 "acceptance_reason": verdict.reason,
-                **curriculum_inputs,
+                **task_selection_feedback,
             },
         )
         self._complete_iteration(
@@ -657,207 +683,173 @@ class AutoSaddlerEngine:
         )
 
     async def _drain_deferred(self) -> None:
-        # Reflection can schedule pattern extraction for the same iteration, so re-read
-        # the pending set after every obligation and run reflection before extraction.
-        while pending := self._state().pending_obligations:
-            obligation_id, obligation = min(
-                pending.items(),
-                key=lambda item: (
-                    cast(int, item[1].get("owning_iteration")),
-                    _DEFERRED_KIND_ORDER.get(str(item[1].get("session_kind", "")), len(_DEFERRED_KIND_ORDER)),
-                    item[0],
-                ),
-            )
+        adaptive = self._adaptive_task_selection()
+        # Reflection may schedule task-selection work, so re-read the pending set after each
+        # obligation; reflections keep their original order and run before that work.
+        while pending := sorted(
+            self._state().pending_obligations.items(),
+            key=lambda item: (item[1].get("session_kind") != "reflect", item[0]),
+        ):
+            obligation_id, obligation = pending[0]
             kind = str(obligation.get("session_kind", ""))
-            if kind == "reflect":
-                await self._run_deferred_reflection(obligation_id, obligation)
-            elif kind == "extract_patterns":
-                await self._run_deferred_pattern_extraction(obligation_id, obligation)
-            else:
-                raise ValueError(f"Unknown deferred session kind: {kind}")
+            if kind != "reflect":
+                if adaptive is None or kind not in adaptive.required_session_kinds:
+                    raise ValueError(f"Unknown deferred session kind: {kind}")
+                await self._run_task_selection_deferred(adaptive, obligation_id, obligation)
+                continue
+            candidate_id = str(obligation.get("candidate_id", ""))
+            train_case_ids = _string_list(obligation.get("train_case_ids"), "deferred train case IDs")
+            spec = self.scenario.prompt_pack.session(
+                "reflect",
+                {
+                    "iteration": cast(int, obligation.get("owning_iteration")),
+                    "candidate_ids": [candidate_id],
+                    "train_case_ids": list(train_case_ids),
+                    "parent_candidate_id": cast(JsonValue, obligation.get("parent_candidate_id")),
+                    "working_parent_candidate_id": cast(
+                        JsonValue,
+                        obligation.get("working_parent_candidate_id"),
+                    ),
+                    "selection_parent_ids": cast(JsonValue, obligation.get("selection_parent_ids")),
+                    "component_sources": cast(JsonValue, obligation.get("component_sources")),
+                    "selection_rationale": cast(JsonValue, obligation.get("selection_rationale")),
+                    "train_before_aggregate": cast(JsonValue, obligation.get("train_before_aggregate")),
+                    "train_after_aggregate": cast(JsonValue, obligation.get("train_after_aggregate")),
+                    "train_before_case_scores": cast(
+                        JsonValue,
+                        obligation.get("train_before_case_scores"),
+                    ),
+                    "train_after_case_scores": cast(
+                        JsonValue,
+                        obligation.get("train_after_case_scores"),
+                    ),
+                    "accepted_by_minibatch_gate": cast(
+                        JsonValue,
+                        obligation.get("accepted_by_minibatch_gate"),
+                    ),
+                    "parent_development_aggregate": cast(
+                        JsonValue,
+                        obligation.get("parent_development_aggregate"),
+                    ),
+                    "candidate_development_aggregate": cast(
+                        JsonValue,
+                        obligation.get("candidate_development_aggregate"),
+                    ),
+                    "changed_components": cast(JsonValue, obligation.get("changed_components")),
+                    "updates": cast(JsonValue, obligation.get("updates")),
+                    "diagnosis": cast(JsonValue, obligation.get("diagnosis")),
+                    "acceptance_reason": cast(JsonValue, obligation.get("acceptance_reason")),
+                },
+            )
+            try:
+                result = await self._ensure_session(
+                    logical_operation_id=operation_id(self.store.run_id, "deferred", obligation_id, "reflect"),
+                    spec=spec,
+                    source_workspace=None,
+                    result_validator=lambda value: _reflection_failure_reason(value, train_case_ids),
+                    metrics_context={
+                        "stage": "proposal.reflection",
+                        "iteration": cast(int, obligation.get("owning_iteration")),
+                        "candidate_id": candidate_id,
+                    },
+                )
+            except SessionRetriesExhausted as error:
+                self.store.append(
+                    "DeferredWorkAbandoned",
+                    operation_id(self.store.run_id, "deferred", obligation_id, "abandon"),
+                    {
+                        "obligation_id": obligation_id,
+                        "candidate_id": candidate_id,
+                        "reason": str(error),
+                    },
+                )
+                continue
+            lessons = _session_list(result, "lessons")
+            _validate_lesson_case_ids(lessons, train_case_ids)
+            self.store.append(
+                "ExtensionStateChanged",
+                operation_id(self.store.run_id, "deferred", obligation_id, "lessons"),
+                {
+                    "namespace": "autosaddler.lessons",
+                    "schema_version": "autosaddler-lessons/v1",
+                    "candidate_id": candidate_id,
+                    "owning_iteration": cast(int, obligation.get("owning_iteration")),
+                    "lessons": lessons,
+                },
+            )
+            feedback = obligation.get("task_selection_feedback")
+            if feedback is not None:
+                if adaptive is None:
+                    raise ValueError("Reflection carries task-selection feedback without an adaptive policy")
+                request = adaptive.after_reflection(self.store.events(), iteration_feedback_from(feedback), lessons)
+                if request is not None:
+                    self._schedule_task_selection_deferred(obligation_id, obligation, request)
+            self.store.append(
+                "DeferredWorkCompleted",
+                operation_id(self.store.run_id, "deferred", obligation_id, "complete"),
+                {"obligation_id": obligation_id, "candidate_id": candidate_id},
+            )
 
-    async def _run_deferred_reflection(self, obligation_id: str, obligation: Mapping[str, object]) -> None:
-        candidate_id = str(obligation.get("candidate_id", ""))
-        train_case_ids = _string_list(obligation.get("train_case_ids"), "deferred train case IDs")
-        spec = self.scenario.prompt_pack.session(
-            "reflect",
+    def _schedule_task_selection_deferred(
+        self,
+        reflection_obligation_id: str,
+        reflection: Mapping[str, object],
+        request: DeferredRequest,
+    ) -> None:
+        owning_iteration = cast(int, reflection.get("owning_iteration"))
+        candidate_id = str(reflection.get("candidate_id", ""))
+        obligation_id = sha256_digest(
+            canonical_json({"iteration": owning_iteration, "candidate_id": candidate_id, "kind": request.kind})
+        )
+        self.store.append(
+            "DeferredWorkScheduled",
+            operation_id(self.store.run_id, "deferred", reflection_obligation_id, "schedule", request.kind),
             {
-                "iteration": cast(int, obligation.get("owning_iteration")),
-                "candidate_ids": [candidate_id],
-                "train_case_ids": list(train_case_ids),
-                "parent_candidate_id": cast(JsonValue, obligation.get("parent_candidate_id")),
-                "working_parent_candidate_id": cast(
-                    JsonValue,
-                    obligation.get("working_parent_candidate_id"),
-                ),
-                "selection_parent_ids": cast(JsonValue, obligation.get("selection_parent_ids")),
-                "component_sources": cast(JsonValue, obligation.get("component_sources")),
-                "selection_rationale": cast(JsonValue, obligation.get("selection_rationale")),
-                "train_before_aggregate": cast(JsonValue, obligation.get("train_before_aggregate")),
-                "train_after_aggregate": cast(JsonValue, obligation.get("train_after_aggregate")),
-                "train_before_case_scores": cast(
-                    JsonValue,
-                    obligation.get("train_before_case_scores"),
-                ),
-                "train_after_case_scores": cast(
-                    JsonValue,
-                    obligation.get("train_after_case_scores"),
-                ),
-                "accepted_by_minibatch_gate": cast(
-                    JsonValue,
-                    obligation.get("accepted_by_minibatch_gate"),
-                ),
-                "parent_development_aggregate": cast(
-                    JsonValue,
-                    obligation.get("parent_development_aggregate"),
-                ),
-                "candidate_development_aggregate": cast(
-                    JsonValue,
-                    obligation.get("candidate_development_aggregate"),
-                ),
-                "changed_components": cast(JsonValue, obligation.get("changed_components")),
-                "updates": cast(JsonValue, obligation.get("updates")),
-                "diagnosis": cast(JsonValue, obligation.get("diagnosis")),
-                "acceptance_reason": cast(JsonValue, obligation.get("acceptance_reason")),
+                "obligation_id": obligation_id,
+                "owning_iteration": owning_iteration,
+                "candidate_id": candidate_id,
+                "session_kind": request.kind,
+                "stage": request.stage,
+                "task_selection": cast(JsonValue, request.payload),
             },
         )
+
+    async def _run_task_selection_deferred(
+        self,
+        policy: AdaptiveTaskSelectionPolicy,
+        obligation_id: str,
+        obligation: Mapping[str, object],
+    ) -> None:
+        payload = obligation.get("task_selection")
+        if not isinstance(payload, Mapping):
+            raise TypeError("Task-selection deferred work requires a payload object")
+        request = DeferredRequest(
+            kind=str(obligation.get("session_kind", "")),
+            stage=str(obligation.get("stage", "")),
+            payload=cast(Mapping[str, JsonValue], payload),
+        )
+        candidate_id = str(obligation.get("candidate_id", ""))
+        state_parts = ("deferred", obligation_id, "state")
+        # Exclude this obligation's own state so a partially recorded result replays identically.
+        events = self._events_without_state(state_parts)
+        spec = self.scenario.prompt_pack.session(request.kind, policy.deferred_context(events, request))
         try:
             result = await self._ensure_session(
-                logical_operation_id=operation_id(self.store.run_id, "deferred", obligation_id, "reflect"),
+                logical_operation_id=operation_id(self.store.run_id, "deferred", obligation_id, request.kind),
                 spec=spec,
                 source_workspace=None,
-                result_validator=lambda value: _reflection_failure_reason(value, train_case_ids),
+                result_validator=lambda value: policy.deferred_failure_reason(events, request, value),
                 metrics_context={
-                    "stage": "proposal.reflection",
+                    "stage": request.stage,
                     "iteration": cast(int, obligation.get("owning_iteration")),
                     "candidate_id": candidate_id,
                 },
             )
         except SessionRetriesExhausted as error:
-            self.store.append(
-                "DeferredWorkAbandoned",
-                operation_id(self.store.run_id, "deferred", obligation_id, "abandon"),
-                {
-                    "obligation_id": obligation_id,
-                    "candidate_id": candidate_id,
-                    "reason": str(error),
-                },
-            )
-            return
-        lessons = _session_list(result, "lessons")
-        _validate_lesson_case_ids(lessons, train_case_ids)
-        self.store.append(
-            "ExtensionStateChanged",
-            operation_id(self.store.run_id, "deferred", obligation_id, "lessons"),
-            {
-                "namespace": "autosaddler.lessons",
-                "schema_version": "autosaddler-lessons/v1",
-                "candidate_id": candidate_id,
-                "owning_iteration": cast(int, obligation.get("owning_iteration")),
-                "lessons": lessons,
-            },
-        )
-        if "curriculum" in obligation:
-            self._schedule_pattern_extraction(obligation_id, obligation, lessons)
-        self.store.append(
-            "DeferredWorkCompleted",
-            operation_id(self.store.run_id, "deferred", obligation_id, "complete"),
-            {"obligation_id": obligation_id, "candidate_id": candidate_id},
-        )
-
-    def _schedule_pattern_extraction(
-        self,
-        reflection_obligation_id: str,
-        obligation: Mapping[str, object],
-        lessons: Sequence[JsonValue],
-    ) -> None:
-        owning_iteration = cast(int, obligation.get("owning_iteration"))
-        candidate_id = str(obligation.get("candidate_id", ""))
-        before_scores = _score_mapping(obligation.get("train_before_case_scores"), "train_before_case_scores")
-        after_scores = _score_mapping(obligation.get("train_after_case_scores"), "train_after_case_scores")
-        pre_patch = failing_case_ids(before_scores)
-        post_patch = failing_case_ids(after_scores)
-        if not pre_patch and not post_patch:
-            return
-        extraction_id = sha256_digest(
-            canonical_json({"iteration": owning_iteration, "candidate_id": candidate_id, "kind": "extract_patterns"})
-        )
-        self.store.append(
-            "DeferredWorkScheduled",
-            operation_id(self.store.run_id, "deferred", reflection_obligation_id, "schedule-extract-patterns"),
-            {
-                "obligation_id": extraction_id,
-                "owning_iteration": owning_iteration,
-                "candidate_id": candidate_id,
-                "session_kind": "extract_patterns",
-                "train_case_ids": cast(JsonValue, obligation.get("train_case_ids")),
-                "curriculum": cast(JsonValue, obligation.get("curriculum")),
-                "pre_patch_failures": [
-                    {"case_id": case_id, "train_before_score": before_scores[case_id]} for case_id in pre_patch
-                ],
-                "post_patch_failures": [
-                    {"case_id": case_id, "train_after_score": after_scores[case_id]} for case_id in post_patch
-                ],
-                "train_before_case_scores": cast(JsonValue, obligation.get("train_before_case_scores")),
-                "train_after_case_scores": cast(JsonValue, obligation.get("train_after_case_scores")),
-                "diagnosis": cast(JsonValue, obligation.get("diagnosis")),
-                "lessons": list(lessons),
-            },
-        )
-
-    async def _run_deferred_pattern_extraction(self, obligation_id: str, obligation: Mapping[str, object]) -> None:
-        owning_iteration = cast(int, obligation.get("owning_iteration"))
-        candidate_id = str(obligation.get("candidate_id", ""))
-        curriculum = obligation.get("curriculum")
-        if not isinstance(curriculum, Mapping):
-            raise TypeError("Pattern extraction obligation requires curriculum inputs")
-        train_case_ids = _string_list(obligation.get("train_case_ids"), "pattern extraction train case IDs")
-        pre_patch = _failure_case_ids(obligation.get("pre_patch_failures"), "pre_patch_failures")
-        post_patch = _failure_case_ids(obligation.get("post_patch_failures"), "post_patch_failures")
-        state = CurriculumState.replay(self.store.events())
-        existing_ids = tuple(
-            pattern_id
-            for pattern_id, pattern in state.patterns.items()
-            if pattern.created_iteration != owning_iteration
-        )
-        spec = self.scenario.prompt_pack.session(
-            "extract_patterns",
-            {
-                "iteration": owning_iteration,
-                "candidate_ids": [candidate_id],
-                "train_case_ids": list(train_case_ids),
-                "curriculum": cast(JsonValue, curriculum),
-                "pre_patch_failures": cast(JsonValue, obligation.get("pre_patch_failures")),
-                "post_patch_failures": cast(JsonValue, obligation.get("post_patch_failures")),
-                "train_before_case_scores": cast(JsonValue, obligation.get("train_before_case_scores")),
-                "train_after_case_scores": cast(JsonValue, obligation.get("train_after_case_scores")),
-                "diagnosis": cast(JsonValue, obligation.get("diagnosis")),
-                "lessons": cast(JsonValue, obligation.get("lessons")),
-                "existing_pattern_ids": list(existing_ids),
-            },
-        )
-        after_evaluation_id = _mapping_string(curriculum, "train_after_evaluation_id")
-        try:
-            result = await self._ensure_session(
-                logical_operation_id=operation_id(self.store.run_id, "deferred", obligation_id, "extract-patterns"),
-                spec=spec,
-                source_workspace=None,
-                result_validator=lambda value: _pattern_extraction_failure_reason(
-                    value, pre_patch, post_patch, existing_ids
-                ),
-                metrics_context={
-                    "stage": "proposal.pattern_extraction",
-                    "iteration": owning_iteration,
-                    "candidate_id": candidate_id,
-                },
-            )
-        except SessionRetriesExhausted as error:
-            # ActiveSaddler still observes the sampled arms when extraction fails.
-            self._record_pattern_observations(
-                logical_operation_id=operation_id(self.store.run_id, "deferred", obligation_id, "observations"),
-                iteration=owning_iteration,
-                batch_case_ids=train_case_ids,
-                after_evaluation_id=after_evaluation_id,
+            self._record_task_selection_changes(
+                policy,
+                state_parts,
+                policy.deferred_exhausted_changes(events, request, str(error)),
             )
             self.store.append(
                 "DeferredWorkAbandoned",
@@ -865,230 +857,88 @@ class AutoSaddlerEngine:
                 {"obligation_id": obligation_id, "candidate_id": candidate_id, "reason": str(error)},
             )
             return
-        patterns_operation = operation_id(self.store.run_id, "deferred", obligation_id, "patterns")
-        if self.store.find("ExtensionStateChanged", patterns_operation) is None:
-            self.store.append(
-                "ExtensionStateChanged",
-                patterns_operation,
-                _pattern_extraction_change(
-                    result,
-                    iteration=owning_iteration,
-                    candidate_id=candidate_id,
-                    curriculum=curriculum,
-                ),
-            )
-        self._record_pattern_observations(
-            logical_operation_id=operation_id(self.store.run_id, "deferred", obligation_id, "observations"),
-            iteration=owning_iteration,
-            batch_case_ids=train_case_ids,
-            after_evaluation_id=after_evaluation_id,
-        )
+        self._record_task_selection_changes(policy, state_parts, policy.deferred_changes(events, request, result))
         self.store.append(
             "DeferredWorkCompleted",
             operation_id(self.store.run_id, "deferred", obligation_id, "complete"),
             {"obligation_id": obligation_id, "candidate_id": candidate_id},
         )
 
-    def _record_pattern_observations(
-        self,
-        *,
-        logical_operation_id: str,
-        iteration: int,
-        batch_case_ids: Sequence[str],
-        after_evaluation_id: str | None,
-    ) -> None:
-        if self.store.find("ExtensionStateChanged", logical_operation_id) is not None:
-            return
-        observations = pattern_observations(
-            CurriculumState.replay(self.store.events()),
-            iteration=iteration,
-            batch_case_ids=batch_case_ids,
-            after_evaluation_id=after_evaluation_id,
-        )
-        if not observations:
-            return
-        self.store.append(
-            "ExtensionStateChanged",
-            logical_operation_id,
-            {
-                "namespace": CURRICULUM_NAMESPACE,
-                "schema_version": CURRICULUM_SCHEMA_VERSION,
-                "change": "observations_recorded",
-                "iteration": iteration,
-                "observations": cast(JsonValue, observations),
-            },
-        )
-
-    def _curriculum_policy(self) -> ActiveSaddlerTaskSelectionPolicy | None:
+    def _adaptive_task_selection(self) -> AdaptiveTaskSelectionPolicy | None:
         policy = self.policies.task_selection
-        return policy if isinstance(policy, ActiveSaddlerTaskSelectionPolicy) else None
+        return policy if isinstance(policy, AdaptiveTaskSelectionPolicy) else None
 
-    def _sampled_curriculum_context(
+    async def _ensure_adaptive_batch(
         self,
-        policy: ActiveSaddlerTaskSelectionPolicy,
-        iteration: int,
-    ) -> dict[str, JsonValue]:
-        batch_event = self.store.find("BatchSampled", operation_id(self.store.run_id, "iteration", iteration, "batch"))
-        if batch_event is None:
-            raise RuntimeError(f"Iteration {iteration} has no sampled curriculum batch")
-        provenance = batch_event.payload.get("provenance")
-        if not isinstance(provenance, Mapping):
-            raise TypeError("Curriculum batch provenance must be an object")
-        return {
-            **policy.curriculum_context(),
-            "sampling_action": provenance.get("action"),
-            "pulled_arm_id": provenance.get("chosen_arm"),
-        }
-
-    async def _ensure_curriculum_batch(
-        self,
-        *,
-        iteration: int,
-        policy: ActiveSaddlerTaskSelectionPolicy,
-        parent: Candidate,
-        selected_parent: Candidate,
-        selection_plan: CompositionPlan,
-    ) -> tuple[str, ...] | None:
+        policy: AdaptiveTaskSelectionPolicy,
+        request: SelectionRequest,
+    ) -> tuple[str, ...] | NoSelection:
+        iteration = request.iteration
         batch_operation = operation_id(self.store.run_id, "iteration", iteration, "batch")
-        batch_event = self.store.find("BatchSampled", batch_operation)
-        if batch_event is not None:
-            return _string_list(batch_event.payload.get("case_ids"), "sampled case_ids")
-        train_case_ids = tuple(case.case_id for case in self.scenario.train_cases)
-        session_context: dict[str, JsonValue] = {
-            "iteration": iteration,
-            "candidate_ids": [parent.candidate_id],
-            "selected_parent_candidate_id": selected_parent.candidate_id,
-            "selection_parent_ids": list(selection_plan.parents),
-            "component_sources": dict(selection_plan.selections),
-            "selection_rationale": selection_plan.rationale,
-        }
-
-        decision_operation = operation_id(self.store.run_id, "iteration", iteration, "arm-decision")
-        decision_event = self.store.find("ExtensionStateChanged", decision_operation)
-        if decision_event is None:
-            state = CurriculumState.replay(self.store.events())
-            arms = state.arms(train_case_ids)
-            unseen = state.unseen_case_ids(policy.draw_order(self.scenario.train_cases))
-            requested: ArmAction | None = None
-            rationale = "No failure-pattern arm exists yet; draw unseen training cases."
-            fallback_reason: str | None = None
-            if arms:
-                spec = self.scenario.prompt_pack.session(
-                    "decide_arm",
-                    {
-                        **session_context,
-                        "curriculum": {
-                            **policy.curriculum_context(),
-                            "arm_ids": list(arms),
-                            "num_arms": len(arms),
-                            "num_unseen": len(unseen),
-                        },
-                    },
-                )
-                try:
-                    decision = await self._ensure_session(
-                        logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, "decide-arm"),
-                        spec=spec,
-                        source_workspace=None,
-                        result_validator=_arm_decision_failure_reason,
-                        metrics_context={
-                            "stage": "proposal.arm_decision",
-                            "iteration": iteration,
-                            "candidate_id": parent.candidate_id,
-                        },
-                    )
-                except SessionRetriesExhausted as error:
-                    # ActiveSaddler treats a missing or failed decision as an arm pull.
-                    requested = "pull"
-                    rationale = "Arm decision session failed; defaulting to an arm pull."
-                    fallback_reason = str(error)
-                else:
-                    requested = cast(ArmAction, _optional_session_string(decision, "action"))
-                    rationale = _optional_session_string(decision, "rationale")
-            action = resolve_action(num_arms=len(arms), unseen_count=len(unseen), requested=requested)
-            decision_event = self.store.append(
-                "ExtensionStateChanged",
-                decision_operation,
-                {
-                    "namespace": CURRICULUM_NAMESPACE,
-                    "schema_version": CURRICULUM_SCHEMA_VERSION,
-                    "change": "arm_decision",
-                    "iteration": iteration,
-                    "requested_action": requested,
-                    "action": action,
-                    "rationale": rationale,
-                    "fallback_reason": fallback_reason,
-                    "num_arms": len(arms),
-                    "num_unseen": len(unseen),
-                },
-            )
-        action = decision_event.payload.get("action")
-        if action == "empty":
-            return None
-        if action not in {"unseen_draw", "arm_pull"}:
-            raise ValueError(f"Unknown curriculum action: {action}")
-
-        if action == "arm_pull":
-            scores_operation = operation_id(self.store.run_id, "iteration", iteration, "arm-scores")
-            if self.store.find("ExtensionStateChanged", scores_operation) is None:
-                arm_ids = tuple(CurriculumState.replay(self.store.events()).arms(train_case_ids))
-                spec = self.scenario.prompt_pack.session(
-                    "score_arms",
-                    {
-                        **session_context,
-                        "curriculum": {
-                            **policy.curriculum_context(),
-                            "arm_ids": list(arm_ids),
-                            "num_arms": len(arm_ids),
-                        },
-                    },
-                )
-                # A missing arm score would silently zero that arm, so exhausted retries fail the run.
-                scoring = await self._ensure_session(
-                    logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, "score-arms"),
-                    spec=spec,
-                    source_workspace=None,
-                    result_validator=lambda value: _arm_scoring_failure_reason(value, arm_ids),
-                    metrics_context={
-                        "stage": "proposal.arm_scoring",
-                        "iteration": iteration,
-                        "candidate_id": parent.candidate_id,
-                    },
-                )
+        executed: set[str] = set()
+        for _ in range(MAX_SELECTION_STEPS):
+            batch_event = self.store.find("BatchSampled", batch_operation)
+            if batch_event is not None:
+                return _string_list(batch_event.payload.get("case_ids"), "sampled case_ids")
+            step = policy.next_selection_step(self.store.events(), request)
+            if isinstance(step, TaskSelection):
                 self.store.append(
-                    "ExtensionStateChanged",
-                    scores_operation,
-                    {
-                        "namespace": CURRICULUM_NAMESPACE,
-                        "schema_version": CURRICULUM_SCHEMA_VERSION,
-                        "change": "arm_scores",
-                        "iteration": iteration,
-                        "scores": [
-                            {
-                                key: item[key]
-                                for key in ("pattern_id", "severity", "fixability", "breadth", "side_effect", "rationale")
-                            }
-                            for item in cast(list[Mapping[str, JsonValue]], _session_list(scoring, "scores"))
-                        ],
-                    },
+                    "BatchSampled",
+                    batch_operation,
+                    {"iteration": iteration, "case_ids": list(step.case_ids), "provenance": step.provenance},
                 )
+                continue
+            if isinstance(step, NoSelection):
+                return step
+            state_operation = operation_id(self.store.run_id, "iteration", iteration, "selection", step.name)
+            if step.name in executed or self.store.find("ExtensionStateChanged", state_operation) is not None:
+                raise RuntimeError(f"Adaptive task selection repeated step {step.name!r} in iteration {iteration}")
+            executed.add(step.name)
+            if isinstance(step, StateStep):
+                state = step.payload
+            else:
+                state = await self._task_selection_session_state(step, iteration, request.working_parent_id)
+            self.store.append("ExtensionStateChanged", state_operation, _namespaced(policy, state))
+        raise RuntimeError(f"Adaptive task selection exceeded {MAX_SELECTION_STEPS} steps in iteration {iteration}")
 
-        selection = policy.select_curriculum(
-            self.scenario.train_cases,
-            iteration,
-            state=CurriculumState.replay(self.store.events()),
-            action=action,
+    async def _task_selection_session_state(
+        self,
+        step: SessionStep,
+        iteration: int,
+        candidate_id: str,
+    ) -> StatePayload:
+        try:
+            result = await self._ensure_session(
+                logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, step.name),
+                spec=self.scenario.prompt_pack.session(step.kind, step.context),
+                source_workspace=None,
+                result_validator=step.validate,
+                metrics_context={"stage": step.stage, "iteration": iteration, "candidate_id": candidate_id},
+            )
+        except SessionRetriesExhausted as error:
+            if step.record_exhausted is None:
+                raise
+            return step.record_exhausted(str(error))
+        return step.record(result)
+
+    def _record_task_selection_changes(
+        self,
+        policy: AdaptiveTaskSelectionPolicy,
+        parts: tuple[object, ...],
+        changes: Sequence[StatePayload],
+    ) -> None:
+        for index, change in enumerate(changes):
+            state_operation = operation_id(self.store.run_id, *parts, index)
+            if self.store.find("ExtensionStateChanged", state_operation) is None:
+                self.store.append("ExtensionStateChanged", state_operation, _namespaced(policy, change))
+
+    def _events_without_state(self, parts: tuple[object, ...]) -> tuple[RunEvent, ...]:
+        prefix = operation_id(self.store.run_id, *parts) + ":"
+        return tuple(
+            event
+            for event in self.store.events()
+            if not (event.event_type == "ExtensionStateChanged" and event.operation_id.startswith(prefix))
         )
-        batch_event = self.store.append(
-            "BatchSampled",
-            batch_operation,
-            {
-                "iteration": iteration,
-                "case_ids": list(selection.case_ids),
-                "provenance": selection.provenance,
-            },
-        )
-        return _string_list(batch_event.payload.get("case_ids"), "sampled case_ids")
 
     async def _ensure_session(
         self,
@@ -1542,10 +1392,9 @@ class AutoSaddlerEngine:
             return self.diagnosis_patch_timeout_seconds
         if kind == "reflect":
             return self.reflection_timeout_seconds
-        if kind == "extract_patterns":
-            return self.pattern_extraction_timeout_seconds
-        if kind in {"decide_arm", "score_arms"}:
-            return self.arm_scoring_timeout_seconds
+        adaptive = self._adaptive_task_selection()
+        if adaptive is not None and kind in adaptive.session_timeouts():
+            return adaptive.session_timeouts()[kind]
         raise ValueError(f"Unknown session kind: {kind}")
 
     def _iteration_wall_seconds(self, iteration: int) -> float:
@@ -1626,7 +1475,10 @@ class AutoSaddlerEngine:
         )
 
 
-_DEFERRED_KIND_ORDER = {"reflect": 0, "extract_patterns": 1}
+def _namespaced(policy: AdaptiveTaskSelectionPolicy, state: StatePayload) -> dict[str, JsonValue]:
+    if "namespace" in state:
+        raise ValueError("Task-selection state payloads must not set their own namespace")
+    return {"namespace": policy.namespace, **state}
 
 
 def _required_score(evaluation: Evaluation) -> float:
@@ -1799,176 +1651,6 @@ def _reflection_failure_reason(result: SessionResult, train_case_ids: Sequence[s
     except (TypeError, ValueError) as error:
         return f"{type(error).__name__}: {error}"
     return None
-
-
-def _arm_decision_failure_reason(result: SessionResult) -> str | None:
-    output = result.structured_output
-    if output is None:
-        return "Arm decision session produced no structured output"
-    if output.get("action") not in {"pull", "draw"}:
-        return "Arm decision action must be 'pull' or 'draw'"
-    rationale = output.get("rationale")
-    if not isinstance(rationale, str) or not rationale:
-        return "Arm decision rationale must be a non-empty string"
-    return None
-
-
-def _arm_scoring_failure_reason(result: SessionResult, arm_ids: Sequence[str]) -> str | None:
-    try:
-        scores = _session_list(result, "scores")
-    except TypeError as error:
-        return str(error)
-    scored: list[str] = []
-    for index, item in enumerate(scores):
-        if not isinstance(item, Mapping):
-            return f"Arm score {index} must be an object"
-        pattern_id = item.get("pattern_id")
-        if not isinstance(pattern_id, str):
-            return f"Arm score {index} requires a pattern_id"
-        for axis in ("severity", "fixability", "breadth", "side_effect"):
-            value = item.get(axis)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
-                return f"Arm score {index} {axis} must be a number in [0, 1]"
-        rationale = item.get("rationale")
-        if not isinstance(rationale, str) or not rationale:
-            return f"Arm score {index} requires a rationale"
-        scored.append(pattern_id)
-    if len(set(scored)) != len(scored):
-        return "Every arm must be scored exactly once"
-    if set(scored) != set(arm_ids):
-        missing = sorted(set(arm_ids) - set(scored))
-        unknown = sorted(set(scored) - set(arm_ids))
-        return f"Arm scores must cover exactly the current arms: missing={missing}, unknown={unknown}"
-    return None
-
-
-def _pattern_extraction_failure_reason(
-    result: SessionResult,
-    pre_patch: Sequence[str],
-    post_patch: Sequence[str],
-    existing_pattern_ids: Sequence[str],
-) -> str | None:
-    output = result.structured_output
-    if output is None:
-        return "Pattern extraction session produced no structured output"
-    new_patterns = output.get("new_patterns")
-    tags = output.get("tags")
-    if not isinstance(new_patterns, list) or not isinstance(tags, list):
-        return "Pattern extraction output requires new_patterns and tags lists"
-    keys: list[str] = []
-    for index, item in enumerate(new_patterns):
-        if not isinstance(item, Mapping):
-            return f"New pattern {index} must be an object"
-        key = item.get("key")
-        label = item.get("label")
-        if not isinstance(key, str) or not key or not isinstance(label, str) or not label:
-            return f"New pattern {index} requires a non-empty key and label"
-        keys.append(key)
-    if len(set(keys)) != len(keys):
-        return "New pattern keys must be unique"
-    if set(keys) & set(existing_pattern_ids):
-        return "New pattern keys must not reuse existing pattern IDs"
-    allowed_refs = set(keys) | set(existing_pattern_ids)
-    failures = {"pre_patch": set(pre_patch), "post_patch": set(post_patch)}
-    referenced: set[str] = set()
-    for index, item in enumerate(tags):
-        if not isinstance(item, Mapping):
-            return f"Pattern tag {index} must be an object"
-        source = item.get("source")
-        case_id = item.get("case_id")
-        if source not in failures:
-            return f"Pattern tag {index} source must be pre_patch or post_patch"
-        if case_id not in failures[cast(str, source)]:
-            return f"Pattern tag {index} case {case_id!r} is not a {source} failure of this iteration"
-        refs = item.get("pattern_refs")
-        if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) for ref in refs):
-            return f"Pattern tag {index} pattern_refs must be a non-empty list of strings"
-        if len(set(refs)) != len(refs):
-            return f"Pattern tag {index} pattern_refs must be unique"
-        unknown = sorted(set(cast(list[str], refs)) - allowed_refs)
-        if unknown:
-            return f"Pattern tag {index} references unknown patterns: {unknown}"
-        root_cause = item.get("root_cause")
-        if not isinstance(root_cause, str) or not root_cause:
-            return f"Pattern tag {index} requires a root_cause"
-        referenced.update(cast(list[str], refs))
-    untagged = sorted(set(keys) - referenced)
-    if untagged:
-        return f"New patterns must tag at least one failure: {untagged}"
-    return None
-
-
-def _pattern_extraction_change(
-    result: SessionResult,
-    *,
-    iteration: int,
-    candidate_id: str,
-    curriculum: Mapping[str, object],
-) -> dict[str, JsonValue]:
-    output = result.structured_output
-    if output is None:
-        raise ValueError("Pattern extraction session produced no structured output")
-    key_to_id: dict[str, str] = {}
-    new_patterns: list[JsonValue] = []
-    for item in cast(list[Mapping[str, str]], output.get("new_patterns")):
-        pattern_id = derive_pattern_id(iteration=iteration, key=item["key"], label=item["label"])
-        key_to_id[item["key"]] = pattern_id
-        new_patterns.append({"pattern_id": pattern_id, "key": item["key"], "label": item["label"]})
-    provenance = {
-        "pre_patch": (
-            _mapping_string(curriculum, "working_parent_candidate_id"),
-            _mapping_string(curriculum, "train_before_evaluation_id"),
-        ),
-        "post_patch": (candidate_id, _mapping_string(curriculum, "train_after_evaluation_id")),
-    }
-    tags: list[JsonValue] = []
-    for item in cast(list[Mapping[str, JsonValue]], output.get("tags")):
-        source = cast(str, item["source"])
-        tagged_candidate_id, evaluation_id = provenance[source]
-        for ref in cast(list[str], item["pattern_refs"]):
-            tags.append(
-                {
-                    "pattern_id": key_to_id.get(ref, ref),
-                    "case_id": item["case_id"],
-                    "candidate_id": tagged_candidate_id,
-                    "evaluation_id": evaluation_id,
-                    "source": source,
-                    "root_cause": item["root_cause"],
-                }
-            )
-    return {
-        "namespace": CURRICULUM_NAMESPACE,
-        "schema_version": CURRICULUM_SCHEMA_VERSION,
-        "change": "patterns_extracted",
-        "iteration": iteration,
-        "candidate_id": candidate_id,
-        "new_patterns": new_patterns,
-        "tags": tags,
-    }
-
-
-def _score_mapping(value: object, label: str) -> dict[str, float]:
-    if not isinstance(value, Mapping) or any(
-        not isinstance(key, str) or isinstance(score, bool) or not isinstance(score, (int, float))
-        for key, score in value.items()
-    ):
-        raise TypeError(f"{label} must map case IDs to scores")
-    return {str(key): float(score) for key, score in value.items()}
-
-
-def _failure_case_ids(value: object, label: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or any(
-        not isinstance(item, Mapping) or not isinstance(item.get("case_id"), str) for item in value
-    ):
-        raise TypeError(f"{label} must be a list of case records")
-    return tuple(cast(str, item["case_id"]) for item in value)
-
-
-def _mapping_string(value: Mapping[str, object], key: str) -> str:
-    item = value.get(key)
-    if not isinstance(item, str) or not item:
-        raise TypeError(f"Curriculum input {key!r} must be a non-empty string")
-    return item
 
 
 def _verdict(value: object) -> PatchVerdict:

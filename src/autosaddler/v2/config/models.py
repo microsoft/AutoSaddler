@@ -25,7 +25,8 @@ class TaskSelectionConfig:
     type: str
     batch_size: int
     seed: int
-    settings: Mapping[str, JsonValue]
+    # Policy-owned settings for parameterized policies; omitted for passive policies.
+    settings: Mapping[str, JsonValue] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,8 +50,6 @@ class OptimizationConfig:
     diagnosis_patch_timeout_seconds: float
     selection_timeout_seconds: float
     reflection_timeout_seconds: float
-    pattern_extraction_timeout_seconds: float
-    arm_scoring_timeout_seconds: float
     session_retries: int
     session_retry_backoff_seconds: float
 
@@ -98,8 +97,6 @@ class RunConfig:
         optional_optimization = {
             "selection_timeout_seconds",
             "reflection_timeout_seconds",
-            "pattern_extraction_timeout_seconds",
-            "arm_scoring_timeout_seconds",
             "session_retries",
             "session_retry_backoff_seconds",
         }
@@ -148,14 +145,6 @@ class RunConfig:
             optimization_value.get("reflection_timeout_seconds", diagnosis_patch_timeout),
             "optimization.reflection_timeout_seconds",
         )
-        pattern_extraction_timeout = _positive_number(
-            optimization_value.get("pattern_extraction_timeout_seconds", diagnosis_patch_timeout),
-            "optimization.pattern_extraction_timeout_seconds",
-        )
-        arm_scoring_timeout = _positive_number(
-            optimization_value.get("arm_scoring_timeout_seconds", diagnosis_patch_timeout),
-            "optimization.arm_scoring_timeout_seconds",
-        )
         session_retries = _nonnegative_int(
             optimization_value.get("session_retries", 2),
             "optimization.session_retries",
@@ -178,9 +167,10 @@ class RunConfig:
                     type=_required_string(task_selection, "type", "optimization.task_selection"),
                     batch_size=_positive_int(task_selection["batch_size"], "optimization.task_selection.batch_size"),
                     seed=_nonnegative_int(task_selection.get("seed", 0), "optimization.task_selection.seed"),
-                    settings=_json_mapping(
-                        task_selection.get("settings", {}),
-                        "optimization.task_selection.settings",
+                    settings=(
+                        _json_mapping(task_selection["settings"], "optimization.task_selection.settings")
+                        if "settings" in task_selection
+                        else None
                     ),
                 ),
                 acceptance=acceptance,
@@ -193,8 +183,6 @@ class RunConfig:
                 diagnosis_patch_timeout_seconds=diagnosis_patch_timeout,
                 selection_timeout_seconds=selection_timeout,
                 reflection_timeout_seconds=reflection_timeout,
-                pattern_extraction_timeout_seconds=pattern_extraction_timeout,
-                arm_scoring_timeout_seconds=arm_scoring_timeout,
                 session_retries=session_retries,
                 session_retry_backoff_seconds=retry_backoff,
             ),
@@ -212,6 +200,13 @@ class RunConfig:
     def as_mapping(self) -> Mapping[str, JsonValue]:
         converted = to_json_value(self)
         assert isinstance(converted, dict)
+        if self.optimization.task_selection.settings is None:
+            # Keep resolved configs of settings-free policies byte-identical to earlier runs.
+            optimization = converted["optimization"]
+            assert isinstance(optimization, dict)
+            task_selection = optimization["task_selection"]
+            assert isinstance(task_selection, dict)
+            del task_selection["settings"]
         return converted
 
 

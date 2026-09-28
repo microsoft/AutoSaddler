@@ -9,7 +9,6 @@ import pytest
 import yaml
 
 from autosaddler.v2.config.registry import build_runtime, default_registry
-from autosaddler.v2.core.curriculum import CurriculumState
 from autosaddler.v2.core.domain import Cost, JsonValue, canonical_json, sha256_digest
 from autosaddler.v2.plugins.meta_are.runner import MetaARERunResult
 from autosaddler.v2.prompting.models import SessionRequest, SessionResult
@@ -67,35 +66,6 @@ class ScriptedMetaAREProvider:
                         "statement": "Enable the capability identified by training evidence.",
                         "evidence_case_ids": context["train_case_ids"],
                     }
-                ],
-            }
-        elif request.spec.kind == "extract_patterns":
-            failures = [
-                (source, item["case_id"])
-                for source, key in (("pre_patch", "pre_patch_failures"), ("post_patch", "post_patch_failures"))
-                for item in context[key]
-            ]
-            output = {
-                "schema_version": "autosaddler-meta-are-pattern-extraction/v1",
-                "symptoms": [
-                    {
-                        "case_id": case_id,
-                        "source": source,
-                        "root_cause": "The fixture capability is disabled.",
-                        "symptom": "A required capability is unavailable to the agent.",
-                        "rationale": "The trace never reaches the capability.",
-                    }
-                    for source, case_id in failures
-                ],
-                "new_patterns": [{"key": "disabled-capability", "label": "Required capability unavailable"}],
-                "tags": [
-                    {
-                        "case_id": case_id,
-                        "source": source,
-                        "pattern_refs": ["disabled-capability"],
-                        "root_cause": "The fixture capability is disabled.",
-                    }
-                    for source, case_id in failures
                 ],
             }
         else:
@@ -341,12 +311,6 @@ def test_configured_meta_are_runs_full_engine_and_resumes_without_paid_work(
         "diagnose_patch.capability",
         "diagnose_patch.steering",
         "reflect",
-        "evolve.curriculum",
-        "diagnose_patch.capability.curriculum",
-        "diagnose_patch.steering.curriculum",
-        "extract_patterns",
-        "decide_arm",
-        "score_arms",
     }
     assert any(asset["source"] == "shared/system/optimizer-invariants.md" for asset in prompt_assets["assets"])
     assert dataset_source["source_revision"] == "b" * 40
@@ -389,47 +353,6 @@ def test_configured_meta_are_runs_full_engine_and_resumes_without_paid_work(
     assert resumed_result == result
     assert provider.calls == ["evolve", "diagnose_patch", "reflect"]
     assert len(runner.calls) == 4
-
-
-def test_meta_are_curriculum_extracts_patterns_from_matched_training_evidence(tmp_path: Path) -> None:
-    config_path = _write_integration_fixture(tmp_path, curriculum=True)
-    provider = ScriptedMetaAREProvider()
-    runner = ScriptedMetaARERunner()
-    registry = default_registry()
-    registry.providers["scripted_meta_are"] = lambda **_kwargs: provider
-
-    runtime = build_runtime(config_path, run_id="meta-are-curriculum", registry=registry)
-    runtime.scenario.evaluator.runner = runner
-    result = runtime.engine.run()
-
-    assert result.development_score == 1.0
-    assert provider.calls == ["evolve", "diagnose_patch", "reflect", "extract_patterns"]
-    (batch,) = runtime.store.events_of_type("BatchSampled")
-    assert batch.payload["provenance"]["action"] == "unseen_draw"
-    requests = {
-        request["spec"]["kind"]: request
-        for request in (
-            runtime.store.read_json(str(event.payload["request"]["uri"]))
-            for event in runtime.store.events_of_type("SessionStarted")
-        )
-    }
-    diagnosis_context = json.loads(requests["diagnose_patch"]["spec"]["workspace_files"][".autosaddler/session_context.json"])
-    assert diagnosis_context["patch_phase"] == "capability"
-    assert diagnosis_context["curriculum"]["sampling_action"] == "unseen_draw"
-    extraction_files = requests["extract_patterns"]["spec"]["workspace_files"]
-    before = json.loads(extraction_files[".autosaddler/training_evidence_before.json"])
-    after = json.loads(extraction_files[".autosaddler/training_evidence_after.json"])
-    assert (before["purpose"], after["purpose"]) == ("train_before", "train_after")
-    state = CurriculumState.replay(runtime.store.events())
-    (pattern,) = state.patterns.values()
-    assert pattern.label == "Required capability unavailable"
-    assert pattern.case_ids == ("train-a",)
-    assert runtime.scenario.prompt_pack.patch_phase(1) == "steering"
-
-    resumed = build_runtime(config_path, run_id="meta-are-curriculum", registry=registry)
-    resumed.scenario.evaluator.runner = runner
-    assert resumed.engine.run() == result
-    assert provider.calls == ["evolve", "diagnose_patch", "reflect", "extract_patterns"]
 
 
 @pytest.mark.parametrize(
@@ -729,7 +652,6 @@ def _write_integration_fixture(
     infrastructure_retries: int = 0,
     development_case_ids: tuple[str, ...] = ("dev-a",),
     repetitions: int = 1,
-    curriculum: bool = False,
 ) -> Path:
     source = tmp_path / "meta-are"
     source.mkdir()
@@ -878,8 +800,6 @@ def _write_integration_fixture(
                 "infrastructure_retries": infrastructure_retries,
                 "import_check": "import json",
                 "capability_phase_iterations": 1,
-                "capability_transition_mode": "iterations",
-                "capability_phase_max_iterations": 0,
             },
         },
         "optimization": {
@@ -902,20 +822,6 @@ def _write_integration_fixture(
         },
         "storage": {"type": "local", "run_root": str(tmp_path / "runs")},
     }
-    if curriculum:
-        config["scenario"]["settings"].update(
-            {
-                "capability_phase_iterations": 0,
-                "capability_transition_mode": "full_coverage",
-                "capability_phase_max_iterations": 0,
-            }
-        )
-        config["optimization"]["task_selection"] = {
-            "type": "activesaddler",
-            "batch_size": 1,
-            "seed": 0,
-            "settings": {"softmax_temperature": 0.15, "min_prob": 0.0, "ema_eta": 0.9},
-        }
     config_path = tmp_path / "autosaddler.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return config_path

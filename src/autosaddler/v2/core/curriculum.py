@@ -1,24 +1,42 @@
-"""Failure-pattern curriculum state for the ActiveSaddler task-selection policy.
+"""ActiveSaddler: an adaptive task-selection policy over failure patterns.
 
 The curriculum treats every failure pattern that owns at least one training
 case as a bandit arm. All state is folded from the append-only event log:
 pattern registrations, tags, observations, arm decisions, and arm scores are
 recorded as ``ExtensionStateChanged`` events in the ``autosaddler.curriculum``
 namespace, executed cases come from ``BatchSampled`` events, and probe points
-come from completed training evaluations. Nothing here performs I/O.
+come from completed training evaluations.
+
+``ActiveSaddlerTaskSelectionPolicy`` implements the adaptive task-selection
+interface in ``autosaddler.v2.core.scheduling``: it asks the engine for an arm
+decision and arm scores before sampling a batch, and for a pattern-extraction
+session after reflection. Nothing here performs I/O.
 """
 
 from __future__ import annotations
 
 import math
+import random
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Literal, TypeAlias, cast
 
-from autosaddler.v2.core.domain import JsonValue, canonical_json, sha256_digest
+from autosaddler.v2.core.domain import Case, JsonValue, canonical_json, sha256_digest, to_json_value
 from autosaddler.v2.core.events import RunEvent
+from autosaddler.v2.core.policies import TaskSelection
+from autosaddler.v2.core.scheduling import (
+    DeferredRequest,
+    IterationFeedback,
+    NoSelection,
+    SelectionRequest,
+    SelectionStep,
+    SessionStep,
+    StatePayload,
+    StateStep,
+)
 from autosaddler.v2.core.serde import evaluation_from
+from autosaddler.v2.prompting.models import SessionResult
 
 CURRICULUM_NAMESPACE = "autosaddler.curriculum"
 CURRICULUM_SCHEMA_VERSION = "autosaddler-curriculum/v1"
@@ -167,6 +185,13 @@ class CurriculumState:
             probe_points=frozenset(probe_points),
         )
 
+    def applied(self, change: Mapping[str, JsonValue]) -> "CurriculumState":
+        """Return the state after one curriculum change payload."""
+        patterns = dict(self.patterns)
+        decisions = dict(self.decisions)
+        _apply_change(change, patterns, decisions)
+        return replace(self, patterns=patterns, decisions=decisions)
+
     def arms(self, train_case_ids: Sequence[str]) -> dict[str, tuple[str, ...]]:
         """Instantiated arms: patterns owning at least one available training case, in creation order."""
         arms: dict[str, tuple[str, ...]] = {}
@@ -284,6 +309,427 @@ def pattern_observations(
     return observations
 
 
+class ActiveSaddlerTaskSelectionPolicy:
+    """Agent-driven infinite-armed bandit curriculum over failure patterns.
+
+    Each iteration performs exactly one action. An unseen draw takes the next
+    never-executed cases from a fixed seeded permutation of the training set.
+    An arm pull samples one failure pattern with probability given by a floored
+    softmax over the agent's current-iteration learning-progress scores and then
+    evaluates up to ``batch_size`` of that pattern's cases. The pull/draw choice
+    and the arm scores come from optimizer sessions recorded before selection,
+    and failure patterns come from a deferred extraction session after
+    reflection; every decision is a pure function of the replayed events.
+    """
+
+    namespace = CURRICULUM_NAMESPACE
+    required_session_kinds: frozenset[str] = CURRICULUM_SESSION_KINDS
+
+    def __init__(
+        self,
+        *,
+        batch_size: int,
+        seed: int,
+        softmax_temperature: float,
+        min_prob: float,
+        ema_eta: float,
+        pattern_extraction_timeout_seconds: float,
+        arm_scoring_timeout_seconds: float,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("Task-selection batch size must be positive")
+        if softmax_temperature <= 0.0:
+            raise ValueError("ActiveSaddler softmax_temperature must be positive")
+        if not 0.0 <= min_prob < 1.0:
+            raise ValueError("ActiveSaddler min_prob must be in [0, 1)")
+        if not 0.0 < ema_eta <= 1.0:
+            raise ValueError("ActiveSaddler ema_eta must be in (0, 1]")
+        if pattern_extraction_timeout_seconds <= 0.0 or arm_scoring_timeout_seconds <= 0.0:
+            raise ValueError("ActiveSaddler session timeouts must be positive")
+        self.batch_size = batch_size
+        self.seed = seed
+        self.softmax_temperature = softmax_temperature
+        self.min_prob = min_prob
+        self.ema_eta = ema_eta
+        self.pattern_extraction_timeout_seconds = pattern_extraction_timeout_seconds
+        self.arm_scoring_timeout_seconds = arm_scoring_timeout_seconds
+
+    def settings_record(self) -> dict[str, JsonValue]:
+        return {
+            "softmax_temperature": self.softmax_temperature,
+            "min_prob": self.min_prob,
+            "ema_eta": self.ema_eta,
+            "pattern_extraction_timeout_seconds": self.pattern_extraction_timeout_seconds,
+            "arm_scoring_timeout_seconds": self.arm_scoring_timeout_seconds,
+        }
+
+    def session_timeouts(self) -> Mapping[str, float]:
+        return {
+            "extract_patterns": self.pattern_extraction_timeout_seconds,
+            "decide_arm": self.arm_scoring_timeout_seconds,
+            "score_arms": self.arm_scoring_timeout_seconds,
+        }
+
+    def curriculum_context(self) -> dict[str, JsonValue]:
+        return {
+            "policy": "activesaddler",
+            "batch_size": self.batch_size,
+            "softmax_temperature": self.softmax_temperature,
+            "min_prob": self.min_prob,
+            "ema_eta": self.ema_eta,
+        }
+
+    def prompt_context(self, events: Sequence[RunEvent], iteration: int) -> Mapping[str, JsonValue]:
+        context = self.curriculum_context()
+        for event in events:
+            if event.event_type == "BatchSampled" and event.payload.get("iteration") == iteration:
+                provenance = event.payload.get("provenance")
+                if isinstance(provenance, Mapping):
+                    context["sampling_action"] = provenance.get("action")
+                    context["pulled_arm_id"] = provenance.get("chosen_arm")
+        return context
+
+    def draw_order(self, cases: Sequence[Case]) -> tuple[str, ...]:
+        order = list(_unique_case_ids(cases))
+        random.Random(f"{self.seed}:0").shuffle(order)
+        return tuple(order)
+
+    def next_selection_step(self, events: Sequence[RunEvent], request: SelectionRequest) -> SelectionStep:
+        state = CurriculumState.replay(events)
+        iteration = request.iteration
+        case_ids = _unique_case_ids(request.train_cases)
+        arms = state.arms(case_ids)
+        unseen = state.unseen_case_ids(self.draw_order(request.train_cases))
+        decision = state.decisions.get(iteration)
+        if decision is None:
+            if not arms:
+                return StateStep(
+                    name="arm-decision",
+                    payload=self._decision(
+                        iteration,
+                        requested=None,
+                        arms=arms,
+                        unseen=unseen,
+                        rationale="No failure-pattern arm exists yet; draw unseen training cases.",
+                    ),
+                )
+            return SessionStep(
+                name="decide-arm",
+                kind="decide_arm",
+                context=self._session_context(request, arms, unseen),
+                stage="proposal.arm_decision",
+                validate=_arm_decision_failure_reason,
+                record=lambda result: self._decision(
+                    iteration,
+                    requested=cast(ArmAction, _output_string(result, "action")),
+                    arms=arms,
+                    unseen=unseen,
+                    rationale=_output_string(result, "rationale"),
+                ),
+                # ActiveSaddler treats a missing or failed decision as an arm pull.
+                record_exhausted=lambda error: self._decision(
+                    iteration,
+                    requested="pull",
+                    arms=arms,
+                    unseen=unseen,
+                    rationale="Arm decision session failed; defaulting to an arm pull.",
+                    fallback_reason=error,
+                ),
+            )
+        action = decision.get("action")
+        if action == "empty":
+            return NoSelection(reason="No failure-pattern arm and no unseen training case remain.")
+        if action not in {"unseen_draw", "arm_pull"}:
+            raise ValueError(f"Unknown curriculum action: {action}")
+        if action == "arm_pull" and all(state.patterns[arm_id].score_at(iteration) is None for arm_id in arms):
+            arm_ids = tuple(arms)
+            return SessionStep(
+                name="score-arms",
+                kind="score_arms",
+                context=self._session_context(request, arms, unseen),
+                stage="proposal.arm_scoring",
+                validate=lambda result: _arm_scoring_failure_reason(result, arm_ids),
+                record=lambda result: _change(
+                    "arm_scores",
+                    iteration,
+                    scores=[
+                        {
+                            key: item[key]
+                            for key in ("pattern_id", "severity", "fixability", "breadth", "side_effect", "rationale")
+                        }
+                        for item in cast(list[Mapping[str, JsonValue]], _output_list(result, "scores"))
+                    ],
+                ),
+                # A missing arm score would silently zero that arm, so exhausted retries fail the run.
+                record_exhausted=None,
+            )
+        return self.select_curriculum(request.train_cases, iteration, state=state, action=cast(SamplingAction, action))
+
+    def select_curriculum(
+        self,
+        cases: Sequence[Case],
+        iteration: int,
+        *,
+        state: CurriculumState,
+        action: SamplingAction,
+    ) -> TaskSelection:
+        if iteration < 0:
+            raise ValueError("Iteration cannot be negative")
+        case_ids = _unique_case_ids(cases)
+        arms = state.arms(case_ids)
+        unseen = state.unseen_case_ids(self.draw_order(cases))
+        scores = {pattern_id: state.arm_score(pattern_id, iteration) for pattern_id in arms}
+        probabilities: dict[str, float] = {}
+        chosen_arm: str | None = None
+        if action == "unseen_draw":
+            if not unseen:
+                raise ValueError("An unseen draw requires never-executed training cases")
+            selected = unseen[: self.batch_size]
+        elif action == "arm_pull":
+            if not arms:
+                raise ValueError("An arm pull requires at least one instantiated arm")
+            probabilities = softmax_floor(scores, temperature=self.softmax_temperature, min_prob=self.min_prob)
+            rng = random.Random(f"{self.seed}:{iteration}:activesaddler")
+            pattern_ids = list(probabilities)
+            chosen_arm = rng.choices(pattern_ids, weights=[probabilities[item] for item in pattern_ids], k=1)[0]
+            candidates = list(arms[chosen_arm])
+            selected = tuple(candidates if len(candidates) <= self.batch_size else rng.sample(candidates, self.batch_size))
+        else:
+            raise ValueError(f"ActiveSaddler cannot select a batch for action {action!r}")
+        arm_records: list[dict[str, JsonValue]] = []
+        for pattern_id, arm_case_ids in arms.items():
+            pattern = state.patterns[pattern_id]
+            score = pattern.score_at(iteration)
+            arm_records.append(
+                {
+                    "pattern_id": pattern_id,
+                    "label": pattern.label,
+                    "case_ids": list(arm_case_ids),
+                    "num_cases": len(arm_case_ids),
+                    "num_observations": len(pattern.observations),
+                    "ema": activity_ema(pattern.observations, self.ema_eta),
+                    "severity": score.severity if score is not None else None,
+                    "fixability": score.fixability if score is not None else None,
+                    "breadth": score.breadth if score is not None else None,
+                    "side_effect": score.side_effect if score is not None else None,
+                    "rationale": score.rationale if score is not None else None,
+                    "score": scores[pattern_id],
+                    "prob": probabilities.get(pattern_id),
+                    "selected": pattern_id == chosen_arm,
+                }
+            )
+        arm_records.sort(key=lambda item: (-cast(float, item["score"]), cast(str, item["pattern_id"])))
+        return TaskSelection(
+            case_ids=selected,
+            provenance={
+                "policy": "activesaddler",
+                "iteration": iteration,
+                "seed": self.seed,
+                "action": action,
+                "chosen_arm": chosen_arm,
+                "batch_size": self.batch_size,
+                "softmax_temperature": self.softmax_temperature,
+                "min_prob": self.min_prob,
+                "ema_eta": self.ema_eta,
+                "score_formula": SCORE_FORMULA,
+                "num_arms": len(arms),
+                "n_probes": len(state.probe_points),
+                "num_unseen_before": len(unseen),
+                "unseen_case_ids": list(unseen),
+                "arms": cast(JsonValue, arm_records),
+            },
+        )
+
+    def iteration_changes(self, events: Sequence[RunEvent], feedback: IterationFeedback) -> Sequence[StatePayload]:
+        if feedback.outcome != "no_training_failures":
+            return ()
+        # An all-pass pull is still an arm observation: every overlapping arm was inactive.
+        return _observation_changes(CurriculumState.replay(events), feedback.iteration, feedback.case_ids, None)
+
+    def after_reflection(
+        self,
+        events: Sequence[RunEvent],
+        feedback: IterationFeedback,
+        lessons: Sequence[JsonValue],
+    ) -> DeferredRequest | None:
+        del events
+        after_scores = dict(feedback.train_after_case_scores or {})
+        pre_patch = failing_case_ids(feedback.train_before_case_scores)
+        post_patch = failing_case_ids(after_scores)
+        if not pre_patch and not post_patch:
+            return None
+        if feedback.child_id is None or feedback.train_after_evaluation_id is None:
+            raise ValueError("Pattern extraction requires a patched candidate and its training evaluation")
+        return DeferredRequest(
+            kind="extract_patterns",
+            stage="proposal.pattern_extraction",
+            payload={
+                "iteration": feedback.iteration,
+                "candidate_id": feedback.child_id,
+                "working_parent_candidate_id": feedback.working_parent_id,
+                "train_case_ids": list(feedback.case_ids),
+                "train_before_evaluation_id": feedback.train_before_evaluation_id,
+                "train_after_evaluation_id": feedback.train_after_evaluation_id,
+                "train_before_evidence": to_json_value(feedback.train_before_evidence),
+                "train_after_evidence": to_json_value(feedback.train_after_evidence),
+                "pre_patch_failures": [
+                    {"case_id": case_id, "train_before_score": feedback.train_before_case_scores[case_id]}
+                    for case_id in pre_patch
+                ],
+                "post_patch_failures": [
+                    {"case_id": case_id, "train_after_score": after_scores[case_id]} for case_id in post_patch
+                ],
+                "train_before_case_scores": dict(feedback.train_before_case_scores),
+                "train_after_case_scores": after_scores,
+                "diagnosis": feedback.diagnosis,
+                "lessons": list(lessons),
+            },
+        )
+
+    def deferred_context(self, events: Sequence[RunEvent], request: DeferredRequest) -> Mapping[str, JsonValue]:
+        payload = request.payload
+        return {
+            "iteration": payload["iteration"],
+            "candidate_ids": [payload["candidate_id"]],
+            "train_case_ids": payload["train_case_ids"],
+            "task_selection": {
+                **self.curriculum_context(),
+                **{
+                    key: payload[key]
+                    for key in (
+                        "working_parent_candidate_id",
+                        "train_before_evaluation_id",
+                        "train_after_evaluation_id",
+                        "train_before_evidence",
+                        "train_after_evidence",
+                    )
+                },
+            },
+            **{
+                key: payload[key]
+                for key in (
+                    "pre_patch_failures",
+                    "post_patch_failures",
+                    "train_before_case_scores",
+                    "train_after_case_scores",
+                    "diagnosis",
+                    "lessons",
+                )
+            },
+            "existing_pattern_ids": list(CurriculumState.replay(events).patterns),
+        }
+
+    def deferred_failure_reason(
+        self,
+        events: Sequence[RunEvent],
+        request: DeferredRequest,
+        result: SessionResult,
+    ) -> str | None:
+        return _pattern_extraction_failure_reason(
+            result,
+            _case_ids(request.payload.get("pre_patch_failures"), "pre_patch_failures"),
+            _case_ids(request.payload.get("post_patch_failures"), "post_patch_failures"),
+            tuple(CurriculumState.replay(events).patterns),
+        )
+
+    def deferred_changes(
+        self,
+        events: Sequence[RunEvent],
+        request: DeferredRequest,
+        result: SessionResult,
+    ) -> Sequence[StatePayload]:
+        patterns = _pattern_extraction_change(result, request.payload)
+        state = CurriculumState.replay(events).applied(patterns)
+        return (patterns, *self._post_patch_observations(state, request))
+
+    def deferred_exhausted_changes(
+        self,
+        events: Sequence[RunEvent],
+        request: DeferredRequest,
+        error: str,
+    ) -> Sequence[StatePayload]:
+        del error
+        # ActiveSaddler still observes the sampled arms when extraction fails.
+        return self._post_patch_observations(CurriculumState.replay(events), request)
+
+    def _post_patch_observations(self, state: CurriculumState, request: DeferredRequest) -> tuple[StatePayload, ...]:
+        payload = request.payload
+        return _observation_changes(
+            state,
+            _integer(payload.get("iteration"), "extraction iteration"),
+            _strings(payload.get("train_case_ids"), "extraction train_case_ids"),
+            _string(payload.get("train_after_evaluation_id"), "train_after_evaluation_id"),
+        )
+
+    def _decision(
+        self,
+        iteration: int,
+        *,
+        requested: ArmAction | None,
+        arms: Mapping[str, tuple[str, ...]],
+        unseen: Sequence[str],
+        rationale: str,
+        fallback_reason: str | None = None,
+    ) -> StatePayload:
+        return _change(
+            "arm_decision",
+            iteration,
+            requested_action=requested,
+            action=resolve_action(num_arms=len(arms), unseen_count=len(unseen), requested=requested),
+            rationale=rationale,
+            fallback_reason=fallback_reason,
+            num_arms=len(arms),
+            num_unseen=len(unseen),
+        )
+
+    def _session_context(
+        self,
+        request: SelectionRequest,
+        arms: Mapping[str, tuple[str, ...]],
+        unseen: Sequence[str],
+    ) -> dict[str, JsonValue]:
+        return {
+            "iteration": request.iteration,
+            "candidate_ids": [request.working_parent_id],
+            "selected_parent_candidate_id": request.selected_parent_id,
+            "selection_parent_ids": list(request.selection_parent_ids),
+            "component_sources": dict(request.component_sources),
+            "selection_rationale": request.selection_rationale,
+            "task_selection": {
+                **self.curriculum_context(),
+                "arm_ids": list(arms),
+                "num_arms": len(arms),
+                "num_unseen": len(unseen),
+            },
+        }
+
+
+def _change(change: CurriculumChange, iteration: int, **payload: object) -> dict[str, JsonValue]:
+    return {
+        "schema_version": CURRICULUM_SCHEMA_VERSION,
+        "change": change,
+        "iteration": iteration,
+        **cast(dict[str, JsonValue], payload),
+    }
+
+
+def _observation_changes(
+    state: CurriculumState,
+    iteration: int,
+    batch_case_ids: Sequence[str],
+    after_evaluation_id: str | None,
+) -> tuple[StatePayload, ...]:
+    observations = pattern_observations(
+        state,
+        iteration=iteration,
+        batch_case_ids=batch_case_ids,
+        after_evaluation_id=after_evaluation_id,
+    )
+    if not observations:
+        return ()
+    return (_change("observations_recorded", iteration, observations=observations),)
+
+
 def _apply_change(
     payload: Mapping[str, JsonValue],
     patterns: dict[str, FailurePattern],
@@ -392,3 +838,169 @@ def _number(value: object, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"Curriculum {label} must be numeric")
     return float(value)
+
+
+def _arm_decision_failure_reason(result: SessionResult) -> str | None:
+    output = result.structured_output
+    if output is None:
+        return "Arm decision session produced no structured output"
+    if output.get("action") not in {"pull", "draw"}:
+        return "Arm decision action must be 'pull' or 'draw'"
+    rationale = output.get("rationale")
+    if not isinstance(rationale, str) or not rationale:
+        return "Arm decision rationale must be a non-empty string"
+    return None
+
+
+def _arm_scoring_failure_reason(result: SessionResult, arm_ids: Sequence[str]) -> str | None:
+    try:
+        scores = _output_list(result, "scores")
+    except TypeError as error:
+        return str(error)
+    scored: list[str] = []
+    for index, item in enumerate(scores):
+        if not isinstance(item, Mapping):
+            return f"Arm score {index} must be an object"
+        pattern_id = item.get("pattern_id")
+        if not isinstance(pattern_id, str):
+            return f"Arm score {index} requires a pattern_id"
+        for axis in ("severity", "fixability", "breadth", "side_effect"):
+            value = item.get(axis)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+                return f"Arm score {index} {axis} must be a number in [0, 1]"
+        rationale = item.get("rationale")
+        if not isinstance(rationale, str) or not rationale:
+            return f"Arm score {index} requires a rationale"
+        scored.append(pattern_id)
+    if len(set(scored)) != len(scored):
+        return "Every arm must be scored exactly once"
+    if set(scored) != set(arm_ids):
+        missing = sorted(set(arm_ids) - set(scored))
+        unknown = sorted(set(scored) - set(arm_ids))
+        return f"Arm scores must cover exactly the current arms: missing={missing}, unknown={unknown}"
+    return None
+
+
+def _pattern_extraction_failure_reason(
+    result: SessionResult,
+    pre_patch: Sequence[str],
+    post_patch: Sequence[str],
+    existing_pattern_ids: Sequence[str],
+) -> str | None:
+    output = result.structured_output
+    if output is None:
+        return "Pattern extraction session produced no structured output"
+    new_patterns = output.get("new_patterns")
+    tags = output.get("tags")
+    if not isinstance(new_patterns, list) or not isinstance(tags, list):
+        return "Pattern extraction output requires new_patterns and tags lists"
+    keys: list[str] = []
+    for index, item in enumerate(new_patterns):
+        if not isinstance(item, Mapping):
+            return f"New pattern {index} must be an object"
+        key = item.get("key")
+        label = item.get("label")
+        if not isinstance(key, str) or not key or not isinstance(label, str) or not label:
+            return f"New pattern {index} requires a non-empty key and label"
+        keys.append(key)
+    if len(set(keys)) != len(keys):
+        return "New pattern keys must be unique"
+    if set(keys) & set(existing_pattern_ids):
+        return "New pattern keys must not reuse existing pattern IDs"
+    allowed_refs = set(keys) | set(existing_pattern_ids)
+    failures = {"pre_patch": set(pre_patch), "post_patch": set(post_patch)}
+    referenced: set[str] = set()
+    for index, item in enumerate(tags):
+        if not isinstance(item, Mapping):
+            return f"Pattern tag {index} must be an object"
+        source = item.get("source")
+        case_id = item.get("case_id")
+        if source not in failures:
+            return f"Pattern tag {index} source must be pre_patch or post_patch"
+        if case_id not in failures[cast(str, source)]:
+            return f"Pattern tag {index} case {case_id!r} is not a {source} failure of this iteration"
+        refs = item.get("pattern_refs")
+        if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) for ref in refs):
+            return f"Pattern tag {index} pattern_refs must be a non-empty list of strings"
+        if len(set(refs)) != len(refs):
+            return f"Pattern tag {index} pattern_refs must be unique"
+        unknown = sorted(set(cast(list[str], refs)) - allowed_refs)
+        if unknown:
+            return f"Pattern tag {index} references unknown patterns: {unknown}"
+        root_cause = item.get("root_cause")
+        if not isinstance(root_cause, str) or not root_cause:
+            return f"Pattern tag {index} requires a root_cause"
+        referenced.update(cast(list[str], refs))
+    untagged = sorted(set(keys) - referenced)
+    if untagged:
+        return f"New patterns must tag at least one failure: {untagged}"
+    return None
+
+
+def _pattern_extraction_change(result: SessionResult, payload: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    output = result.structured_output
+    if output is None:
+        raise ValueError("Pattern extraction session produced no structured output")
+    iteration = _integer(payload.get("iteration"), "extraction iteration")
+    candidate_id = _string(payload.get("candidate_id"), "extraction candidate_id")
+    key_to_id: dict[str, str] = {}
+    new_patterns: list[JsonValue] = []
+    for item in cast(list[Mapping[str, str]], output.get("new_patterns")):
+        pattern_id = derive_pattern_id(iteration=iteration, key=item["key"], label=item["label"])
+        key_to_id[item["key"]] = pattern_id
+        new_patterns.append({"pattern_id": pattern_id, "key": item["key"], "label": item["label"]})
+    provenance = {
+        "pre_patch": (
+            _string(payload.get("working_parent_candidate_id"), "working_parent_candidate_id"),
+            _string(payload.get("train_before_evaluation_id"), "train_before_evaluation_id"),
+        ),
+        "post_patch": (candidate_id, _string(payload.get("train_after_evaluation_id"), "train_after_evaluation_id")),
+    }
+    tags: list[JsonValue] = []
+    for item in cast(list[Mapping[str, JsonValue]], output.get("tags")):
+        source = cast(str, item["source"])
+        tagged_candidate_id, evaluation_id = provenance[source]
+        for ref in cast(list[str], item["pattern_refs"]):
+            tags.append(
+                {
+                    "pattern_id": key_to_id.get(ref, ref),
+                    "case_id": item["case_id"],
+                    "candidate_id": tagged_candidate_id,
+                    "evaluation_id": evaluation_id,
+                    "source": source,
+                    "root_cause": item["root_cause"],
+                }
+            )
+    return _change("patterns_extracted", iteration, candidate_id=candidate_id, new_patterns=new_patterns, tags=tags)
+
+
+def _case_ids(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(item, Mapping) or not isinstance(item.get("case_id"), str) for item in value
+    ):
+        raise TypeError(f"Curriculum {label} must be a list of case records")
+    return tuple(cast(str, item["case_id"]) for item in value)
+
+
+def _unique_case_ids(cases: Sequence[Case]) -> tuple[str, ...]:
+    if not cases:
+        raise ValueError("Cannot select from an empty training set")
+    case_ids = tuple(case.case_id for case in cases)
+    if len(set(case_ids)) != len(case_ids):
+        raise ValueError("Training cases must have unique IDs")
+    return case_ids
+
+
+def _output_string(result: SessionResult, key: str) -> str:
+    output = result.structured_output
+    value = output.get(key) if output is not None else None
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"Session output {key!r} must be a non-empty string")
+    return value
+
+
+def _output_list(result: SessionResult, key: str) -> list[JsonValue]:
+    output = result.structured_output
+    if output is None or not isinstance(output.get(key), list):
+        raise TypeError(f"Session output {key!r} must be a list")
+    return cast(list[JsonValue], output[key])

@@ -35,7 +35,7 @@ meta-are-setup = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-autosaddler = ["v1/README.md", "v1/proposer/autosaddler/**/*.md", "v2/plugins/**/*.md", "v2/prompting/methodology/**/*.md"]
+autosaddler = ["v1/README.md", "v1/proposer/autosaddler/**/*.md", "v2/plugins/**/*.md", "v2/prompting/methodology/**/*.md", "v2/prompting/curriculum_methodology/**/*.md"]
 
 [tool.ruff]
 include = ["src/**/*.py"]
