@@ -130,25 +130,48 @@ Train evidence can include case-level traces and scores. Development data is qua
 diagnosis: it is used for ranking and exposed to reflection only through permitted aggregate
 feedback. Test payloads are outside optimization and are not opened by the engine.
 
-## Failure-Pattern Curriculum
+## Task Selection
 
-`task_selection.type: activesaddler` replaces passive batches with the ActiveSaddler curriculum.
-Every failure pattern that owns at least one training case is a bandit arm. The policy is still a
-pure function of replayed state; the agent decisions that feed it are recorded before sampling.
+Task selection is the training-data scheduling interface. `optimization.task_selection.type`
+selects a registered policy, the policy returns a `TaskSelection(case_ids, provenance)`, and the
+engine records it as `BatchSampled`.
+
+- **Passive policies** (`fixed`, `epoch_shuffled`) implement `select(cases, iteration)` and choose
+  the batch before the evolution session.
+- **Adaptive policies** implement `AdaptiveTaskSelectionPolicy` in `core/scheduling.py`. They
+  choose the batch after the working parent is prepared and may need optimizer sessions to do so.
+  The policy describes that work and the engine executes it generically:
+  - `next_selection_step` returns a `SessionStep`, a `StateStep`, a `TaskSelection`, or a
+    `NoSelection` (the iteration completes as `no_selectable_cases`);
+  - `iteration_changes` records state from an all-pass iteration;
+  - `after_reflection` may return one `DeferredRequest`, run after reflection as deferred work.
+
+  Each step result is appended as an `ExtensionStateChanged` event in the policy's namespace before
+  the policy is consulted again, and every policy method is a pure function of replayed events, so
+  a resumed run replays the same steps without repeating paid work. Policy settings live in
+  `optimization.task_selection.settings`, and adaptive-only provenance (settings, extra session
+  kinds, and scenario `task_selection_resolved_entities`) is recorded only for adaptive runs.
+
+### ActiveSaddler
+
+`task_selection.type: activesaddler` is the adaptive ActiveSaddler curriculum
+(`core/curriculum.py`). Every failure pattern that owns at least one training case is a bandit
+arm.
 
 ```mermaid
 sequenceDiagram
     participant Engine
-    participant Provider
     participant Policy
+    participant Provider
     Engine->>Provider: evolve (no batch yet)
-    alt known arms exist
-        Engine->>Provider: decide_arm (pull or draw)
-        opt pull
+    loop until a selection
+        Engine->>Policy: next_selection_step(events)
+        alt known arms and no decision
+            Engine->>Provider: decide_arm (pull or draw)
+        else pull without scores
             Engine->>Provider: score_arms (every arm)
         end
     end
-    Engine->>Policy: select_curriculum(replayed state, action)
     Engine->>Engine: BatchSampled, train-before, diagnose_patch, train-after, gates
     Engine->>Provider: deferred reflect, then extract_patterns
 ```
@@ -174,10 +197,13 @@ sequenceDiagram
   because unrated arms would silently score zero. Exhausted extraction abandons that obligation
   after recording observations.
 
-The activity EMA (`ema_eta`) is shown to the agent only and does not influence selection. The
-Meta-ARE scenario pairs the curriculum with `capability_transition_mode: full_coverage`, which
-switches from capability to steering patches after every training case has been sampled once,
-because repeated pulls make an iteration count a poor proxy for coverage.
+The activity EMA (`ema_eta`) is shown to the agent only and does not influence selection. Curriculum
+prompt assets live in `prompting/curriculum_methodology/` and `plugins/meta_are/curriculum/`,
+outside the sources recorded for every run, and are recorded under `resolved/prompts/curriculum/`
+only for ActiveSaddler runs. The Meta-ARE scenario pairs the curriculum with the optional
+`capability_transition_mode: full_coverage` setting, which switches from capability to steering
+patches after every training case has been sampled once, because repeated pulls make an iteration
+count a poor proxy for coverage.
 
 ## Harness Spaces
 

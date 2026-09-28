@@ -170,9 +170,12 @@ the optional curriculum kinds and add them to `ScenarioComponents.supported_sess
 - `score_arms`: rate every listed arm on severity, fixability, breadth, and side-effect risk.
 
 Build their output contracts with the schema helpers in `autosaddler.v2.prompting.curriculum`,
-because the engine interprets those outputs, and render `build_curriculum_bundle` into the
-workspace when the context contains a `curriculum` object. Runtime assembly rejects the curriculum
-policy for a scenario that does not declare these kinds.
+because the policy interprets those outputs, and render `build_curriculum_bundle` into the
+workspace when the context's `task_selection.policy` is `activesaddler`. Keep curriculum prompts in
+a `curriculum/` plugin directory, exclude it with `prompt_source_entities(..., exclude=("curriculum",))`,
+and record it through `ScenarioComponents.task_selection_resolved_entities` with
+`curriculum_prompt_source_entities`, so runs with passive task selection keep identical provenance.
+Runtime assembly rejects an adaptive policy for a scenario that does not declare its kinds.
 
 Each `SessionSpec` must provide an executable JSON Schema output contract. Keep scenario-specific
 instructions and skills in the plugin package. Compose shared methodology assets through

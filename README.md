@@ -155,18 +155,19 @@ Task-selection policies:
 |---|---|---|
 | `fixed` | Rolling window over the training cases | none |
 | `epoch_shuffled` | Non-overlapping batches from a seeded per-epoch shuffle | none |
-| `activesaddler` | Agent-driven failure-pattern bandit curriculum | `softmax_temperature`, `min_prob`, `ema_eta` |
+| `activesaddler` | Agent-driven failure-pattern bandit curriculum | `softmax_temperature`, `min_prob`, `ema_eta`, `pattern_extraction_timeout_seconds`, `arm_scoring_timeout_seconds` |
 
-`activesaddler` requires a scenario that supports the `extract_patterns`, `decide_arm`, and
-`score_arms` session kinds; both built-in scenarios do. Their timeouts are
-`optimization.pattern_extraction_timeout_seconds` and `optimization.arm_scoring_timeout_seconds`.
+`fixed` and `epoch_shuffled` take no `settings`. `activesaddler` is an adaptive task-selection
+policy: it chooses each batch for the prepared working parent and requires a scenario that renders
+the `extract_patterns`, `decide_arm`, and `score_arms` session kinds, which the built-in Meta-ARE
+scenario does. Adding it leaves fixed and epoch-shuffled runs byte-identical, so their existing
+runs remain resumable.
 
 Included configurations:
 
 | Path | Purpose |
 |---|---|
 | `configs/v2/local_template.yaml` | Credential-free deterministic V2 template |
-| `configs/v2/local_activesaddler_template.yaml` | Credential-free template for the ActiveSaddler curriculum |
 | `configs/v2/codex_local_smoke.yaml` | Real Codex optimizer with the deterministic local evaluator |
 | `configs/v2/meta_are_smoke.yaml` | Current Meta-ARE/GAIA2 smoke integration |
 | `configs/v2/meta_are_full.yaml` | Full Meta-ARE/GAIA2 run with epoch-shuffled batches |
