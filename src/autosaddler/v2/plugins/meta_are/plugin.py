@@ -4,7 +4,8 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from autosaddler.v2.core.domain import JsonValue
-from autosaddler.v2.core.ports import ScenarioComponents
+from autosaddler.v2.core.curriculum import CURRICULUM_SESSION_KINDS
+from autosaddler.v2.core.ports import BASE_SESSION_KINDS, ScenarioComponents
 from autosaddler.v2.harness.git import GitHarnessSpace
 from autosaddler.v2.prompting.assets import prompt_source_entities
 from autosaddler.v2.plugins.meta_are.config import MetaARESettings
@@ -76,6 +77,9 @@ def build_meta_are_components(
         store=store,
         writable_paths=resolved.writable_paths,
         capability_phase_iterations=resolved.capability_phase_iterations,
+        capability_transition_mode=resolved.capability_transition_mode,
+        capability_phase_max_iterations=resolved.capability_phase_max_iterations,
+        train_case_ids=tuple(case.case_id for case in train_cases),
     )
     return ScenarioComponents(
         name="meta_are",
@@ -89,6 +93,7 @@ def build_meta_are_components(
         required_capabilities=REQUIRED_CAPABILITIES,
         evaluation_repetitions=resolved.repetitions,
         resolved_entities=_resolved_entities(resolved, train_cases, development_cases),
+        supported_session_kinds=BASE_SESSION_KINDS | CURRICULUM_SESSION_KINDS,
     )
 
 
@@ -155,6 +160,8 @@ def _resolved_entities(settings, train_cases, development_cases):
             "writable_paths": [path.as_posix() for path in settings.writable_paths],
             "forbidden_paths": [path.as_posix() for path in settings.forbidden_paths],
             "capability_phase_iterations": settings.capability_phase_iterations,
+            "capability_transition_mode": settings.capability_transition_mode,
+            "capability_phase_max_iterations": settings.capability_phase_max_iterations,
             "verification_timeout_seconds": settings.verification_timeout_seconds,
         },
     }

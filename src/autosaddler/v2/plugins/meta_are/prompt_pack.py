@@ -12,6 +12,12 @@ from autosaddler.v2.prompting.assets import (
     prompt_composition_record,
     resolve_prompt_composition,
 )
+from autosaddler.v2.prompting.curriculum import (
+    arm_decision_schema,
+    arm_scoring_schema,
+    build_curriculum_bundle,
+    pattern_extraction_schema,
+)
 from autosaddler.v2.prompting.history import build_history_bundle
 from autosaddler.v2.prompting.models import SessionSpec
 from autosaddler.v2.storage.local import LocalRunStore
@@ -21,6 +27,25 @@ _PROMPTING_ROOT = Path(__file__).parents[2] / "prompting"
 _SESSION_CONTEXT_PATH = ".autosaddler/session_context.json"
 _TRAINING_EVIDENCE_PATH = ".autosaddler/training_evidence.json"
 _PROMPT_ASSETS_PATH = ".autosaddler/prompt_assets.json"
+_EVIDENCE_BEFORE_PATH = ".autosaddler/training_evidence_before.json"
+_EVIDENCE_AFTER_PATH = ".autosaddler/training_evidence_after.json"
+_CURRICULUM_CONTEXT_KINDS = frozenset({"evolve", "diagnose_patch"})
+_SHARED_SKILLS = {
+    "history-analysis": "methodology/skills/history-analysis/SKILL.md",
+    "diagnose": "methodology/skills/causal-diagnosis/SKILL.md",
+    "patch-verification": "methodology/skills/verification-baseline/SKILL.md",
+    "symptom-extract": "methodology/skills/symptom-extraction/SKILL.md",
+    "symptom-normalize": "methodology/skills/symptom-normalization/SKILL.md",
+    "progress-scoring": "methodology/skills/progress-scoring/SKILL.md",
+}
+_METHOD_NAMES = {
+    "diagnose_patch": "diagnose",
+    "evolve": "evolve",
+    "reflect": "reflect",
+    "extract_patterns": "extract-patterns",
+    "decide_arm": "decide-arm",
+    "score_arms": "score-arms",
+}
 
 
 class MetaAREPromptPack:
@@ -30,20 +55,30 @@ class MetaAREPromptPack:
         store: LocalRunStore,
         writable_paths: Sequence[PurePosixPath],
         capability_phase_iterations: int,
+        capability_transition_mode: str = "iterations",
+        capability_phase_max_iterations: int = 0,
+        train_case_ids: Sequence[str] = (),
     ) -> None:
         if not writable_paths:
             raise ValueError("Meta-ARE prompt pack requires writable paths")
-        if capability_phase_iterations < 0:
+        if capability_phase_iterations < 0 or capability_phase_max_iterations < 0:
             raise ValueError("Meta-ARE capability phase iterations cannot be negative")
+        if capability_transition_mode not in {"iterations", "full_coverage"}:
+            raise ValueError(f"Unknown Meta-ARE capability transition mode: {capability_transition_mode}")
+        if capability_transition_mode == "full_coverage" and not train_case_ids:
+            raise ValueError("Meta-ARE full_coverage transitions require training case IDs")
         self.store = store
         self.writable_paths = tuple(writable_paths)
         self.capability_phase_iterations = capability_phase_iterations
+        self.capability_transition_mode = capability_transition_mode
+        self.capability_phase_max_iterations = capability_phase_max_iterations
+        self.train_case_ids = frozenset(train_case_ids)
 
     def session(self, kind: str, context: Mapping[str, JsonValue]) -> SessionSpec:
         iteration = context.get("iteration")
         if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 0:
             raise ValueError("Meta-ARE prompt context requires a nonnegative iteration")
-        patch_phase = "capability" if iteration + 1 <= self.capability_phase_iterations else "steering"
+        patch_phase = self.patch_phase(iteration)
         rendered_context: dict[str, JsonValue] = {
             **context,
             "patch_phase": patch_phase,
@@ -53,6 +88,9 @@ class MetaAREPromptPack:
             _SESSION_CONTEXT_PATH: canonical_json(rendered_context) + "\n",
         }
         workspace_files.update(build_history_bundle(self.store, context).workspace_files)
+        curriculum = "curriculum" in context
+        if curriculum:
+            workspace_files.update(build_curriculum_bundle(self.store, context))
 
         if kind == "diagnose_patch":
             workspace_files[_TRAINING_EVIDENCE_PATH] = self._evidence(context.get("evidence"))
@@ -77,10 +115,32 @@ class MetaAREPromptPack:
             schema = _reflection_schema()
             skill_paths = {"history-analysis": None}
             mutation_label = None
+        elif kind == "extract_patterns":
+            curriculum_inputs = _curriculum(context)
+            workspace_files[_EVIDENCE_BEFORE_PATH] = self._evidence(curriculum_inputs.get("train_before_evidence"))
+            workspace_files[_EVIDENCE_AFTER_PATH] = self._evidence(curriculum_inputs.get("train_after_evidence"))
+            failing = [
+                str(item["case_id"])
+                for key in ("pre_patch_failures", "post_patch_failures")
+                for item in _case_records(context.get(key), key)
+            ]
+            schema = pattern_extraction_schema("autosaddler-meta-are-pattern-extraction/v1", failing)
+            skill_paths = {"history-analysis": None, "symptom-extract": None, "symptom-normalize": None}
+            mutation_label = None
+        elif kind == "decide_arm":
+            _curriculum(context)
+            schema = arm_decision_schema("autosaddler-meta-are-arm-decision/v1")
+            skill_paths = {"history-analysis": None}
+            mutation_label = None
+        elif kind == "score_arms":
+            arm_ids = _strings(_curriculum(context).get("arm_ids"), "curriculum.arm_ids")
+            schema = arm_scoring_schema("autosaddler-meta-are-arm-scoring/v1", arm_ids)
+            skill_paths = {"history-analysis": None, "progress-scoring": None}
+            mutation_label = None
         else:
             raise ValueError(f"Unknown Meta-ARE session kind: {kind}")
 
-        resolved = _resolved_assets(kind, skill_paths)
+        resolved = _resolved_assets(kind, skill_paths, curriculum=curriculum and kind in _CURRICULUM_CONTEXT_KINDS)
         workspace_files[_PROMPT_ASSETS_PATH] = _provenance_manifest(resolved)
 
         return SessionSpec(
@@ -93,6 +153,25 @@ class MetaAREPromptPack:
             capabilities=frozenset({"read_workspace", "edit_workspace", "run_commands", "load_skills"}),
             mutation_label=mutation_label,
         )
+
+    def patch_phase(self, iteration: int) -> str:
+        """Return the patch phase; full_coverage switches after every training case was sampled once."""
+        if self.capability_transition_mode == "iterations":
+            return "capability" if iteration + 1 <= self.capability_phase_iterations else "steering"
+        if self.capability_phase_max_iterations and iteration >= self.capability_phase_max_iterations:
+            return "steering"
+        covered: set[str] = set()
+        for event in self.store.events_of_type("BatchSampled"):
+            sampled_iteration = event.payload.get("iteration")
+            case_ids = event.payload.get("case_ids")
+            if not isinstance(sampled_iteration, int) or not isinstance(case_ids, list):
+                raise TypeError("BatchSampled events require an iteration and case IDs")
+            if sampled_iteration >= iteration:
+                continue
+            covered.update(str(case_id) for case_id in case_ids)
+            if self.train_case_ids <= covered:
+                return "steering"
+        return "capability"
 
     def _evidence(self, raw_artifact: JsonValue | None) -> str:
         if not isinstance(raw_artifact, Mapping):
@@ -210,12 +289,18 @@ def _reflection_schema() -> Mapping[str, JsonValue]:
     }
 
 
-def _resolved_assets(kind: str, skill_paths: Mapping[str, str | None]) -> ResolvedPromptAssets:
-    shared_skills = {
-        "history-analysis": "methodology/skills/history-analysis/SKILL.md",
-        "diagnose": "methodology/skills/causal-diagnosis/SKILL.md",
-        "patch-verification": "methodology/skills/verification-baseline/SKILL.md",
-    }
+def _resolved_assets(
+    kind: str,
+    skill_paths: Mapping[str, str | None],
+    *,
+    curriculum: bool = False,
+) -> ResolvedPromptAssets:
+    shared_skills = _SHARED_SKILLS
+    curriculum_assets = (
+        (_shared_asset("methodology/prompts/curriculum-context.md", "methodology.prompt.curriculum_context"),)
+        if curriculum
+        else ()
+    )
     return resolve_prompt_composition(
         PromptComposition(
             system_assets=(
@@ -225,6 +310,7 @@ def _resolved_assets(kind: str, skill_paths: Mapping[str, str | None]) -> Resolv
             task_assets=(
                 _shared_asset(f"methodology/prompts/{_method_name(kind)}-method.md", f"methodology.prompt.{kind}"),
                 _plugin_asset(f"prompts/{kind}.md", f"meta_are.prompt.{kind}"),
+                *curriculum_assets,
             ),
             skill_assets={
                 name: (
@@ -246,41 +332,58 @@ def _resolved_assets(kind: str, skill_paths: Mapping[str, str | None]) -> Resolv
 
 
 def meta_are_prompt_composition_entity() -> Mapping[str, JsonValue]:
-    return prompt_composition_record(
-        plugin_name="meta_are",
-        compositions={
-            "evolve": _resolved_assets(
-                "evolve",
-                {"history-analysis": None},
-            ),
-            "diagnose_patch.capability": _resolved_assets(
-                "diagnose_patch",
-                {
-                    "history-analysis": None,
-                    "diagnose": None,
-                    "capability-patch": "skills/capability-patch/SKILL.md",
-                    "patch-verification": "skills/patch-verification/SKILL.md",
-                },
-            ),
-            "diagnose_patch.steering": _resolved_assets(
-                "diagnose_patch",
-                {
-                    "history-analysis": None,
-                    "diagnose": None,
-                    "steering-patch": "skills/steering-patch/SKILL.md",
-                    "patch-verification": "skills/patch-verification/SKILL.md",
-                },
-            ),
-            "reflect": _resolved_assets(
-                "reflect",
-                {"history-analysis": None},
-            ),
-        },
-    )
+    diagnose_skills = {
+        phase: {
+            "history-analysis": None,
+            "diagnose": None,
+            f"{phase}-patch": f"skills/{phase}-patch/SKILL.md",
+            "patch-verification": "skills/patch-verification/SKILL.md",
+        }
+        for phase in ("capability", "steering")
+    }
+    compositions = {
+        "evolve": _resolved_assets("evolve", {"history-analysis": None}),
+        "diagnose_patch.capability": _resolved_assets("diagnose_patch", diagnose_skills["capability"]),
+        "diagnose_patch.steering": _resolved_assets("diagnose_patch", diagnose_skills["steering"]),
+        "reflect": _resolved_assets("reflect", {"history-analysis": None}),
+        "evolve.curriculum": _resolved_assets("evolve", {"history-analysis": None}, curriculum=True),
+        "diagnose_patch.capability.curriculum": _resolved_assets(
+            "diagnose_patch",
+            diagnose_skills["capability"],
+            curriculum=True,
+        ),
+        "diagnose_patch.steering.curriculum": _resolved_assets(
+            "diagnose_patch",
+            diagnose_skills["steering"],
+            curriculum=True,
+        ),
+        "extract_patterns": _resolved_assets(
+            "extract_patterns",
+            {"history-analysis": None, "symptom-extract": None, "symptom-normalize": None},
+        ),
+        "decide_arm": _resolved_assets("decide_arm", {"history-analysis": None}),
+        "score_arms": _resolved_assets("score_arms", {"history-analysis": None, "progress-scoring": None}),
+    }
+    return prompt_composition_record(plugin_name="meta_are", compositions=compositions)
 
 
 def _method_name(kind: str) -> str:
-    return "diagnose" if kind == "diagnose_patch" else kind
+    return _METHOD_NAMES[kind]
+
+
+def _curriculum(context: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    value = context.get("curriculum")
+    if not isinstance(value, Mapping):
+        raise TypeError("Meta-ARE curriculum sessions require a curriculum context object")
+    return value
+
+
+def _case_records(value: JsonValue | None, label: str) -> list[Mapping[str, JsonValue]]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, Mapping) or not isinstance(item.get("case_id"), str) for item in value
+    ):
+        raise TypeError(f"Meta-ARE prompt context {label} must be a list of case records")
+    return [item for item in value if isinstance(item, Mapping)]
 
 
 def _shared_asset(relative_path: str, asset_id: str):

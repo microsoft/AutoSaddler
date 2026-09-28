@@ -69,7 +69,10 @@ _EXPECTED_KEYS = {
     "infrastructure_retries",
     "import_check",
     "capability_phase_iterations",
+    "capability_transition_mode",
+    "capability_phase_max_iterations",
 }
+CAPABILITY_TRANSITION_MODES = frozenset({"iterations", "full_coverage"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +113,8 @@ class MetaARESettings:
     infrastructure_retries: int
     import_check: str
     capability_phase_iterations: int
+    capability_transition_mode: str
+    capability_phase_max_iterations: int
     pyproject_sha256: str
     uv_lock_sha256: str
     responses_runtime_sha256: str | None
@@ -255,6 +260,10 @@ class MetaARESettings:
             "capability_phase_iterations": _nonnegative_int(
                 value["capability_phase_iterations"], "capability_phase_iterations"
             ),
+            "capability_transition_mode": _capability_transition_mode(value),
+            "capability_phase_max_iterations": _nonnegative_int(
+                value["capability_phase_max_iterations"], "capability_phase_max_iterations"
+            ),
         }
         fingerprint = sha256_digest(canonical_json(resolved))
         return cls(
@@ -294,6 +303,8 @@ class MetaARESettings:
             infrastructure_retries=int(resolved["infrastructure_retries"]),
             import_check=str(resolved["import_check"]),
             capability_phase_iterations=int(resolved["capability_phase_iterations"]),
+            capability_transition_mode=str(resolved["capability_transition_mode"]),
+            capability_phase_max_iterations=int(resolved["capability_phase_max_iterations"]),
             pyproject_sha256=str(resolved["pyproject_sha256"]),
             uv_lock_sha256=str(resolved["uv_lock_sha256"]),
             responses_runtime_sha256=_as_optional_string(
@@ -645,3 +656,17 @@ def _nonnegative_int(value: JsonValue, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"Meta-ARE {label} must be a nonnegative integer")
     return value
+
+
+def _capability_transition_mode(value: Mapping[str, JsonValue]) -> str:
+    """Validate the capability-to-steering switch and reject settings the mode ignores."""
+    mode = _string(value["capability_transition_mode"], "capability_transition_mode")
+    if mode not in CAPABILITY_TRANSITION_MODES:
+        raise ValueError(
+            f"capability_transition_mode must be one of {sorted(CAPABILITY_TRANSITION_MODES)}, got {mode!r}"
+        )
+    if mode == "iterations" and value["capability_phase_max_iterations"] != 0:
+        raise ValueError("capability_phase_max_iterations applies only to full_coverage transitions")
+    if mode == "full_coverage" and value["capability_phase_iterations"] != 0:
+        raise ValueError("capability_phase_iterations must be 0 for full_coverage transitions")
+    return mode
