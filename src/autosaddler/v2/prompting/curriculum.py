@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from autosaddler.v2.core.curriculum import CurriculumState, FailurePattern, activity_ema
 from autosaddler.v2.core.domain import JsonValue, canonical_json, to_json_value
 from autosaddler.v2.core.events import RunEvent
+from autosaddler.v2.prompting.assets import extension_prompt_source_entities
 from autosaddler.v2.prompting.history import HISTORY_ROOT
 from autosaddler.v2.storage.local import LocalRunStore
 
 CURRICULUM_ROOT = ".autosaddler/curriculum"
+CURRICULUM_METHODOLOGY_ROOT = Path(__file__).parent / "curriculum_methodology"
 
 _PULL_KINDS = {
     "accepted": "patched",
@@ -19,6 +21,16 @@ _PULL_KINDS = {
     "no_training_failures": "all_pass_skip",
     "mutation_rejected": "failed_attempt",
 }
+
+
+def curriculum_prompt_source_entities(*, plugin_root: Path, plugin_name: str) -> dict[str, str | Mapping[str, JsonValue]]:
+    """Record the curriculum prompt sources; a scenario keeps its own under ``<plugin_root>/curriculum``."""
+    return extension_prompt_source_entities(
+        extension="curriculum",
+        shared_root=CURRICULUM_METHODOLOGY_ROOT,
+        plugin_root=plugin_root,
+        plugin_name=plugin_name,
+    )
 
 
 def pattern_extraction_schema(schema_version: str, failing_case_ids: Sequence[str]) -> Mapping[str, JsonValue]:

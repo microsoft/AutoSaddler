@@ -704,6 +704,49 @@ class ActiveSaddlerTaskSelectionPolicy:
         }
 
 
+def activesaddler_task_selection(
+    *,
+    batch_size: int,
+    seed: int,
+    settings: Mapping[str, JsonValue] | None = None,
+) -> ActiveSaddlerTaskSelectionPolicy:
+    """Build the policy from ``optimization.task_selection.settings``; registered in the default registry."""
+    if settings is None:
+        raise ValueError("optimization.task_selection.settings is required for 'activesaddler'")
+    expected = {
+        "softmax_temperature",
+        "min_prob",
+        "ema_eta",
+        "pattern_extraction_timeout_seconds",
+        "arm_scoring_timeout_seconds",
+    }
+    missing = sorted(expected - settings.keys())
+    extra = sorted(settings.keys() - expected)
+    if missing or extra:
+        raise ValueError(
+            f"Invalid keys at optimization.task_selection.settings for activesaddler: missing={missing}, extra={extra}"
+        )
+    path = "optimization.task_selection.settings"
+    return ActiveSaddlerTaskSelectionPolicy(
+        batch_size=batch_size,
+        seed=seed,
+        softmax_temperature=_setting_number(settings["softmax_temperature"], f"{path}.softmax_temperature"),
+        min_prob=_setting_number(settings["min_prob"], f"{path}.min_prob"),
+        ema_eta=_setting_number(settings["ema_eta"], f"{path}.ema_eta"),
+        pattern_extraction_timeout_seconds=_setting_number(
+            settings["pattern_extraction_timeout_seconds"],
+            f"{path}.pattern_extraction_timeout_seconds",
+        ),
+        arm_scoring_timeout_seconds=_setting_number(settings["arm_scoring_timeout_seconds"], f"{path}.arm_scoring_timeout_seconds"),
+    )
+
+
+def _setting_number(value: JsonValue, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{path} must be a number")
+    return float(value)
+
+
 def _change(change: CurriculumChange, iteration: int, **payload: object) -> dict[str, JsonValue]:
     return {
         "schema_version": CURRICULUM_SCHEMA_VERSION,

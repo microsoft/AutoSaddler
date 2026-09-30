@@ -115,12 +115,8 @@ def prompt_source_entities(
     plugin_name: str,
     exclude: tuple[str, ...] = (),
 ) -> dict[str, str | Mapping[str, JsonValue]]:
-    """Record every shared methodology and plugin prompt source.
-
-    ``exclude`` names top-level plugin directories whose sources are recorded
-    separately, such as task-selection extensions that only some runs use.
-    """
-    _validate_plugin_name(plugin_name)
+    if not plugin_name or PurePosixPath(plugin_name).name != plugin_name:
+        raise ValueError(f"Unsafe prompt plugin name: {plugin_name}")
     methodology_root = Path(__file__).parent / "methodology"
     sources = {
         **{
@@ -135,47 +131,11 @@ def prompt_source_entities(
     }
     if not sources:
         raise ValueError(f"No prompt source assets found for {plugin_name}")
-    return _source_entities(sources, entity_root="resolved/prompts", plugin_name=plugin_name)
-
-
-def curriculum_prompt_source_entities(
-    *,
-    plugin_root: Path,
-    plugin_name: str,
-) -> dict[str, str | Mapping[str, JsonValue]]:
-    """Record the failure-pattern curriculum prompt sources for adaptive task selection."""
-    _validate_plugin_name(plugin_name)
-    shared_root = Path(__file__).parent / "curriculum_methodology"
-    plugin_curriculum_root = plugin_root / "curriculum"
-    sources = {
-        **{
-            f"shared/curriculum_methodology/{path.relative_to(shared_root).as_posix()}": path
-            for path in sorted(shared_root.rglob("*.md"))
-        },
-        **{
-            f"plugins/{plugin_name}/curriculum/{path.relative_to(plugin_curriculum_root).as_posix()}": path
-            for path in sorted(plugin_curriculum_root.rglob("*.md"))
-        },
-    }
-    return _source_entities(sources, entity_root="resolved/prompts/curriculum", plugin_name=plugin_name)
-
-
-def _validate_plugin_name(plugin_name: str) -> None:
-    if not plugin_name or PurePosixPath(plugin_name).name != plugin_name:
-        raise ValueError(f"Unsafe prompt plugin name: {plugin_name}")
-
-
-def _source_entities(
-    sources: Mapping[str, Path],
-    *,
-    entity_root: str,
-    plugin_name: str,
-) -> dict[str, str | Mapping[str, JsonValue]]:
     entities: dict[str, str | Mapping[str, JsonValue]] = {}
     inventory: list[dict[str, JsonValue]] = []
     for source, path in sorted(sources.items()):
         text = path.read_text(encoding="utf-8")
-        resolved_path = f"{entity_root}/sources/{source}"
+        resolved_path = f"resolved/prompts/sources/{source}"
         entities[resolved_path] = text
         inventory.append(
             {
@@ -185,7 +145,57 @@ def _source_entities(
                 "bytes": len(text.encode("utf-8")),
             }
         )
-    entities[f"{entity_root}/assets.json"] = {
+    entities["resolved/prompts/assets.json"] = {
+        "schema_version": "autosaddler-prompt-source-assets/v1",
+        "plugin": plugin_name,
+        "assets": inventory,
+    }
+    return entities
+
+
+def extension_prompt_source_entities(
+    *,
+    extension: str,
+    shared_root: Path,
+    plugin_root: Path,
+    plugin_name: str,
+) -> dict[str, str | Mapping[str, JsonValue]]:
+    """Record the prompt sources of an optional extension under ``resolved/prompts/<extension>/``.
+
+    Shared sources come from ``shared_root`` and plugin sources from ``plugin_root / extension``,
+    which ``prompt_source_entities`` excludes so runs without the extension keep their provenance.
+    """
+    for name in (extension, plugin_name):
+        if not name or PurePosixPath(name).name != name:
+            raise ValueError(f"Unsafe prompt extension or plugin name: {name}")
+    plugin_extension_root = plugin_root / extension
+    sources = {
+        **{
+            f"shared/{shared_root.name}/{path.relative_to(shared_root).as_posix()}": path
+            for path in sorted(shared_root.rglob("*.md"))
+        },
+        **{
+            f"plugins/{plugin_name}/{extension}/{path.relative_to(plugin_extension_root).as_posix()}": path
+            for path in sorted(plugin_extension_root.rglob("*.md"))
+        },
+    }
+    if not sources:
+        raise ValueError(f"No prompt source assets found for extension {extension}")
+    entities: dict[str, str | Mapping[str, JsonValue]] = {}
+    inventory: list[dict[str, JsonValue]] = []
+    for source, path in sorted(sources.items()):
+        text = path.read_text(encoding="utf-8")
+        resolved_path = f"resolved/prompts/{extension}/sources/{source}"
+        entities[resolved_path] = text
+        inventory.append(
+            {
+                "source": source,
+                "resolved_path": resolved_path,
+                "sha256": sha256_digest(text),
+                "bytes": len(text.encode("utf-8")),
+            }
+        )
+    entities[f"resolved/prompts/{extension}/assets.json"] = {
         "schema_version": "autosaddler-prompt-source-assets/v1",
         "plugin": plugin_name,
         "assets": inventory,

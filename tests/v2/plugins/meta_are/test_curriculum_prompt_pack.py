@@ -158,12 +158,16 @@ def test_curriculum_context_is_appended_only_for_activesaddler(tmp_path: Path) -
 
 
 def test_curriculum_prompt_provenance_is_recorded_separately() -> None:
-    from autosaddler.v2.plugins.meta_are.plugin import meta_are_prompt_entities
+    from autosaddler.v2.plugins.meta_are.prompt_pack import meta_are_prompt_composition_entity
+    from autosaddler.v2.prompting.assets import prompt_source_entities
     from autosaddler.v2.plugins.meta_are.prompt_pack import meta_are_curriculum_composition_entity
-    from autosaddler.v2.prompting.assets import curriculum_prompt_source_entities
+    from autosaddler.v2.prompting.curriculum import curriculum_prompt_source_entities
     import autosaddler.v2.plugins.meta_are.plugin as plugin
 
-    base = meta_are_prompt_entities()
+    base = {
+        **prompt_source_entities(plugin_root=Path(plugin.__file__).parent, plugin_name="meta_are", exclude=("curriculum",)),
+        "resolved/prompts/compositions.json": meta_are_prompt_composition_entity(),
+    }
     curriculum = curriculum_prompt_source_entities(plugin_root=Path(plugin.__file__).parent, plugin_name="meta_are")
     compositions = meta_are_curriculum_composition_entity()
 

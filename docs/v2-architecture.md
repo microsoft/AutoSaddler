@@ -140,7 +140,8 @@ engine records it as `BatchSampled`.
   the batch before the evolution session.
 - **Adaptive policies** implement `AdaptiveTaskSelectionPolicy` in `core/scheduling.py`. They
   choose the batch after the working parent is prepared and may need optimizer sessions to do so.
-  The policy describes that work and the engine executes it generically:
+  The policy describes that work and `AdaptiveTaskSelectionRunner` (`core/scheduling_runner.py`)
+  executes it generically at a few engine hook points:
   - `next_selection_step` returns a `SessionStep`, a `StateStep`, a `TaskSelection`, or a
     `NoSelection` (the iteration completes as `no_selectable_cases`);
   - `iteration_changes` records state from an all-pass iteration;
@@ -149,8 +150,9 @@ engine records it as `BatchSampled`.
   Each step result is appended as an `ExtensionStateChanged` event in the policy's namespace before
   the policy is consulted again, and every policy method is a pure function of replayed events, so
   a resumed run replays the same steps without repeating paid work. Policy settings live in
-  `optimization.task_selection.settings`, and adaptive-only provenance (settings, extra session
-  kinds, and scenario `task_selection_resolved_entities`) is recorded only for adaptive runs.
+  `optimization.task_selection.settings` and are passed to any registered factory that declares a
+  `settings` parameter. Adaptive-only provenance (settings, extra session kinds, and scenario
+  `task_selection_resolved_entities`) is recorded only for adaptive runs.
 
 ### ActiveSaddler
 

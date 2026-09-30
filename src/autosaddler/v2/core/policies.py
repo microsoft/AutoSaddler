@@ -3,12 +3,8 @@ from __future__ import annotations
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from autosaddler.v2.core.domain import Candidate, Case, Evaluation, JsonValue, PatchVerdict
-
-if TYPE_CHECKING:
-    from autosaddler.v2.core.scheduling import AdaptiveTaskSelectionPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +177,7 @@ class BudgetPolicy:
 
 @dataclass(frozen=True, slots=True)
 class PolicyBundle:
-    task_selection: FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy | AdaptiveTaskSelectionPolicy
+    task_selection: FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy
     acceptance: MatchedValidStrictImprovement
     development: FullOnAcceptDevelopment
     ranking: MeanDevelopmentRanking

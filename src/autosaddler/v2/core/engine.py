@@ -20,9 +20,9 @@ from autosaddler.v2.core.domain import (
     canonical_json,
     sha256_digest,
 )
-from autosaddler.v2.core.events import ITERATION_COMPLETION_SCHEMA_VERSION, RunEvent, operation_id
+from autosaddler.v2.core.events import ITERATION_COMPLETION_SCHEMA_VERSION, operation_id
 from autosaddler.v2.core.metrics import EventModelUsageSink
-from autosaddler.v2.core.policies import DevelopmentDecision, PolicyBundle, TaskSelection
+from autosaddler.v2.core.policies import DevelopmentDecision, PolicyBundle
 from autosaddler.v2.core.ports import (
     AgentProvider,
     CompositionPlan,
@@ -34,18 +34,8 @@ from autosaddler.v2.core.ports import (
     WorkspaceDelta,
 )
 from autosaddler.v2.core.run_state import RunState
-from autosaddler.v2.core.scheduling import (
-    MAX_SELECTION_STEPS,
-    AdaptiveTaskSelectionPolicy,
-    DeferredRequest,
-    IterationFeedback,
-    NoSelection,
-    SelectionRequest,
-    SessionStep,
-    StatePayload,
-    StateStep,
-    iteration_feedback_from,
-)
+from autosaddler.v2.core.scheduling import AdaptiveTaskSelectionPolicy, NoSelection, SelectionRequest
+from autosaddler.v2.core.scheduling_runner import AdaptiveTaskSelectionRunner
 from autosaddler.v2.core.serde import candidate_from, evaluation_from, record, session_result_from
 from autosaddler.v2.prompting.models import (
     SessionRequest,
@@ -98,6 +88,18 @@ class AutoSaddlerEngine:
         self.session_retry_backoff_seconds = session_retry_backoff_seconds
         self.run_invocation_id = uuid4().hex
         self._iteration_started_at: dict[int, float] = {}
+        # Adaptive task-selection policies choose batches through the runner; passive ones use select().
+        self._task_selection = (
+            AdaptiveTaskSelectionRunner(
+                policy=policies.task_selection,
+                store=store,
+                scenario=scenario,
+                run_session=self._ensure_session,
+                exhausted_error=SessionRetriesExhausted,
+            )
+            if isinstance(policies.task_selection, AdaptiveTaskSelectionPolicy)
+            else None
+        )
 
     def run(self) -> OptimizationResult:
         return asyncio.run(self.optimize())
@@ -230,28 +232,22 @@ class AutoSaddlerEngine:
         self._iteration_started_at[iteration] = time.monotonic()
         self.store.append("IterationStarted", iteration_operation, {"iteration": iteration})
 
-        adaptive = self._adaptive_task_selection()
+        adaptive = self._task_selection
+        batch_operation = operation_id(self.store.run_id, "iteration", iteration, "batch")
+        batch_event = self.store.find("BatchSampled", batch_operation)
+        if batch_event is None and adaptive is None:
+            selection = self.policies.task_selection.select(self.scenario.train_cases, iteration)
+            batch_event = self.store.append(
+                "BatchSampled",
+                batch_operation,
+                {
+                    "iteration": iteration,
+                    "case_ids": list(selection.case_ids),
+                    "provenance": selection.provenance,
+                },
+            )
+        case_ids = _string_list(batch_event.payload.get("case_ids"), "sampled case_ids") if adaptive is None else ()
         cases_by_id = {case.case_id: case for case in self.scenario.train_cases}
-        if adaptive is None:
-            batch_operation = operation_id(self.store.run_id, "iteration", iteration, "batch")
-            batch_event = self.store.find("BatchSampled", batch_operation)
-            if batch_event is None:
-                task_selection = self.policies.task_selection
-                assert not isinstance(task_selection, AdaptiveTaskSelectionPolicy)
-                selection = task_selection.select(self.scenario.train_cases, iteration)
-                batch_event = self.store.append(
-                    "BatchSampled",
-                    batch_operation,
-                    {
-                        "iteration": iteration,
-                        "case_ids": list(selection.case_ids),
-                        "provenance": selection.provenance,
-                    },
-                )
-            case_ids = _string_list(batch_event.payload.get("case_ids"), "sampled case_ids")
-        else:
-            # Adaptive policies choose the batch for the prepared working parent.
-            case_ids = ()
         cases = tuple(cases_by_id[case_id] for case_id in case_ids)
 
         state = self._state()
@@ -262,15 +258,16 @@ class AutoSaddlerEngine:
                 continue
             for unit in change.changed_units:
                 component_source_options.setdefault(unit, []).append(candidate_id)
-        evolve_context: dict[str, JsonValue] = {
-            "iteration": iteration,
-            "candidate_ids": list(state.accepted_candidate_ids),
-            "component_source_options": cast(JsonValue, component_source_options),
-            "train_case_ids": list(case_ids),
-        }
-        if adaptive is not None:
-            evolve_context["task_selection"] = adaptive.prompt_context(self.store.events(), iteration)
-        evolve_spec = self.scenario.prompt_pack.session("evolve", evolve_context)
+        evolve_spec = self.scenario.prompt_pack.session(
+            "evolve",
+            {
+                "iteration": iteration,
+                "candidate_ids": list(state.accepted_candidate_ids),
+                "component_source_options": component_source_options,
+                "train_case_ids": list(case_ids),
+                **(adaptive.prompt_context(iteration) if adaptive is not None else {}),
+            },
+        )
         evolve = await self._ensure_session(
             logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, "evolve"),
             spec=evolve_spec,
@@ -296,8 +293,7 @@ class AutoSaddlerEngine:
         else:
             parent = selected_parent
         if adaptive is not None:
-            sampled = await self._ensure_adaptive_batch(
-                adaptive,
+            sampled = await adaptive.select_batch(
                 SelectionRequest(
                     iteration=iteration,
                     train_cases=self.scenario.train_cases,
@@ -306,7 +302,7 @@ class AutoSaddlerEngine:
                     selection_parent_ids=selection_plan.parents,
                     component_sources=selection_plan.selections,
                     selection_rationale=selection_plan.rationale,
-                ),
+                )
             )
             if isinstance(sampled, NoSelection):
                 self._complete_iteration(
@@ -315,11 +311,7 @@ class AutoSaddlerEngine:
                     evaluated_candidates=(parent,),
                     accepted=False,
                     outcome="no_selectable_cases",
-                    details={
-                        "selection_parent_ids": list(selection_plan.parents),
-                        "component_sources": dict(selection_plan.selections),
-                        "no_selection_reason": sampled.reason,
-                    },
+                    details={"no_selection_reason": sampled.reason},
                 )
                 return
             case_ids = sampled
@@ -333,26 +325,11 @@ class AutoSaddlerEngine:
         )
         if all(observation.disposition == "success" for observation in parent_evaluation.observations):
             if adaptive is not None:
-                self._record_task_selection_changes(
-                    adaptive,
-                    operation_id(self.store.run_id, "iteration", iteration, "feedback"),
-                    adaptive.iteration_changes(
-                        self.store.events(),
-                        IterationFeedback(
-                            iteration=iteration,
-                            outcome="no_training_failures",
-                            case_ids=case_ids,
-                            working_parent_id=parent.candidate_id,
-                            child_id=None,
-                            train_before_evaluation_id=parent_evaluation.evaluation_id,
-                            train_after_evaluation_id=None,
-                            train_before_case_scores=_case_aggregate_scores(parent_evaluation),
-                            train_after_case_scores=None,
-                            train_before_evidence=None,
-                            train_after_evidence=None,
-                            diagnosis=None,
-                        ),
-                    ),
+                adaptive.record_no_training_failures(
+                    iteration=iteration,
+                    case_ids=case_ids,
+                    parent=parent,
+                    parent_evaluation=parent_evaluation,
                 )
             self._complete_iteration(
                 iteration=iteration,
@@ -368,15 +345,16 @@ class AutoSaddlerEngine:
             return
         evidence = self.scenario.evidence_builder.build(parent_evaluation)
 
-        diagnosis_context: dict[str, JsonValue] = {
-            "iteration": iteration,
-            "candidate_ids": [parent.candidate_id],
-            "train_case_ids": list(case_ids),
-            "evidence": record(evidence),
-        }
-        if adaptive is not None:
-            diagnosis_context["task_selection"] = adaptive.prompt_context(self.store.events(), iteration)
-        diagnosis_spec = self.scenario.prompt_pack.session("diagnose_patch", diagnosis_context)
+        diagnosis_spec = self.scenario.prompt_pack.session(
+            "diagnose_patch",
+            {
+                "iteration": iteration,
+                "candidate_ids": [parent.candidate_id],
+                "train_case_ids": list(case_ids),
+                "evidence": record(evidence),
+                **(adaptive.prompt_context(iteration) if adaptive is not None else {}),
+            },
+        )
         mutation_context = MutationContext(
             iteration=iteration,
             patch_label=diagnosis_spec.mutation_label or "diagnosis-patch",
@@ -531,24 +509,6 @@ class AutoSaddlerEngine:
         obligation_id = sha256_digest(
             canonical_json({"iteration": iteration, "candidate_id": child.candidate_id, "kind": "reflect"})
         )
-        task_selection_feedback: dict[str, JsonValue] = {}
-        if adaptive is not None:
-            task_selection_feedback["task_selection_feedback"] = record(
-                IterationFeedback(
-                    iteration=iteration,
-                    outcome="accepted" if verdict.accepted else "declined",
-                    case_ids=case_ids,
-                    working_parent_id=parent.candidate_id,
-                    child_id=child.candidate_id,
-                    train_before_evaluation_id=parent_evaluation.evaluation_id,
-                    train_after_evaluation_id=child_evaluation.evaluation_id,
-                    train_before_case_scores=_case_aggregate_scores(parent_evaluation),
-                    train_after_case_scores=_case_aggregate_scores(child_evaluation),
-                    train_before_evidence=evidence,
-                    train_after_evidence=self.scenario.evidence_builder.build(child_evaluation),
-                    diagnosis=_optional_session_string(diagnosis, "diagnosis"),
-                )
-            )
         self.store.append(
             "DeferredWorkScheduled",
             operation_id(self.store.run_id, "iteration", iteration, "deferred-reflect"),
@@ -577,7 +537,21 @@ class AutoSaddlerEngine:
                 "diagnosis": _optional_session_string(diagnosis, "diagnosis"),
                 "patch_phase": mutation_context.patch_label,
                 "acceptance_reason": verdict.reason,
-                **task_selection_feedback,
+                **(
+                    adaptive.reflection_payload(
+                        iteration=iteration,
+                        accepted=verdict.accepted,
+                        case_ids=case_ids,
+                        parent=parent,
+                        parent_evaluation=parent_evaluation,
+                        child=child,
+                        child_evaluation=child_evaluation,
+                        evidence=evidence,
+                        diagnosis=_optional_session_string(diagnosis, "diagnosis"),
+                    )
+                    if adaptive is not None
+                    else {}
+                ),
             },
         )
         self._complete_iteration(
@@ -683,20 +657,14 @@ class AutoSaddlerEngine:
         )
 
     async def _drain_deferred(self) -> None:
-        adaptive = self._adaptive_task_selection()
-        # Reflection may schedule task-selection work, so re-read the pending set after each
-        # obligation; reflections keep their original order and run before that work.
-        while pending := sorted(
-            self._state().pending_obligations.items(),
-            key=lambda item: (item[1].get("session_kind") != "reflect", item[0]),
-        ):
-            obligation_id, obligation = pending[0]
+        adaptive = self._task_selection
+        for obligation_id, obligation in sorted(self._state().pending_obligations.items()):
             kind = str(obligation.get("session_kind", ""))
             if kind != "reflect":
-                if adaptive is None or kind not in adaptive.required_session_kinds:
-                    raise ValueError(f"Unknown deferred session kind: {kind}")
-                await self._run_task_selection_deferred(adaptive, obligation_id, obligation)
-                continue
+                # Task-selection work runs after every reflection it may depend on.
+                if adaptive is not None and adaptive.handles(kind):
+                    continue
+                raise ValueError(f"Unknown deferred session kind: {kind}")
             candidate_id = str(obligation.get("candidate_id", ""))
             train_case_ids = _string_list(obligation.get("train_case_ids"), "deferred train case IDs")
             spec = self.scenario.prompt_pack.session(
@@ -777,168 +745,15 @@ class AutoSaddlerEngine:
                     "lessons": lessons,
                 },
             )
-            feedback = obligation.get("task_selection_feedback")
-            if feedback is not None:
-                if adaptive is None:
-                    raise ValueError("Reflection carries task-selection feedback without an adaptive policy")
-                request = adaptive.after_reflection(self.store.events(), iteration_feedback_from(feedback), lessons)
-                if request is not None:
-                    self._schedule_task_selection_deferred(obligation_id, obligation, request)
+            if adaptive is not None:
+                adaptive.after_reflection(obligation_id, obligation, lessons)
             self.store.append(
                 "DeferredWorkCompleted",
                 operation_id(self.store.run_id, "deferred", obligation_id, "complete"),
                 {"obligation_id": obligation_id, "candidate_id": candidate_id},
             )
-
-    def _schedule_task_selection_deferred(
-        self,
-        reflection_obligation_id: str,
-        reflection: Mapping[str, object],
-        request: DeferredRequest,
-    ) -> None:
-        owning_iteration = cast(int, reflection.get("owning_iteration"))
-        candidate_id = str(reflection.get("candidate_id", ""))
-        obligation_id = sha256_digest(
-            canonical_json({"iteration": owning_iteration, "candidate_id": candidate_id, "kind": request.kind})
-        )
-        self.store.append(
-            "DeferredWorkScheduled",
-            operation_id(self.store.run_id, "deferred", reflection_obligation_id, "schedule", request.kind),
-            {
-                "obligation_id": obligation_id,
-                "owning_iteration": owning_iteration,
-                "candidate_id": candidate_id,
-                "session_kind": request.kind,
-                "stage": request.stage,
-                "task_selection": cast(JsonValue, request.payload),
-            },
-        )
-
-    async def _run_task_selection_deferred(
-        self,
-        policy: AdaptiveTaskSelectionPolicy,
-        obligation_id: str,
-        obligation: Mapping[str, object],
-    ) -> None:
-        payload = obligation.get("task_selection")
-        if not isinstance(payload, Mapping):
-            raise TypeError("Task-selection deferred work requires a payload object")
-        request = DeferredRequest(
-            kind=str(obligation.get("session_kind", "")),
-            stage=str(obligation.get("stage", "")),
-            payload=cast(Mapping[str, JsonValue], payload),
-        )
-        candidate_id = str(obligation.get("candidate_id", ""))
-        state_parts = ("deferred", obligation_id, "state")
-        # Exclude this obligation's own state so a partially recorded result replays identically.
-        events = self._events_without_state(state_parts)
-        spec = self.scenario.prompt_pack.session(request.kind, policy.deferred_context(events, request))
-        try:
-            result = await self._ensure_session(
-                logical_operation_id=operation_id(self.store.run_id, "deferred", obligation_id, request.kind),
-                spec=spec,
-                source_workspace=None,
-                result_validator=lambda value: policy.deferred_failure_reason(events, request, value),
-                metrics_context={
-                    "stage": request.stage,
-                    "iteration": cast(int, obligation.get("owning_iteration")),
-                    "candidate_id": candidate_id,
-                },
-            )
-        except SessionRetriesExhausted as error:
-            self._record_task_selection_changes(
-                policy,
-                state_parts,
-                policy.deferred_exhausted_changes(events, request, str(error)),
-            )
-            self.store.append(
-                "DeferredWorkAbandoned",
-                operation_id(self.store.run_id, "deferred", obligation_id, "abandon"),
-                {"obligation_id": obligation_id, "candidate_id": candidate_id, "reason": str(error)},
-            )
-            return
-        self._record_task_selection_changes(policy, state_parts, policy.deferred_changes(events, request, result))
-        self.store.append(
-            "DeferredWorkCompleted",
-            operation_id(self.store.run_id, "deferred", obligation_id, "complete"),
-            {"obligation_id": obligation_id, "candidate_id": candidate_id},
-        )
-
-    def _adaptive_task_selection(self) -> AdaptiveTaskSelectionPolicy | None:
-        policy = self.policies.task_selection
-        return policy if isinstance(policy, AdaptiveTaskSelectionPolicy) else None
-
-    async def _ensure_adaptive_batch(
-        self,
-        policy: AdaptiveTaskSelectionPolicy,
-        request: SelectionRequest,
-    ) -> tuple[str, ...] | NoSelection:
-        iteration = request.iteration
-        batch_operation = operation_id(self.store.run_id, "iteration", iteration, "batch")
-        executed: set[str] = set()
-        for _ in range(MAX_SELECTION_STEPS):
-            batch_event = self.store.find("BatchSampled", batch_operation)
-            if batch_event is not None:
-                return _string_list(batch_event.payload.get("case_ids"), "sampled case_ids")
-            step = policy.next_selection_step(self.store.events(), request)
-            if isinstance(step, TaskSelection):
-                self.store.append(
-                    "BatchSampled",
-                    batch_operation,
-                    {"iteration": iteration, "case_ids": list(step.case_ids), "provenance": step.provenance},
-                )
-                continue
-            if isinstance(step, NoSelection):
-                return step
-            state_operation = operation_id(self.store.run_id, "iteration", iteration, "selection", step.name)
-            if step.name in executed or self.store.find("ExtensionStateChanged", state_operation) is not None:
-                raise RuntimeError(f"Adaptive task selection repeated step {step.name!r} in iteration {iteration}")
-            executed.add(step.name)
-            if isinstance(step, StateStep):
-                state = step.payload
-            else:
-                state = await self._task_selection_session_state(step, iteration, request.working_parent_id)
-            self.store.append("ExtensionStateChanged", state_operation, _namespaced(policy, state))
-        raise RuntimeError(f"Adaptive task selection exceeded {MAX_SELECTION_STEPS} steps in iteration {iteration}")
-
-    async def _task_selection_session_state(
-        self,
-        step: SessionStep,
-        iteration: int,
-        candidate_id: str,
-    ) -> StatePayload:
-        try:
-            result = await self._ensure_session(
-                logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, step.name),
-                spec=self.scenario.prompt_pack.session(step.kind, step.context),
-                source_workspace=None,
-                result_validator=step.validate,
-                metrics_context={"stage": step.stage, "iteration": iteration, "candidate_id": candidate_id},
-            )
-        except SessionRetriesExhausted as error:
-            if step.record_exhausted is None:
-                raise
-            return step.record_exhausted(str(error))
-        return step.record(result)
-
-    def _record_task_selection_changes(
-        self,
-        policy: AdaptiveTaskSelectionPolicy,
-        parts: tuple[object, ...],
-        changes: Sequence[StatePayload],
-    ) -> None:
-        for index, change in enumerate(changes):
-            state_operation = operation_id(self.store.run_id, *parts, index)
-            if self.store.find("ExtensionStateChanged", state_operation) is None:
-                self.store.append("ExtensionStateChanged", state_operation, _namespaced(policy, change))
-
-    def _events_without_state(self, parts: tuple[object, ...]) -> tuple[RunEvent, ...]:
-        prefix = operation_id(self.store.run_id, *parts) + ":"
-        return tuple(
-            event
-            for event in self.store.events()
-            if not (event.event_type == "ExtensionStateChanged" and event.operation_id.startswith(prefix))
-        )
+        if adaptive is not None:
+            await adaptive.drain_deferred()
 
     async def _ensure_session(
         self,
@@ -1392,9 +1207,9 @@ class AutoSaddlerEngine:
             return self.diagnosis_patch_timeout_seconds
         if kind == "reflect":
             return self.reflection_timeout_seconds
-        adaptive = self._adaptive_task_selection()
-        if adaptive is not None and kind in adaptive.session_timeouts():
-            return adaptive.session_timeouts()[kind]
+        timeout = self._task_selection.session_timeout(kind) if self._task_selection is not None else None
+        if timeout is not None:
+            return timeout
         raise ValueError(f"Unknown session kind: {kind}")
 
     def _iteration_wall_seconds(self, iteration: int) -> float:
@@ -1473,12 +1288,6 @@ class AutoSaddlerEngine:
             development_score=float(value.get("development_score")),
             iterations=int(value.get("iterations")),
         )
-
-
-def _namespaced(policy: AdaptiveTaskSelectionPolicy, state: StatePayload) -> dict[str, JsonValue]:
-    if "namespace" in state:
-        raise ValueError("Task-selection state payloads must not set their own namespace")
-    return {"namespace": policy.namespace, **state}
 
 
 def _required_score(evaluation: Evaluation) -> float:

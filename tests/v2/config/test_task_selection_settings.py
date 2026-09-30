@@ -107,3 +107,32 @@ def test_activesaddler_rejects_out_of_range_settings(
     config["optimization"]["task_selection"]["settings"][key] = value
     with pytest.raises(ValueError, match=error):
         build_runtime(write_config(tmp_path, config), run_id="range", registry=curriculum_registry)
+
+
+def test_registered_policies_receive_settings_when_their_factory_declares_them(
+    tmp_path: Path,
+    activesaddler_config,
+) -> None:
+    from autosaddler.v2.config.registry import default_registry
+    from autosaddler.v2.core.policies import EpochShuffledTaskSelectionPolicy
+
+    received: list[dict] = []
+
+    def custom_factory(*, batch_size: int, seed: int, settings=None):
+        received.append(dict(settings or {}))
+        return EpochShuffledTaskSelectionPolicy(batch_size=batch_size, seed=seed)
+
+    registry = default_registry()
+    registry.task_selection["custom"] = custom_factory
+    registry.task_selection["custom_without_settings"] = lambda *, batch_size, seed: EpochShuffledTaskSelectionPolicy(
+        batch_size=batch_size,
+        seed=seed,
+    )
+    value = activesaddler_config(tmp_path)
+    value["optimization"]["task_selection"] = {"type": "custom", "batch_size": 2, "seed": 1, "settings": {"k": 1}}
+    build_runtime(write_config(tmp_path / "custom", value), run_id="custom", registry=registry)
+
+    assert received == [{"k": 1}]
+    value["optimization"]["task_selection"]["type"] = "custom_without_settings"
+    with pytest.raises(ValueError, match="not supported by 'custom_without_settings'"):
+        build_runtime(write_config(tmp_path / "without", value), run_id="without", registry=registry)

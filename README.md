@@ -157,7 +157,8 @@ Task-selection policies:
 | `epoch_shuffled` | Non-overlapping batches from a seeded per-epoch shuffle | none |
 | `activesaddler` | Agent-driven failure-pattern bandit curriculum | `softmax_temperature`, `min_prob`, `ema_eta`, `pattern_extraction_timeout_seconds`, `arm_scoring_timeout_seconds` |
 
-`fixed` and `epoch_shuffled` take no `settings`. `activesaddler` is an adaptive task-selection
+`fixed` and `epoch_shuffled` take no `settings`; a registered factory receives them when it declares a
+`settings` parameter. `activesaddler` is an adaptive task-selection
 policy: it chooses each batch for the prepared working parent and requires a scenario that renders
 the `extract_patterns`, `decide_arm`, and `score_arms` session kinds, which the built-in Meta-ARE
 scenario does. Adding it leaves fixed and epoch-shuffled runs byte-identical, so their existing

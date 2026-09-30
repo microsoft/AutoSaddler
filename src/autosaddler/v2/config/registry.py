@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib.metadata import EntryPoint, PackageNotFoundError, entry_points, version
@@ -7,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from autosaddler.v2.config.models import RunConfig
-from autosaddler.v2.core.curriculum import ActiveSaddlerTaskSelectionPolicy
+from autosaddler.v2.core.curriculum import activesaddler_task_selection
 from autosaddler.v2.core.domain import JsonValue
 from autosaddler.v2.core.engine import AutoSaddlerEngine
 from autosaddler.v2.core.policies import (
@@ -103,7 +104,7 @@ class Registry:
         self.providers: dict[str, Callable[..., AgentProvider]] = {}
         self.task_selection: dict[
             str,
-            Callable[..., FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy | AdaptiveTaskSelectionPolicy],
+            Callable[..., FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy],
         ] = {}
         self.acceptance: dict[str, Callable[[], MatchedValidStrictImprovement]] = {}
         self.development: dict[str, Callable[[], FullOnAcceptDevelopment]] = {}
@@ -146,7 +147,7 @@ def default_registry() -> Registry:
         batch_size=batch_size,
         seed=seed,
     )
-    registry.task_selection["activesaddler"] = _activesaddler_task_selection
+    registry.task_selection["activesaddler"] = activesaddler_task_selection
     registry.acceptance["matched_valid_strict_improvement"] = MatchedValidStrictImprovement
     registry.development["full_on_accept"] = FullOnAcceptDevelopment
     registry.ranking["mean_development_score"] = MeanDevelopmentRanking
@@ -281,17 +282,17 @@ def build_runtime(
     if missing_capabilities:
         raise ValueError(f"Configured provider lacks required capabilities: {missing_capabilities}")
     provider = provider_factory(ledger=ledger, settings=config.provider.settings)
-    task_selection_config = config.optimization.task_selection
-    task_selection_arguments: dict[str, Any] = {
-        "batch_size": task_selection_config.batch_size,
-        "seed": task_selection_config.seed,
-    }
-    if task_selection_config.settings is not None:
-        if task_selection_config.type not in _TASK_SELECTION_WITH_SETTINGS:
-            raise ValueError(f"optimization.task_selection.settings is not supported by {task_selection_config.type!r}")
-        task_selection_arguments["settings"] = task_selection_config.settings
+    task_selection_settings = config.optimization.task_selection.settings
+    if task_selection_settings is not None and "settings" not in inspect.signature(task_selection_factory).parameters:
+        raise ValueError(
+            f"optimization.task_selection.settings is not supported by {config.optimization.task_selection.type!r}"
+        )
     policies = PolicyBundle(
-        task_selection=task_selection_factory(**task_selection_arguments),
+        task_selection=task_selection_factory(
+            batch_size=config.optimization.task_selection.batch_size,
+            seed=config.optimization.task_selection.seed,
+            **({"settings": task_selection_settings} if task_selection_settings is not None else {}),
+        ),
         acceptance=acceptance_factory(),
         development=development_factory(),
         ranking=ranking_factory(),
@@ -300,13 +301,12 @@ def build_runtime(
             max_iterations=config.optimization.budget.max_iterations,
         ),
     )
-    adaptive = policies.task_selection if isinstance(policies.task_selection, AdaptiveTaskSelectionPolicy) else None
-    if adaptive is not None:
-        unsupported_kinds = sorted(adaptive.required_session_kinds - scenario.supported_session_kinds)
+    if isinstance(policies.task_selection, AdaptiveTaskSelectionPolicy):
+        unsupported_kinds = sorted(policies.task_selection.required_session_kinds - scenario.supported_session_kinds)
         if unsupported_kinds:
             raise ValueError(
                 f"Scenario {scenario.name!r} does not support session kinds required by "
-                f"task selection {task_selection_config.type!r}: {unsupported_kinds}"
+                f"task selection {config.optimization.task_selection.type!r}: {unsupported_kinds}"
             )
     resolved_entities = _resolved_entities(
         config,
@@ -327,51 +327,6 @@ def build_runtime(
         session_retry_backoff_seconds=config.optimization.session_retry_backoff_seconds,
     )
     return Runtime(config, store, scenario, provider, policies, engine, ledger)
-
-
-_TASK_SELECTION_WITH_SETTINGS = frozenset({"activesaddler"})
-
-
-def _activesaddler_task_selection(
-    *,
-    batch_size: int,
-    seed: int,
-    settings: Mapping[str, JsonValue] | None = None,
-) -> ActiveSaddlerTaskSelectionPolicy:
-    if settings is None:
-        raise ValueError("optimization.task_selection.settings is required for 'activesaddler'")
-    expected = {
-        "softmax_temperature",
-        "min_prob",
-        "ema_eta",
-        "pattern_extraction_timeout_seconds",
-        "arm_scoring_timeout_seconds",
-    }
-    missing = sorted(expected - settings.keys())
-    extra = sorted(settings.keys() - expected)
-    if missing or extra:
-        raise ValueError(
-            f"Invalid keys at optimization.task_selection.settings for activesaddler: missing={missing}, extra={extra}"
-        )
-    path = "optimization.task_selection.settings"
-    return ActiveSaddlerTaskSelectionPolicy(
-        batch_size=batch_size,
-        seed=seed,
-        softmax_temperature=_number(settings["softmax_temperature"], f"{path}.softmax_temperature"),
-        min_prob=_number(settings["min_prob"], f"{path}.min_prob"),
-        ema_eta=_number(settings["ema_eta"], f"{path}.ema_eta"),
-        pattern_extraction_timeout_seconds=_number(
-            settings["pattern_extraction_timeout_seconds"],
-            f"{path}.pattern_extraction_timeout_seconds",
-        ),
-        arm_scoring_timeout_seconds=_number(settings["arm_scoring_timeout_seconds"], f"{path}.arm_scoring_timeout_seconds"),
-    )
-
-
-def _number(value: JsonValue, path: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{path} must be a number")
-    return float(value)
 
 
 def _fake_settings(value: Mapping[str, JsonValue]) -> FakeScenarioSettings:

@@ -185,11 +185,9 @@ class ScenarioComponents:
             raise ValueError("train_cases may contain the train split only")
         if any(case.split != "development" for case in self.development_cases):
             raise ValueError("development_cases may contain the development split only")
-        object.__setattr__(self, "resolved_entities", MappingProxyType(dict(self.resolved_entities)))
-        if not BASE_SESSION_KINDS <= self.supported_session_kinds:
-            raise ValueError("Scenarios must support the evolve, diagnose_patch, and reflect session kinds")
         object.__setattr__(
             self,
             "task_selection_resolved_entities",
             MappingProxyType(dict(self.task_selection_resolved_entities)),
         )
+        object.__setattr__(self, "resolved_entities", MappingProxyType(dict(self.resolved_entities)))

@@ -7,7 +7,8 @@ from autosaddler.v2.core.domain import JsonValue
 from autosaddler.v2.core.curriculum import CURRICULUM_SESSION_KINDS
 from autosaddler.v2.core.ports import BASE_SESSION_KINDS, ScenarioComponents
 from autosaddler.v2.harness.git import GitHarnessSpace
-from autosaddler.v2.prompting.assets import curriculum_prompt_source_entities, prompt_source_entities
+from autosaddler.v2.prompting.assets import prompt_source_entities
+from autosaddler.v2.prompting.curriculum import curriculum_prompt_source_entities
 from autosaddler.v2.plugins.meta_are.config import MetaARESettings
 from autosaddler.v2.plugins.meta_are.evaluator import MetaAREEvaluator
 from autosaddler.v2.plugins.meta_are.evidence import MetaAREEvidenceBuilder
@@ -102,8 +103,7 @@ def build_meta_are_components(
     )
 
 
-def meta_are_prompt_entities() -> dict[str, str | Mapping[str, JsonValue]]:
-    """Prompt provenance recorded for every Meta-ARE run; curriculum assets are recorded separately."""
+def _resolved_entities(settings, train_cases, development_cases):
     return {
         **prompt_source_entities(
             plugin_root=Path(__file__).parent,
@@ -111,12 +111,6 @@ def meta_are_prompt_entities() -> dict[str, str | Mapping[str, JsonValue]]:
             exclude=("curriculum",),
         ),
         "resolved/prompts/compositions.json": meta_are_prompt_composition_entity(),
-    }
-
-
-def _resolved_entities(settings, train_cases, development_cases):
-    return {
-        **meta_are_prompt_entities(),
         "resolved/sources/harness.json": {
             "type": "git",
             "source_repo": str(settings.source_repo),
