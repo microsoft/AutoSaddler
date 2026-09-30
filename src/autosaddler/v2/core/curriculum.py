@@ -41,6 +41,8 @@ from autosaddler.v2.prompting.models import SessionResult
 CURRICULUM_NAMESPACE = "autosaddler.curriculum"
 CURRICULUM_SCHEMA_VERSION = "autosaddler-curriculum/v1"
 CURRICULUM_SESSION_KINDS = frozenset({"extract_patterns", "decide_arm", "score_arms"})
+# Prompt overlay for failure-pattern curricula: the curriculum bundle, sessions, and context prompt.
+CURRICULUM_PROMPT_OVERLAY = "failure_pattern_curriculum"
 FAILURE_SCORE_THRESHOLD = 0.5
 SCORE_FORMULA = (
     "phi(p) = mean(severity, fixability, breadth, 1 - side_effect); "
@@ -48,6 +50,7 @@ SCORE_FORMULA = (
 )
 
 PatternSource: TypeAlias = Literal["pre_patch", "post_patch"]
+CaseStatus: TypeAlias = Literal["fixed", "regressed", "still_failing", "still_passing"]
 ArmAction: TypeAlias = Literal["pull", "draw"]
 SamplingAction: TypeAlias = Literal["unseen_draw", "arm_pull", "empty"]
 CurriculumChange: TypeAlias = Literal["patterns_extracted", "observations_recorded", "arm_decision", "arm_scores"]
@@ -270,6 +273,15 @@ def failing_case_ids(case_scores: Mapping[str, float]) -> tuple[str, ...]:
     return tuple(case_id for case_id, score in case_scores.items() if score < FAILURE_SCORE_THRESHOLD)
 
 
+def case_status(before: float, after: float) -> CaseStatus:
+    """Per-case impact of a patch on the matched training batch."""
+    failed_before = before < FAILURE_SCORE_THRESHOLD
+    failed_after = after < FAILURE_SCORE_THRESHOLD
+    if failed_before:
+        return "still_failing" if failed_after else "fixed"
+    return "regressed" if failed_after else "still_passing"
+
+
 def pattern_observations(
     state: CurriculumState,
     *,
@@ -323,6 +335,7 @@ class ActiveSaddlerTaskSelectionPolicy:
     """
 
     namespace = CURRICULUM_NAMESPACE
+    prompt_overlay = CURRICULUM_PROMPT_OVERLAY
     required_session_kinds: frozenset[str] = CURRICULUM_SESSION_KINDS
 
     def __init__(
@@ -572,16 +585,12 @@ class ActiveSaddlerTaskSelectionPolicy:
                 "train_after_evaluation_id": feedback.train_after_evaluation_id,
                 "train_before_evidence": to_json_value(feedback.train_before_evidence),
                 "train_after_evidence": to_json_value(feedback.train_after_evidence),
-                "pre_patch_failures": [
-                    {"case_id": case_id, "train_before_score": feedback.train_before_case_scores[case_id]}
-                    for case_id in pre_patch
-                ],
-                "post_patch_failures": [
-                    {"case_id": case_id, "train_after_score": after_scores[case_id]} for case_id in post_patch
-                ],
+                "pre_patch_failures": [_failure_record(feedback, after_scores, case_id) for case_id in pre_patch],
+                "post_patch_failures": [_failure_record(feedback, after_scores, case_id) for case_id in post_patch],
                 "train_before_case_scores": dict(feedback.train_before_case_scores),
                 "train_after_case_scores": after_scores,
                 "diagnosis": feedback.diagnosis,
+                "patch_intent": to_json_value(feedback.patch_intent),
                 "lessons": list(lessons),
             },
         )
@@ -613,8 +622,10 @@ class ActiveSaddlerTaskSelectionPolicy:
                     "train_before_case_scores",
                     "train_after_case_scores",
                     "diagnosis",
+                    "patch_intent",
                     "lessons",
                 )
+                if key in payload
             },
             "existing_pattern_ids": list(CurriculumState.replay(events).patterns),
         }
@@ -745,6 +756,21 @@ def _setting_number(value: JsonValue, path: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{path} must be a number")
     return float(value)
+
+
+def _failure_record(
+    feedback: IterationFeedback,
+    after_scores: Mapping[str, float],
+    case_id: str,
+) -> dict[str, JsonValue]:
+    before = feedback.train_before_case_scores[case_id]
+    after = after_scores[case_id]
+    return {
+        "case_id": case_id,
+        "train_before_score": before,
+        "train_after_score": after,
+        "status": case_status(before, after),
+    }
 
 
 def _change(change: CurriculumChange, iteration: int, **payload: object) -> dict[str, JsonValue]:

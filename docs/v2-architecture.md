@@ -151,7 +151,9 @@ engine records it as `BatchSampled`.
   the policy is consulted again, and every policy method is a pure function of replayed events, so
   a resumed run replays the same steps without repeating paid work. Policy settings live in
   `optimization.task_selection.settings` and are passed to any registered factory that declares a
-  `settings` parameter. Adaptive-only provenance (settings, extra session kinds, and scenario
+  `settings` parameter. Each adaptive policy declares a `prompt_overlay` name; the runner adds it as
+  `task_selection.prompt_overlay` to every session context it builds, and scenario prompt packs
+  select extra prompt assets by that name rather than by the policy's registry name. Adaptive-only provenance (settings, extra session kinds, and scenario
   `task_selection_resolved_entities`) is recorded only for adaptive runs.
 
 ### ActiveSaddler
@@ -187,17 +189,22 @@ sequenceDiagram
   score for the current iteration, and evaluates up to `batch_size` of the arm's cases. The random
   generator is derived from the seed and iteration, so no RNG state is stored.
 - **Extraction.** After a successful reflection with failing cases, a deferred `extract_patterns`
-  session returns new patterns and pre- or post-patch tags as structured output. The engine derives
+  session returns new patterns and pre- or post-patch tags as structured output. Its context lists
+  each failure's scores and status, the diagnosis session's output (`IterationFeedback.patch_intent`),
+  and the reflection lessons. The engine derives
   pattern IDs deterministically and records post-patch activity observations; a pattern created
   only from this iteration's post-patch tags is not observed. An all-pass batch observes every
   overlapping arm as inactive.
 - **State.** Patterns, tags, observations, decisions, and scores are `ExtensionStateChanged` events
   in the `autosaddler.curriculum` namespace; the sampler snapshot is `BatchSampled.provenance`;
   executed cases and probe points are derived from existing events. `strategy/curriculum.json`
-  projects the namespace, and sessions read `.autosaddler/curriculum/` for the replayed registry.
-- **Failures.** An exhausted arm decision falls back to a pull. Exhausted arm scoring fails the run
-  because unrated arms would silently score zero. Exhausted extraction abandons that obligation
-  after recording observations.
+  projects the namespace, and sessions read `.autosaddler/curriculum/` for the replayed registry:
+  patterns, per-arm pull histories (patch intent, development impact, per-case status and tagged
+  root causes, and the lessons of each pull), and per-case histories. The evolution session does
+  not receive it.
+- **Failures.** An exhausted arm decision falls back to a pull. Arm scoring must rate every arm
+  exactly once; exhausted arm scoring fails the run because unrated arms would silently score zero.
+  Exhausted extraction abandons that obligation after recording observations.
 
 The activity EMA (`ema_eta`) is shown to the agent only and does not influence selection. Curriculum
 prompt assets live in `prompting/curriculum_methodology/` and `plugins/meta_are/curriculum/`,

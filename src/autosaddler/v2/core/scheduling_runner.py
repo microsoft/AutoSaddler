@@ -27,6 +27,8 @@ from autosaddler.v2.core.ports import ScenarioComponents
 from autosaddler.v2.core.run_state import RunState
 from autosaddler.v2.core.scheduling import (
     MAX_SELECTION_STEPS,
+    PROMPT_OVERLAY_KEY,
+    TASK_SELECTION_CONTEXT_KEY,
     AdaptiveTaskSelectionPolicy,
     DeferredRequest,
     IterationFeedback,
@@ -67,7 +69,7 @@ class AdaptiveTaskSelectionRunner:
         return self.policy.session_timeouts().get(kind)
 
     def prompt_context(self, iteration: int) -> dict[str, JsonValue]:
-        return {"task_selection": cast(JsonValue, self.policy.prompt_context(self.store.events(), iteration))}
+        return {TASK_SELECTION_CONTEXT_KEY: self._overlaid(self.policy.prompt_context(self.store.events(), iteration))}
 
     async def select_batch(self, request: SelectionRequest) -> tuple[str, ...] | NoSelection:
         iteration = request.iteration
@@ -135,6 +137,7 @@ class AdaptiveTaskSelectionRunner:
         child_evaluation: Evaluation,
         evidence: ArtifactRef,
         diagnosis: str,
+        patch_intent: Mapping[str, JsonValue] | None = None,
     ) -> dict[str, JsonValue]:
         feedback = IterationFeedback(
             iteration=iteration,
@@ -149,6 +152,11 @@ class AdaptiveTaskSelectionRunner:
             train_before_evidence=evidence,
             train_after_evidence=self.scenario.evidence_builder.build(child_evaluation),
             diagnosis=diagnosis,
+            patch_intent=(
+                {key: value for key, value in patch_intent.items() if key != "schema_version"}
+                if patch_intent is not None
+                else None
+            ),
         )
         return {"task_selection_feedback": record(feedback)}
 
@@ -203,7 +211,9 @@ class AdaptiveTaskSelectionRunner:
         parts = ("deferred", obligation_id, "state")
         # Exclude this obligation's own state so a partially recorded result replays identically.
         events = self._events_without_state(parts)
-        spec = self.scenario.prompt_pack.session(request.kind, self.policy.deferred_context(events, request))
+        spec = self.scenario.prompt_pack.session(
+            request.kind, self._with_overlay(self.policy.deferred_context(events, request))
+        )
         try:
             result = await self.run_session(
                 logical_operation_id=operation_id(self.store.run_id, "deferred", obligation_id, request.kind),
@@ -235,7 +245,7 @@ class AdaptiveTaskSelectionRunner:
         try:
             result = await self.run_session(
                 logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, step.name),
-                spec=self.scenario.prompt_pack.session(step.kind, step.context),
+                spec=self.scenario.prompt_pack.session(step.kind, self._with_overlay(step.context)),
                 source_workspace=None,
                 result_validator=step.validate,
                 metrics_context={"stage": step.stage, "iteration": iteration, "candidate_id": candidate_id},
@@ -245,6 +255,17 @@ class AdaptiveTaskSelectionRunner:
                 raise
             return step.record_exhausted(str(error))
         return step.record(result)
+
+    def _with_overlay(self, context: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+        selection = context.get(TASK_SELECTION_CONTEXT_KEY, {})
+        if not isinstance(selection, Mapping):
+            raise TypeError(f"Session context {TASK_SELECTION_CONTEXT_KEY!r} must be an object")
+        return {**context, TASK_SELECTION_CONTEXT_KEY: self._overlaid(selection)}
+
+    def _overlaid(self, selection: Mapping[str, JsonValue]) -> JsonValue:
+        if PROMPT_OVERLAY_KEY in selection:
+            raise ValueError(f"Task-selection prompt context must not set its own {PROMPT_OVERLAY_KEY!r}")
+        return {**selection, PROMPT_OVERLAY_KEY: self.policy.prompt_overlay}
 
     def _record_changes(self, parts: tuple[object, ...], changes: Sequence[StatePayload]) -> None:
         for index, change in enumerate(changes):

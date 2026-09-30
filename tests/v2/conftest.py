@@ -108,16 +108,6 @@ def _pattern_extraction(
     reference = str(existing[0]) if existing else "incomplete-instruction"
     response: Mapping[str, JsonValue] = {
         "schema_version": "autosaddler-fake-pattern-extraction/v1",
-        "symptoms": [
-            {
-                "case_id": case_id,
-                "source": source,
-                "root_cause": "The instruction omits the required behavior.",
-                "symptom": "The agent follows an incomplete instruction.",
-                "rationale": "Every fake failure shares the same baseline cause.",
-            }
-            for source, case_id in failures
-        ],
         "new_patterns": new_patterns,
         "tags": [
             {

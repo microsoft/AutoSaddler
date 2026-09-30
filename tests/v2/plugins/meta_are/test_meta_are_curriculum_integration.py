@@ -29,16 +29,6 @@ class ScriptedCurriculumMetaAREProvider(ScriptedMetaAREProvider):
         ]
         output = {
             "schema_version": "autosaddler-meta-are-pattern-extraction/v1",
-            "symptoms": [
-                {
-                    "case_id": case_id,
-                    "source": source,
-                    "root_cause": "The fixture capability is disabled.",
-                    "symptom": "A required capability is unavailable to the agent.",
-                    "rationale": "The trace never reaches the capability.",
-                }
-                for source, case_id in failures
-            ],
             "new_patterns": [{"key": "disabled-capability", "label": "Required capability unavailable"}],
             "tags": [
                 {
@@ -113,7 +103,11 @@ def test_meta_are_curriculum_extracts_patterns_from_matched_training_evidence(tm
     assert diagnosis_context["patch_phase"] == "capability"
     assert diagnosis_context["task_selection"]["sampling_action"] == "unseen_draw"
     assert ".autosaddler/curriculum/manifest.json" in diagnosis_files
-    assert "Failure-Pattern Curriculum Context" in requests["diagnose_patch"]["spec"]["task_prompt"]
+    assert "Prior Attempts on This Arm" in requests["diagnose_patch"]["spec"]["task_prompt"]
+    # The reflect session is exactly the core v2 reflect session.
+    reflect_spec = requests["reflect"]["spec"]
+    assert "ActiveSaddler" not in reflect_spec["system_context"] + reflect_spec["task_prompt"]
+    assert not any(path.startswith(".autosaddler/curriculum/") for path in reflect_spec["workspace_files"])
     extraction_files = requests["extract_patterns"]["spec"]["workspace_files"]
     before = json.loads(extraction_files[".autosaddler/training_evidence_before.json"])
     after = json.loads(extraction_files[".autosaddler/training_evidence_after.json"])
@@ -121,6 +115,9 @@ def test_meta_are_curriculum_extracts_patterns_from_matched_training_evidence(tm
     (pattern,) = CurriculumState.replay(store.events()).patterns.values()
     assert pattern.label == "Required capability unavailable"
     assert pattern.case_ids == ("train-a",)
+    extraction_context = json.loads(extraction_files[".autosaddler/session_context.json"])
+    assert extraction_context["pre_patch_failures"][0]["status"] in {"fixed", "still_failing"}
+    assert extraction_context["patch_intent"]["intent"] and "schema_version" not in extraction_context["patch_intent"]
     assert runtime.scenario.prompt_pack.patch_phase(1) == "steering"
     compositions = store.read_json("resolved/prompts/curriculum/compositions.json")
     assert "extract_patterns" in compositions["compositions"]

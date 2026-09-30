@@ -548,6 +548,7 @@ class AutoSaddlerEngine:
                         child_evaluation=child_evaluation,
                         evidence=evidence,
                         diagnosis=_optional_session_string(diagnosis, "diagnosis"),
+                        patch_intent=diagnosis.structured_output,
                     )
                     if adaptive is not None
                     else {}

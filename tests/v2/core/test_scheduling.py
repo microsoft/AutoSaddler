@@ -40,8 +40,10 @@ def _probe_schema() -> Mapping[str, JsonValue]:
 class ProbePromptPack:
     def __init__(self, base) -> None:
         self.base = base
+        self.contexts: list[tuple[str, Mapping[str, JsonValue]]] = []
 
     def session(self, kind: str, context: Mapping[str, JsonValue]) -> object:
+        self.contexts.append((kind, context))
         if kind != "probe":
             return self.base.session(kind, context)
         spec = self.base.session("reflect", {**context, "train_case_ids": []})
@@ -60,6 +62,7 @@ class ProbePolicy:
     """Asks one session for the case to train on, records a note, then selects it."""
 
     namespace = NAMESPACE
+    prompt_overlay = "probe_overlay"
     required_session_kinds = frozenset({"probe"})
 
     def __init__(self, *, mode: str = "select") -> None:
@@ -205,6 +208,17 @@ def test_engine_executes_policy_steps_selection_and_deferred_work(tmp_path: Path
     ]
     assert {request["spec"]["kind"]: request["timeout_seconds"] for request in requests}["probe"] == 7.0
     assert (runtime.store.run_dir / "strategy" / "tests.probe.json").is_file()
+
+
+def test_engine_passes_the_declared_prompt_overlay_to_every_session(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+
+    runtime.engine.run()
+
+    contexts = runtime.scenario.prompt_pack.contexts
+    assert [kind for kind, _ in contexts] == ["evolve", "probe", "diagnose_patch", "reflect", "probe"]
+    overlays = {kind: context.get("task_selection", {}).get("prompt_overlay") for kind, context in contexts}
+    assert overlays == {"evolve": "probe_overlay", "probe": "probe_overlay", "diagnose_patch": "probe_overlay", "reflect": None}
 
 
 def test_engine_completes_iteration_without_selection(tmp_path: Path) -> None:

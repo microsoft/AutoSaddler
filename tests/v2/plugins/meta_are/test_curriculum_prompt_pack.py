@@ -84,6 +84,7 @@ def test_prompt_pack_renders_curriculum_sessions(tmp_path: Path) -> None:
     parent = sha256_digest("parent")
     curriculum = {
         "policy": "activesaddler",
+        "prompt_overlay": "failure_pattern_curriculum",
         "batch_size": 2,
         "softmax_temperature": 0.15,
         "min_prob": 0.0,
@@ -101,12 +102,21 @@ def test_prompt_pack_renders_curriculum_sessions(tmp_path: Path) -> None:
                 "train_before_evidence": {"uri": evidence["before"].uri, "sha256": evidence["before"].sha256},
                 "train_after_evidence": {"uri": evidence["after"].uri, "sha256": evidence["after"].sha256},
             },
-            "pre_patch_failures": [{"case_id": "train-a", "train_before_score": 0.0}],
-            "post_patch_failures": [{"case_id": "train-b", "train_after_score": 0.0}],
+            "pre_patch_failures": [
+                {"case_id": "train-a", "train_before_score": 0.0, "train_after_score": 1.0, "status": "fixed"}
+            ],
+            "post_patch_failures": [
+                {"case_id": "train-b", "train_before_score": 1.0, "train_after_score": 0.0, "status": "regressed"}
+            ],
             "existing_pattern_ids": [],
         },
     )
     assert set(extraction.skills) == {"history-analysis", "symptom-extract", "symptom-normalize"}
+    assert "case_reflections" not in extraction.output_schema["properties"]
+    assert "Session 3: Pattern Extraction" in extraction.system_context or "Session 3: Pattern Extraction" in (
+        extraction.task_prompt
+    )
+    assert "## ActiveSaddler (Core)" in extraction.system_context
     assert {".autosaddler/training_evidence_before.json", ".autosaddler/training_evidence_after.json"} <= set(
         extraction.workspace_files
     )
@@ -122,7 +132,7 @@ def test_prompt_pack_renders_curriculum_sessions(tmp_path: Path) -> None:
     )
     assert set(scoring.skills) == {"history-analysis", "progress-scoring"}
     assert scoring.output_schema["properties"]["scores"]["minItems"] == 1
-    assert "Rate Four Axes" in scoring.task_prompt
+    assert "Session 4: Arm Scoring" in scoring.task_prompt
 
     decision = pack.session(
         "decide_arm",
@@ -136,23 +146,48 @@ def test_prompt_pack_renders_curriculum_sessions(tmp_path: Path) -> None:
         {"iteration": 1, "candidate_ids": [parent], "train_case_ids": [], "task_selection": curriculum},
     )
     plain = pack.session("evolve", {"iteration": 1, "candidate_ids": [parent], "train_case_ids": []})
-    assert "Failure-Pattern Curriculum Context" in evolve.task_prompt
-    assert "Failure-Pattern Curriculum Context" not in plain.task_prompt
+    assert "Session 0 Under ActiveSaddler" in evolve.task_prompt
+    assert "Session 0 Under ActiveSaddler" not in plain.task_prompt
+    # As in ActiveSaddler, Session 0 does not see the failure-pattern registry.
+    assert ".autosaddler/curriculum/manifest.json" not in evolve.workspace_files
     assert ".autosaddler/curriculum/manifest.json" not in plain.workspace_files
+    diagnose = pack.session(
+        "diagnose_patch",
+        {
+            "iteration": 1,
+            "candidate_ids": [parent],
+            "train_case_ids": ["train-a"],
+            "evidence": {"uri": evidence["before"].uri, "sha256": evidence["before"].sha256},
+            "task_selection": curriculum,
+        },
+    )
+    assert "Prior Attempts on This Arm" in diagnose.task_prompt
+    assert ".autosaddler/curriculum/manifest.json" in diagnose.workspace_files
 
 
-def test_curriculum_context_is_appended_only_for_activesaddler(tmp_path: Path) -> None:
+def test_curriculum_context_follows_the_prompt_overlay_not_the_policy_name(tmp_path: Path) -> None:
     pack = _curriculum_pack(tmp_path, capability_transition_mode="iterations", capability_phase_iterations=1)
     parent = sha256_digest("parent")
 
+    def evolve(task_selection: dict[str, object]):
+        return pack.session(
+            "evolve",
+            {"iteration": 0, "candidate_ids": [parent], "train_case_ids": [], "task_selection": task_selection},
+        )
+
     passive = pack.session("evolve", {"iteration": 0, "candidate_ids": [parent], "train_case_ids": ["train-a"]})
-    other = pack.session(
-        "evolve",
-        {"iteration": 0, "candidate_ids": [parent], "train_case_ids": [], "task_selection": {"policy": "other"}},
+    no_overlay = evolve({"policy": "activesaddler"})
+    other_policy = evolve(
+        {"policy": "another_curriculum", "prompt_overlay": "failure_pattern_curriculum", "ema_eta": 0.9}
     )
 
-    assert "Failure-Pattern Curriculum Context" not in passive.task_prompt
-    assert passive.task_prompt == other.task_prompt
+    assert "Session 0 Under ActiveSaddler" not in passive.task_prompt
+    assert passive.task_prompt == no_overlay.task_prompt
+    assert passive.system_context == no_overlay.system_context
+    assert "Session 0 Under ActiveSaddler" in other_policy.task_prompt
+    assert "## ActiveSaddler (Core)" in other_policy.system_context
+    with pytest.raises(ValueError, match="no prompt overlay 'unknown_overlay'"):
+        evolve({"policy": "activesaddler", "prompt_overlay": "unknown_overlay"})
     with pytest.raises(ValueError, match="Unknown Meta-ARE session kind"):
         pack.session("decide_arm", {"iteration": 0, "candidate_ids": [parent]})
 

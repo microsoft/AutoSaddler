@@ -14,6 +14,11 @@ Every step result is appended as an ``ExtensionStateChanged`` event in the polic
 namespace before the policy is consulted again, and every policy method is a pure
 function of the replayed events it receives. A resumed run therefore replays the
 same steps without repeating paid work.
+
+Every session context the engine builds for an adaptive policy carries
+``task_selection.prompt_overlay``, the name the policy declares for the prompt assets
+it needs. Scenario prompt packs branch on that name, never on the policy's registry
+name, so another policy can reuse an overlay without scenario changes.
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ if TYPE_CHECKING:
 
 StatePayload: TypeAlias = Mapping[str, JsonValue]
 MAX_SELECTION_STEPS = 8
+TASK_SELECTION_CONTEXT_KEY = "task_selection"
+PROMPT_OVERLAY_KEY = "prompt_overlay"
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,11 +111,15 @@ class IterationFeedback:
     train_before_evidence: ArtifactRef | None
     train_after_evidence: ArtifactRef | None
     diagnosis: str | None
+    # The diagnosis session's structured output without its schema version.
+    patch_intent: Mapping[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "train_before_case_scores", MappingProxyType(dict(self.train_before_case_scores)))
         if self.train_after_case_scores is not None:
             object.__setattr__(self, "train_after_case_scores", MappingProxyType(dict(self.train_after_case_scores)))
+        if self.patch_intent is not None:
+            object.__setattr__(self, "patch_intent", freeze_json_mapping(self.patch_intent))
 
 
 def iteration_feedback_from(value: object) -> IterationFeedback:
@@ -134,7 +145,16 @@ def iteration_feedback_from(value: object) -> IterationFeedback:
         train_before_evidence=_optional_artifact(value.get("train_before_evidence")),
         train_after_evidence=_optional_artifact(value.get("train_after_evidence")),
         diagnosis=_optional_string(value.get("diagnosis")),
+        patch_intent=_optional_mapping(value.get("patch_intent")),
     )
+
+
+def _optional_mapping(value: object) -> Mapping[str, JsonValue] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("Iteration feedback patch_intent must be an object")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +174,7 @@ class DeferredRequest:
 @runtime_checkable
 class AdaptiveTaskSelectionPolicy(Protocol):
     namespace: str
+    prompt_overlay: str
     required_session_kinds: frozenset[str]
 
     def settings_record(self) -> dict[str, JsonValue]: ...

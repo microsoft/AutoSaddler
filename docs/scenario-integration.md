@@ -171,7 +171,10 @@ the optional curriculum kinds and add them to `ScenarioComponents.supported_sess
 
 Build their output contracts with the schema helpers in `autosaddler.v2.prompting.curriculum`,
 because the policy interprets those outputs, and render `build_curriculum_bundle` into the
-workspace when the context's `task_selection.policy` is `activesaddler`. Keep curriculum prompts in
+workspace when the context's `task_selection.prompt_overlay` is `failure_pattern_curriculum`
+(`CURRICULUM_PROMPT_OVERLAY`). Branch on the overlay name, never on the policy name, so another
+policy that declares the same overlay needs no scenario change, and reject overlay names the plugin
+does not implement. Keep curriculum prompts in
 a `curriculum/` plugin directory, exclude it with `prompt_source_entities(..., exclude=("curriculum",))`,
 and record it through `ScenarioComponents.task_selection_resolved_entities` with
 `autosaddler.v2.prompting.curriculum.curriculum_prompt_source_entities`, so runs with passive task

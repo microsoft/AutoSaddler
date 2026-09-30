@@ -4,8 +4,9 @@ import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
-from autosaddler.v2.core.curriculum import CURRICULUM_SESSION_KINDS
+from autosaddler.v2.core.curriculum import CURRICULUM_PROMPT_OVERLAY, CURRICULUM_SESSION_KINDS
 from autosaddler.v2.core.domain import JsonValue, canonical_json, sha256_digest
+from autosaddler.v2.core.scheduling import PROMPT_OVERLAY_KEY, TASK_SELECTION_CONTEXT_KEY
 from autosaddler.v2.prompting.assets import (
     PromptComposition,
     ResolvedPromptAssets,
@@ -30,6 +31,12 @@ _TRAINING_EVIDENCE_PATH = ".autosaddler/training_evidence.json"
 _PROMPT_ASSETS_PATH = ".autosaddler/prompt_assets.json"
 _EVIDENCE_BEFORE_PATH = ".autosaddler/training_evidence_before.json"
 _EVIDENCE_AFTER_PATH = ".autosaddler/training_evidence_after.json"
+# As in ActiveSaddler, history-analysis is supplied to every session.
+_EXTRACTION_SKILLS: Mapping[str, str | None] = {
+    "history-analysis": None,
+    "symptom-extract": None,
+    "symptom-normalize": None,
+}
 _CURRICULUM_METHOD_NAMES = {
     "extract_patterns": "extract-patterns",
     "decide_arm": "decide-arm",
@@ -80,7 +87,8 @@ class MetaAREPromptPack:
         }
         workspace_files.update(build_history_bundle(self.store, context).workspace_files)
         curriculum = _is_curriculum(context)
-        if curriculum:
+        # As in ActiveSaddler, Session 0 (evolve) does not see the failure-pattern registry.
+        if curriculum and kind != "evolve":
             workspace_files.update(build_curriculum_bundle(self.store, context))
 
         if kind == "diagnose_patch":
@@ -118,7 +126,7 @@ class MetaAREPromptPack:
                     for item in _case_records(context.get(key), key)
                 ]
                 schema = pattern_extraction_schema("autosaddler-meta-are-pattern-extraction/v1", failing)
-                skill_paths = {"history-analysis": None, "symptom-extract": None, "symptom-normalize": None}
+                skill_paths = dict(_EXTRACTION_SKILLS)
             elif kind == "decide_arm":
                 schema = arm_decision_schema("autosaddler-meta-are-arm-decision/v1")
                 skill_paths = {"history-analysis": None}
@@ -288,8 +296,8 @@ def _resolved_assets(
         "history-analysis": "methodology/skills/history-analysis/SKILL.md",
         "diagnose": "methodology/skills/causal-diagnosis/SKILL.md",
         "patch-verification": "methodology/skills/verification-baseline/SKILL.md",
-        "symptom-extract": "curriculum_methodology/skills/symptom-extraction/SKILL.md",
-        "symptom-normalize": "curriculum_methodology/skills/symptom-normalization/SKILL.md",
+        "symptom-extract": "curriculum_methodology/skills/symptom-extract/SKILL.md",
+        "symptom-normalize": "curriculum_methodology/skills/symptom-normalize/SKILL.md",
         "progress-scoring": "curriculum_methodology/skills/progress-scoring/SKILL.md",
     }
     if kind in CURRICULUM_SESSION_KINDS:
@@ -307,19 +315,25 @@ def _resolved_assets(
             *(
                 (
                     _shared_asset(
-                        "curriculum_methodology/prompts/curriculum-context.md",
-                        "methodology.prompt.curriculum_context",
+                        f"curriculum_methodology/prompts/{_method_name(kind)}-context.md",
+                        f"methodology.prompt.{kind}.curriculum_context",
                     ),
                 )
                 if curriculum
                 else ()
             ),
         )
+    curriculum_system = (
+        (_shared_asset("curriculum_methodology/system/curriculum-system.md", "methodology.system.curriculum"),)
+        if curriculum or kind in CURRICULUM_SESSION_KINDS
+        else ()
+    )
     return resolve_prompt_composition(
         PromptComposition(
             system_assets=(
                 _shared_asset("methodology/system/optimizer-invariants.md", "methodology.system.invariants"),
                 _plugin_asset("SYSTEM.md", "meta_are.system"),
+                *curriculum_system,
             ),
             task_assets=task_assets,
             skill_assets={
@@ -399,19 +413,22 @@ def meta_are_curriculum_composition_entity() -> Mapping[str, JsonValue]:
                 diagnose_skills["steering"],
                 curriculum=True,
             ),
-            "extract_patterns": _resolved_assets(
-                "extract_patterns",
-                {"history-analysis": None, "symptom-extract": None, "symptom-normalize": None},
-            ),
+            "extract_patterns": _resolved_assets("extract_patterns", _EXTRACTION_SKILLS),
             "decide_arm": _resolved_assets("decide_arm", {"history-analysis": None}),
             "score_arms": _resolved_assets("score_arms", {"history-analysis": None, "progress-scoring": None}),
         },
     )
 
 
+_PROMPT_OVERLAYS = frozenset({CURRICULUM_PROMPT_OVERLAY})
+
+
 def _is_curriculum(context: Mapping[str, JsonValue]) -> bool:
-    value = context.get("task_selection")
-    return isinstance(value, Mapping) and value.get("policy") == "activesaddler"
+    value = context.get(TASK_SELECTION_CONTEXT_KEY)
+    overlay = value.get(PROMPT_OVERLAY_KEY) if isinstance(value, Mapping) else None
+    if overlay is not None and overlay not in _PROMPT_OVERLAYS:
+        raise ValueError(f"Meta-ARE prompt pack has no prompt overlay {overlay!r}")
+    return overlay == CURRICULUM_PROMPT_OVERLAY
 
 
 def _task_selection(context: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
