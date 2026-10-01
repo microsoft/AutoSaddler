@@ -41,7 +41,12 @@ pre-optimization choice.
   `t`. These are the candidates that can be scored and selected by a PULL.
 - **Unseen pool (`U_t`)**: Training scenarios that have never been executed.
   A DRAW samples from this pool to search for failure types not represented by
-  the known arms.
+  the known arms. Once all offline training scenarios have been explored and every arm has since
+  been visited, prior successes that did not instantiate an arm become eligible
+  for exploration again, analogous to additional epochs over seen examples in
+  conventional offline learning: when the pool is empty and every
+  current arm has been pulled since it emptied, executed scenarios that own no
+  arm form the pool of the next draw epoch.
 - **PULL / DRAW**: The curriculum action for one iteration. PULL exploits one
   known arm; DRAW explores unseen scenarios. Agent Session 3.5 records this
   decision before any optional arm scoring.
@@ -86,8 +91,8 @@ selection.
   Session 4 is read-only with respect to the harness; only registry score
   records may change.
 4. **Mini-batch sampling**: The outer loop executes the Session 3.5 decision. A
-  DRAW takes up to the configured batch size from the never-executed scenario
-  pool. A PULL uses the newly recorded Session 4 scores, samples one arm with
+  DRAW takes up to the configured batch size from the unseen pool of the
+  current draw epoch. A PULL uses the newly recorded Session 4 scores, samples one arm with
   floored softmax probability, and selects up to the configured batch size of
   that arm's scenarios. The chosen action, arm, scores, probabilities, and
   scenario IDs are persisted in the sampler trace.
@@ -149,8 +154,9 @@ patch rather than a change in batch composition.
 
 Unlike epoch shuffle, ActiveSaddler does not partition the full training set
 into fixed batches. A DRAW selects up to the configured mini-batch size from
-the persisted, deterministically ordered pool of scenarios that have never been
-executed. A PULL selects exactly one known failure-pattern arm and executes all
+the persisted, deterministically ordered unseen pool of the current draw
+epoch: never-executed scenarios first, then, in each later epoch, the executed
+scenarios that own no arm. A PULL selects exactly one known failure-pattern arm and executes all
 of its scenarios when it owns no more than the configured batch size, or a
 uniform random subset when it owns more. A mini-batch may therefore be smaller
 than the configured size when the unseen pool or selected arm contains fewer

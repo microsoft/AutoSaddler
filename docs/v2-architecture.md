@@ -184,6 +184,14 @@ sequenceDiagram
   receives no training case IDs and the batch is chosen for the prepared harness.
 - **Draw.** Takes the next never-executed cases from a fixed permutation seeded by
   `task_selection.seed`. A cold start with no arm always draws without a decision session.
+- **Draw epochs.** Once all offline training cases have been explored and every arm has since
+  been visited, prior successes that did not instantiate an arm become eligible for exploration
+  again, like additional epochs over seen examples. Concretely, when the current draw pool is
+  empty and every current arm was the pulled arm of some iteration after the pool emptied, a
+  `draw_epoch_opened` state change records the next epoch: the executed cases that own no arm, in
+  a permutation seeded by `seed` and the epoch number. Draws then take that pool, and the epoch
+  number appears in decision context and sampler provenance. With `min_prob: 0`, a rarely pulled
+  arm can postpone the next epoch; set `min_prob > 0` to bound the delay.
 - **Pull.** Samples one arm with probability `softmax(phi / softmax_temperature)` floored at
   `min_prob`, where `phi = (severity + fixability + breadth + (1 - side_effect)) / 4` is the agent's
   score for the current iteration, and evaluates up to `batch_size` of the arm's cases. The random

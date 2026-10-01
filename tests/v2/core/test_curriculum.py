@@ -323,3 +323,163 @@ def test_passive_policies_are_not_adaptive() -> None:
 
     assert not isinstance(FixedTaskSelectionPolicy(batch_size=1), AdaptiveTaskSelectionPolicy)
     assert not isinstance(EpochShuffledTaskSelectionPolicy(batch_size=1, seed=0), AdaptiveTaskSelectionPolicy)
+
+
+class EventLog:
+    """Synthetic event log for draw-epoch tests."""
+
+    def __init__(self) -> None:
+        self.events: list[RunEvent] = []
+
+    def batch(self, iteration: int, case_ids: list[str], *, arm: str | None = None) -> "EventLog":
+        provenance = {"policy": "activesaddler", "action": "arm_pull" if arm else "unseen_draw", "chosen_arm": arm}
+        self.events.append(
+            event(len(self.events) + 1, "BatchSampled", {"iteration": iteration, "case_ids": case_ids, "provenance": provenance})
+        )
+        return self
+
+    def pattern(self, iteration: int, pattern_id: str, *case_ids: str) -> "EventLog":
+        self.events.append(
+            change(
+                len(self.events) + 1,
+                "patterns_extracted",
+                iteration,
+                new_patterns=[{"pattern_id": pattern_id, "key": pattern_id, "label": pattern_id}],
+                tags=[tag(pattern_id, case_id) for case_id in case_ids],
+            )
+        )
+        return self
+
+    def state_change(self, payload: dict) -> "EventLog":
+        self.events.append(
+            event(len(self.events) + 1, "ExtensionStateChanged", {"namespace": CURRICULUM_NAMESPACE, **payload})
+        )
+        return self
+
+
+def _request(iteration: int):
+    from autosaddler.v2.core.scheduling import SelectionRequest
+
+    return SelectionRequest(
+        iteration=iteration,
+        train_cases=CASES,
+        working_parent_id=PARENT,
+        selected_parent_id=PARENT,
+        selection_parent_ids=(PARENT,),
+        component_sources={},
+        selection_rationale="keep the base",
+    )
+
+
+def _epoch_step(log: EventLog, iteration: int):
+    from autosaddler.v2.core.scheduling import StateStep
+
+    step = policy().next_selection_step(log.events, _request(iteration))
+    return step if isinstance(step, StateStep) and step.name == "draw-epoch" else None
+
+
+def test_draw_epoch_stays_closed_while_the_draw_pool_has_cases() -> None:
+    log = EventLog().batch(0, ["c1", "c2"]).pattern(0, "pattern-a", "c1").batch(1, ["c1"], arm="pattern-a")
+
+    assert _epoch_step(log, 2) is None
+    assert CurriculumState.replay(log.events).draw_epoch == 0
+
+
+def test_draw_epoch_waits_until_every_arm_is_pulled_after_the_pool_empties() -> None:
+    log = (
+        EventLog()
+        .batch(0, ["c1", "c2"])
+        .pattern(0, "pattern-a", "c1")
+        .batch(1, ["c1"], arm="pattern-a")
+        .batch(2, ["c3", "c4", "c5"])
+        .pattern(2, "pattern-b", "c3")
+    )
+    # pattern-a was pulled only before the pool emptied at iteration 2; pattern-b never.
+    assert _epoch_step(log, 3) is None
+    log.batch(3, ["c1"], arm="pattern-a")
+    assert _epoch_step(log, 4) is None
+    log.batch(4, ["c3"], arm="pattern-b")
+
+    step = _epoch_step(log, 5)
+
+    assert step is not None
+    payload = step.payload
+    assert payload["change"] == "draw_epoch_opened" and payload["epoch"] == 1 and payload["iteration"] == 5
+    assert payload["previous_epoch_exhausted_iteration"] == 2
+    expected = [case_id for case_id in policy().draw_order(CASES, 1) if case_id in {"c2", "c4", "c5"}]
+    assert payload["case_ids"] == expected
+
+
+def test_new_draw_epoch_takes_arm_free_cases_in_order_and_records_the_epoch() -> None:
+    from autosaddler.v2.core.policies import TaskSelection
+    from autosaddler.v2.core.scheduling import SessionStep
+    from autosaddler.v2.prompting.models import Cost, SessionResult
+
+    log = EventLog().batch(0, ["c1", "c2", "c3", "c4", "c5"]).pattern(0, "pattern-a", "c1").batch(1, ["c1"], arm="pattern-a")
+    step = _epoch_step(log, 2)
+    assert step is not None
+    log.state_change(dict(step.payload))
+    pool = step.payload["case_ids"]
+
+    decide = policy().next_selection_step(log.events, _request(2))
+    assert isinstance(decide, SessionStep) and decide.kind == "decide_arm"
+    assert decide.context["task_selection"]["num_unseen"] == len(pool) == 4
+    assert decide.context["task_selection"]["draw_epoch"] == 1
+    draw = SessionResult(
+        status="completed",
+        structured_output={"action": "draw", "rationale": "Re-explore prior successes."},
+        raw_response="{}",
+        tool_calls=(),
+        usage=(),
+        cost=Cost(sessions=1),
+    )
+    assert decide.validate(draw) is None
+    log.state_change(dict(decide.record(draw)))
+
+    selection = policy().next_selection_step(log.events, _request(2))
+    assert isinstance(selection, TaskSelection)
+    assert list(selection.case_ids) == pool[:2]
+    assert selection.provenance["draw_epoch"] == 1
+    assert selection.provenance["unseen_case_ids"] == pool
+
+
+def test_draw_epochs_repeat_and_skip_when_every_executed_case_owns_an_arm() -> None:
+    log = EventLog().batch(0, ["c1", "c2", "c3", "c4", "c5"]).pattern(0, "pattern-a", "c1").batch(1, ["c1"], arm="pattern-a")
+    first = _epoch_step(log, 2)
+    assert first is not None
+    log.state_change(dict(first.payload)).batch(2, list(first.payload["case_ids"]))
+    log.batch(3, ["c1"], arm="pattern-a")
+
+    second = _epoch_step(log, 4)
+
+    assert second is not None and second.payload["epoch"] == 2
+    assert second.payload["previous_epoch_exhausted_iteration"] == 2
+    assert second.payload["case_ids"] == [case_id for case_id in policy().draw_order(CASES, 2) if case_id != "c1"]
+
+    owned = EventLog().batch(0, ["c1", "c2", "c3", "c4", "c5"]).pattern(0, "pattern-a", "c1", "c2", "c3", "c4", "c5")
+    owned.batch(1, ["c1", "c2"], arm="pattern-a")
+    assert _epoch_step(owned, 2) is None
+
+
+def test_draw_epoch_opens_instead_of_ending_when_no_arm_exists() -> None:
+    log = EventLog().batch(0, ["c1", "c2", "c3", "c4", "c5"])
+
+    step = _epoch_step(log, 1)
+
+    assert step is not None and sorted(step.payload["case_ids"]) == ["c1", "c2", "c3", "c4", "c5"]
+
+
+def test_draw_epoch_does_not_open_after_the_iteration_decision() -> None:
+    log = EventLog().batch(0, ["c1", "c2", "c3", "c4", "c5"]).pattern(0, "pattern-a", "c1").batch(1, ["c1"], arm="pattern-a")
+    log.events.append(change(len(log.events) + 1, "arm_decision", 2, action="arm_pull", requested_action="pull"))
+
+    assert _epoch_step(log, 2) is None
+
+
+def test_draw_epochs_must_open_in_order() -> None:
+    log = EventLog().batch(0, ["c1"]).state_change(
+        {"schema_version": CURRICULUM_SCHEMA_VERSION, "change": "draw_epoch_opened", "iteration": 1, "epoch": 2, "case_ids": ["c1"]}
+    )
+
+    with pytest.raises(ValueError, match="must open in order"):
+        CurriculumState.replay(log.events)

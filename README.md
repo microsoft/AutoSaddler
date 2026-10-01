@@ -155,7 +155,7 @@ Task-selection policies:
 |---|---|---|
 | `fixed` | Rolling window over the training cases | none |
 | `epoch_shuffled` | Non-overlapping batches from a seeded per-epoch shuffle | none |
-| `activesaddler` | Agent-driven failure-pattern bandit curriculum | `softmax_temperature`, `min_prob`, `ema_eta`, `pattern_extraction_timeout_seconds`, `arm_scoring_timeout_seconds` |
+| `activesaddler` | Agent-driven failure-pattern bandit curriculum; after every case was drawn and every arm since pulled, prior successes that own no arm become drawable again (another draw epoch) | `softmax_temperature`, `min_prob`, `ema_eta`, `pattern_extraction_timeout_seconds`, `arm_scoring_timeout_seconds` |
 
 `fixed` and `epoch_shuffled` take no `settings`; a registered factory receives them when it declares a
 `settings` parameter. `activesaddler` is an adaptive task-selection

@@ -22,6 +22,8 @@ This is an exploration-exploitation trade-off in **arm space**:
   then scores every known pattern so the sampler can choose an arm to repair.
 - **DRAW** probes scenarios that have never been executed. This may reveal a
   failure pattern not yet represented by the known arms; Session 4 is skipped.
+  In a later draw epoch (`task_selection.draw_epoch` > 0), DRAW instead
+  re-explores prior successes that did not instantiate an arm.
 
 There is **no fixed formula or threshold** for this decision. Do not decide
 mechanically from `|P_t|`, `|U_t|`, Activity, or any single statistic. Weigh all
@@ -41,6 +43,7 @@ Read `.autosaddler/session_context.json`:
   plan in `selection_parent_ids`, `component_sources`, and `selection_rationale`
 - **Discovered failure patterns**: |P_t| = `task_selection.num_arms`
 - **Unseen scenarios remaining**: |U_t| = `task_selection.num_unseen`
+- **Draw epoch**: `task_selection.draw_epoch` (0 while never-executed scenarios remain)
 
 ## Candidate Failure Patterns (known arms) (Core)
 
@@ -109,7 +112,9 @@ Use all two lenses below. They guide attention but do not form a formula.
 2. **How complete is coverage of the failure surface?**
    Few discovered arms and a large unseen pool suggest that known patterns do
    not yet represent the harness's weaknesses. A small or exhausted unseen pool
-   leaves little discovery value and favors PULL.
+   leaves little discovery value and favors PULL. In a later draw epoch the pool
+   holds scenarios that passed before, so its discovery value comes from
+   regressions or new failures the harness changes since then may have caused.
 
 ### 5. Make and record one decision (Core)
 

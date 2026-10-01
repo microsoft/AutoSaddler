@@ -49,8 +49,10 @@ class OperationScopedFakeEvaluator:
 class CurriculumFakePromptPack:
     """Delegate passive kinds to the fake pack and answer curriculum kinds deterministically."""
 
-    def __init__(self, base: Any) -> None:
+    def __init__(self, base: Any, *, decision: str = "pull") -> None:
         self.base = base
+        # "pull" always pulls; "draw_first" draws while the draw pool has cases.
+        self.decision = decision
 
     def session(self, kind: str, context: Mapping[str, JsonValue]) -> SessionSpec:
         if kind not in CURRICULUM_SESSION_KINDS:
@@ -59,10 +61,13 @@ class CurriculumFakePromptPack:
         if kind == "extract_patterns":
             response, schema = _pattern_extraction(context)
         elif kind == "decide_arm":
+            task_selection = context.get("task_selection")
+            assert isinstance(task_selection, Mapping)
+            draw = self.decision == "draw_first" and task_selection.get("num_unseen", 0) > 0
             response = {
                 "schema_version": "autosaddler-fake-arm-decision/v1",
-                "action": "pull",
-                "rationale": "Revisit the known failure pattern before drawing new cases.",
+                "action": "draw" if draw else "pull",
+                "rationale": "Draw while the pool has cases." if draw else "Revisit the known failure pattern before drawing new cases.",
             }
             schema = arm_decision_schema("autosaddler-fake-arm-decision/v1")
         else:
@@ -139,12 +144,16 @@ def _task_selection_strings(context: Mapping[str, JsonValue], key: str) -> list[
     return [str(item) for item in value]
 
 
-def curriculum_fake_factory(base_factory: Callable[..., ScenarioComponents]) -> Callable[..., ScenarioComponents]:
+def curriculum_fake_factory(
+    base_factory: Callable[..., ScenarioComponents],
+    *,
+    decision: str = "pull",
+) -> Callable[..., ScenarioComponents]:
     def build(**kwargs: Any) -> ScenarioComponents:
         base = base_factory(**kwargs)
         return replace(
             base,
-            prompt_pack=CurriculumFakePromptPack(base.prompt_pack),
+            prompt_pack=CurriculumFakePromptPack(base.prompt_pack, decision=decision),
             evaluator=OperationScopedFakeEvaluator(base.evaluator),
             supported_session_kinds=BASE_SESSION_KINDS | CURRICULUM_SESSION_KINDS,
         )

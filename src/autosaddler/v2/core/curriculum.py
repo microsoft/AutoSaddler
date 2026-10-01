@@ -53,9 +53,17 @@ PatternSource: TypeAlias = Literal["pre_patch", "post_patch"]
 CaseStatus: TypeAlias = Literal["fixed", "regressed", "still_failing", "still_passing"]
 ArmAction: TypeAlias = Literal["pull", "draw"]
 SamplingAction: TypeAlias = Literal["unseen_draw", "arm_pull", "empty"]
-CurriculumChange: TypeAlias = Literal["patterns_extracted", "observations_recorded", "arm_decision", "arm_scores"]
+CurriculumChange: TypeAlias = Literal[
+    "patterns_extracted",
+    "observations_recorded",
+    "arm_decision",
+    "arm_scores",
+    "draw_epoch_opened",
+]
 
-_CHANGES = frozenset({"patterns_extracted", "observations_recorded", "arm_decision", "arm_scores"})
+_CHANGES = frozenset(
+    {"patterns_extracted", "observations_recorded", "arm_decision", "arm_scores", "draw_epoch_opened"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,12 +151,29 @@ class ArmPull:
 
 
 @dataclass(frozen=True, slots=True)
+class SampledBatch:
+    iteration: int
+    case_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DrawEpoch:
+    """A later draw epoch: executed cases that own no arm, re-eligible for draws in this order."""
+
+    epoch: int
+    opened_iteration: int
+    case_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CurriculumState:
     patterns: Mapping[str, FailurePattern] = field(default_factory=dict)
     executed_case_ids: frozenset[str] = frozenset()
     decisions: Mapping[int, Mapping[str, JsonValue]] = field(default_factory=dict)
     pulls: tuple[ArmPull, ...] = ()
     probe_points: frozenset[tuple[str, str]] = frozenset()
+    batches: tuple[SampledBatch, ...] = ()
+    draw_epochs: tuple[DrawEpoch, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "patterns", MappingProxyType(dict(self.patterns)))
@@ -161,15 +186,19 @@ class CurriculumState:
         decisions: dict[int, Mapping[str, JsonValue]] = {}
         pulls: list[ArmPull] = []
         probe_points: set[tuple[str, str]] = set()
+        batches: list[SampledBatch] = []
+        draw_epochs: list[DrawEpoch] = []
         for event in events:
             if event.event_type == "BatchSampled":
                 case_ids = _strings(event.payload.get("case_ids"), "BatchSampled case_ids")
+                iteration = _integer(event.payload.get("iteration"), "BatchSampled iteration")
                 executed.update(case_ids)
+                batches.append(SampledBatch(iteration=iteration, case_ids=case_ids))
                 provenance = event.payload.get("provenance")
                 if isinstance(provenance, Mapping) and isinstance(provenance.get("chosen_arm"), str):
                     pulls.append(
                         ArmPull(
-                            iteration=_integer(event.payload.get("iteration"), "BatchSampled iteration"),
+                            iteration=iteration,
                             pattern_id=cast(str, provenance["chosen_arm"]),
                             case_ids=case_ids,
                         )
@@ -179,21 +208,24 @@ class CurriculumState:
                 if evaluation.split == "train":
                     probe_points.update((case_id, evaluation.candidate_id) for case_id in evaluation.requested_case_ids)
             elif event.event_type == "ExtensionStateChanged" and event.payload.get("namespace") == CURRICULUM_NAMESPACE:
-                _apply_change(event.payload, patterns, decisions)
+                _apply_change(event.payload, patterns, decisions, draw_epochs)
         return cls(
             patterns=patterns,
             executed_case_ids=frozenset(executed),
             decisions=decisions,
             pulls=tuple(pulls),
             probe_points=frozenset(probe_points),
+            batches=tuple(batches),
+            draw_epochs=tuple(draw_epochs),
         )
 
     def applied(self, change: Mapping[str, JsonValue]) -> "CurriculumState":
         """Return the state after one curriculum change payload."""
         patterns = dict(self.patterns)
         decisions = dict(self.decisions)
-        _apply_change(change, patterns, decisions)
-        return replace(self, patterns=patterns, decisions=decisions)
+        draw_epochs = list(self.draw_epochs)
+        _apply_change(change, patterns, decisions, draw_epochs)
+        return replace(self, patterns=patterns, decisions=decisions, draw_epochs=tuple(draw_epochs))
 
     def arms(self, train_case_ids: Sequence[str]) -> dict[str, tuple[str, ...]]:
         """Instantiated arms: patterns owning at least one available training case, in creation order."""
@@ -207,6 +239,56 @@ class CurriculumState:
 
     def unseen_case_ids(self, ordered_case_ids: Sequence[str]) -> tuple[str, ...]:
         return tuple(case_id for case_id in ordered_case_ids if case_id not in self.executed_case_ids)
+
+    @property
+    def draw_epoch(self) -> int:
+        """The current draw epoch: 0 until executed cases become re-eligible for draws."""
+        return self.draw_epochs[-1].epoch if self.draw_epochs else 0
+
+    def draw_pool(self, epoch_zero_order: Sequence[str]) -> tuple[str, ...]:
+        """Cases a draw may still take in the current epoch, in draw order.
+
+        Epoch 0 holds the never-executed training cases. A later epoch holds the cases
+        recorded when it opened that no batch has executed since.
+        """
+        if not self.draw_epochs:
+            return self.unseen_case_ids(epoch_zero_order)
+        current = self.draw_epochs[-1]
+        executed_since = {
+            case_id
+            for batch in self.batches
+            if batch.iteration >= current.opened_iteration
+            for case_id in batch.case_ids
+        }
+        return tuple(case_id for case_id in current.case_ids if case_id not in executed_since)
+
+    def draw_pool_exhausted_iteration(self, epoch_zero_order: Sequence[str]) -> int | None:
+        """Iteration whose batch took the last case of the current draw epoch, if it ended."""
+        if self.draw_epochs:
+            remaining = set(self.draw_epochs[-1].case_ids)
+            start = self.draw_epochs[-1].opened_iteration
+        else:
+            remaining = set(epoch_zero_order)
+            start = 0
+        if not remaining:
+            return None
+        for batch in self.batches:
+            if batch.iteration < start:
+                continue
+            remaining.difference_update(batch.case_ids)
+            if not remaining:
+                return batch.iteration
+        return None
+
+    def pulled_arm_ids_after(self, iteration: int) -> frozenset[str]:
+        return frozenset(pull.pattern_id for pull in self.pulls if pull.iteration > iteration)
+
+    def arm_free_executed_case_ids(self, ordered_case_ids: Sequence[str]) -> tuple[str, ...]:
+        """Executed cases that own no failure pattern, in the given order."""
+        owned = {case_id for pattern in self.patterns.values() for case_id in pattern.case_ids}
+        return tuple(
+            case_id for case_id in ordered_case_ids if case_id in self.executed_case_ids and case_id not in owned
+        )
 
     def arm_score(self, pattern_id: str, iteration: int) -> float:
         """Agent score for exactly ``iteration``; an unrated arm scores zero."""
@@ -402,17 +484,48 @@ class ActiveSaddlerTaskSelectionPolicy:
                     context["pulled_arm_id"] = provenance.get("chosen_arm")
         return context
 
-    def draw_order(self, cases: Sequence[Case]) -> tuple[str, ...]:
+    def draw_order(self, cases: Sequence[Case], epoch: int = 0) -> tuple[str, ...]:
         order = list(_unique_case_ids(cases))
-        random.Random(f"{self.seed}:0").shuffle(order)
+        random.Random(f"{self.seed}:{epoch}").shuffle(order)
         return tuple(order)
+
+    def next_draw_epoch(self, state: CurriculumState, cases: Sequence[Case], iteration: int) -> StatePayload | None:
+        """Open the next draw epoch once the current one is exhausted and every arm was pulled since.
+
+        Executed cases that own no arm, mostly prior successes, become eligible for draws
+        again, like another epoch over seen examples.
+        """
+        epoch_zero_order = self.draw_order(cases)
+        if iteration in state.decisions or state.draw_pool(epoch_zero_order):
+            return None
+        exhausted = state.draw_pool_exhausted_iteration(epoch_zero_order)
+        if exhausted is None:
+            return None
+        arms = state.arms(_unique_case_ids(cases))
+        if not set(arms) <= state.pulled_arm_ids_after(exhausted):
+            return None
+        epoch = state.draw_epoch + 1
+        case_ids = state.arm_free_executed_case_ids(self.draw_order(cases, epoch))
+        if not case_ids:
+            return None
+        return _change(
+            "draw_epoch_opened",
+            iteration,
+            epoch=epoch,
+            case_ids=list(case_ids),
+            previous_epoch_exhausted_iteration=exhausted,
+            num_arms=len(arms),
+        )
 
     def next_selection_step(self, events: Sequence[RunEvent], request: SelectionRequest) -> SelectionStep:
         state = CurriculumState.replay(events)
         iteration = request.iteration
+        opened = self.next_draw_epoch(state, request.train_cases, iteration)
+        if opened is not None:
+            return StateStep(name="draw-epoch", payload=opened)
         case_ids = _unique_case_ids(request.train_cases)
         arms = state.arms(case_ids)
-        unseen = state.unseen_case_ids(self.draw_order(request.train_cases))
+        unseen = state.draw_pool(self.draw_order(request.train_cases))
         decision = state.decisions.get(iteration)
         if decision is None:
             if not arms:
@@ -424,12 +537,13 @@ class ActiveSaddlerTaskSelectionPolicy:
                         arms=arms,
                         unseen=unseen,
                         rationale="No failure-pattern arm exists yet; draw unseen training cases.",
+                        draw_epoch=state.draw_epoch,
                     ),
                 )
             return SessionStep(
                 name="decide-arm",
                 kind="decide_arm",
-                context=self._session_context(request, arms, unseen),
+                context=self._session_context(request, arms, unseen, state.draw_epoch),
                 stage="proposal.arm_decision",
                 validate=_arm_decision_failure_reason,
                 record=lambda result: self._decision(
@@ -438,6 +552,7 @@ class ActiveSaddlerTaskSelectionPolicy:
                     arms=arms,
                     unseen=unseen,
                     rationale=_output_string(result, "rationale"),
+                    draw_epoch=state.draw_epoch,
                 ),
                 # ActiveSaddler treats a missing or failed decision as an arm pull.
                 record_exhausted=lambda error: self._decision(
@@ -447,6 +562,7 @@ class ActiveSaddlerTaskSelectionPolicy:
                     unseen=unseen,
                     rationale="Arm decision session failed; defaulting to an arm pull.",
                     fallback_reason=error,
+                    draw_epoch=state.draw_epoch,
                 ),
             )
         action = decision.get("action")
@@ -459,7 +575,7 @@ class ActiveSaddlerTaskSelectionPolicy:
             return SessionStep(
                 name="score-arms",
                 kind="score_arms",
-                context=self._session_context(request, arms, unseen),
+                context=self._session_context(request, arms, unseen, state.draw_epoch),
                 stage="proposal.arm_scoring",
                 validate=lambda result: _arm_scoring_failure_reason(result, arm_ids),
                 record=lambda result: _change(
@@ -490,13 +606,13 @@ class ActiveSaddlerTaskSelectionPolicy:
             raise ValueError("Iteration cannot be negative")
         case_ids = _unique_case_ids(cases)
         arms = state.arms(case_ids)
-        unseen = state.unseen_case_ids(self.draw_order(cases))
+        unseen = state.draw_pool(self.draw_order(cases))
         scores = {pattern_id: state.arm_score(pattern_id, iteration) for pattern_id in arms}
         probabilities: dict[str, float] = {}
         chosen_arm: str | None = None
         if action == "unseen_draw":
             if not unseen:
-                raise ValueError("An unseen draw requires never-executed training cases")
+                raise ValueError("An unseen draw requires cases in the current draw pool")
             selected = unseen[: self.batch_size]
         elif action == "arm_pull":
             if not arms:
@@ -549,6 +665,7 @@ class ActiveSaddlerTaskSelectionPolicy:
                 "n_probes": len(state.probe_points),
                 "num_unseen_before": len(unseen),
                 "unseen_case_ids": list(unseen),
+                "draw_epoch": state.draw_epoch,
                 "arms": cast(JsonValue, arm_records),
             },
         )
@@ -680,6 +797,7 @@ class ActiveSaddlerTaskSelectionPolicy:
         arms: Mapping[str, tuple[str, ...]],
         unseen: Sequence[str],
         rationale: str,
+        draw_epoch: int,
         fallback_reason: str | None = None,
     ) -> StatePayload:
         return _change(
@@ -691,6 +809,7 @@ class ActiveSaddlerTaskSelectionPolicy:
             fallback_reason=fallback_reason,
             num_arms=len(arms),
             num_unseen=len(unseen),
+            draw_epoch=draw_epoch,
         )
 
     def _session_context(
@@ -698,6 +817,7 @@ class ActiveSaddlerTaskSelectionPolicy:
         request: SelectionRequest,
         arms: Mapping[str, tuple[str, ...]],
         unseen: Sequence[str],
+        draw_epoch: int,
     ) -> dict[str, JsonValue]:
         return {
             "iteration": request.iteration,
@@ -711,6 +831,7 @@ class ActiveSaddlerTaskSelectionPolicy:
                 "arm_ids": list(arms),
                 "num_arms": len(arms),
                 "num_unseen": len(unseen),
+                "draw_epoch": draw_epoch,
             },
         }
 
@@ -803,6 +924,7 @@ def _apply_change(
     payload: Mapping[str, JsonValue],
     patterns: dict[str, FailurePattern],
     decisions: dict[int, Mapping[str, JsonValue]],
+    draw_epochs: list[DrawEpoch],
 ) -> None:
     if payload.get("schema_version") != CURRICULUM_SCHEMA_VERSION:
         raise ValueError(f"Unknown curriculum schema: {payload.get('schema_version')}")
@@ -855,6 +977,13 @@ def _apply_change(
             patterns[pattern_id] = replace(pattern, observations=(*pattern.observations, observation))
     elif change == "arm_decision":
         decisions[iteration] = dict(payload)
+    elif change == "draw_epoch_opened":
+        epoch = _integer(payload.get("epoch"), "draw epoch")
+        if epoch != (draw_epochs[-1].epoch if draw_epochs else 0) + 1:
+            raise ValueError(f"Draw epochs must open in order, got {epoch}")
+        draw_epochs.append(
+            DrawEpoch(epoch=epoch, opened_iteration=iteration, case_ids=_strings(payload.get("case_ids"), "draw epoch case_ids"))
+        )
     else:
         for raw in _objects(payload.get("scores"), "scores"):
             pattern_id = _string(raw.get("pattern_id"), "score pattern_id")

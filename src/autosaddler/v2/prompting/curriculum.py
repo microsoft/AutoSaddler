@@ -188,6 +188,10 @@ def build_curriculum_bundle(store: LocalRunStore, context: Mapping[str, JsonValu
         {
             "schema_version": "autosaddler-curriculum-decisions/v1",
             "decisions": [dict(state.decisions[key]) for key in sorted(state.decisions)],
+            "draw_epochs": [
+                {"epoch": item.epoch, "opened_iteration": item.opened_iteration, "case_ids": list(item.case_ids)}
+                for item in state.draw_epochs
+            ],
         }
     )
     files[f"{CURRICULUM_ROOT}/manifest.json"] = _json(
@@ -197,6 +201,7 @@ def build_curriculum_bundle(store: LocalRunStore, context: Mapping[str, JsonValu
             "settings": to_json_value(curriculum),
             "num_patterns": len(state.patterns),
             "num_executed_cases": len(state.executed_case_ids),
+            "draw_epoch": state.draw_epoch,
             "num_probe_points": len(state.probe_points),
             "entry_points": {"patterns": patterns_path, "decisions": decisions_path, "cases": cases_path},
             "files": sorted(files),
@@ -259,6 +264,7 @@ def _case_history(
         evaluations.append(
             {
                 "iteration": iteration,
+                "draw_epoch": sum(1 for item in state.draw_epochs if item.opened_iteration <= iteration),
                 "sampling_action": record.get("sampling_action"),
                 "pulled_arm_id": record.get("pulled_arm_id"),
                 "outcome": record.get("outcome"),

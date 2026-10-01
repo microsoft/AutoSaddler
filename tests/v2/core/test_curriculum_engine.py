@@ -252,3 +252,80 @@ def test_runtime_rejects_scenarios_without_curriculum_session_kinds(
 def test_builtin_fake_scenario_does_not_declare_curriculum_kinds(tmp_path: Path, activesaddler_config) -> None:
     with pytest.raises(ValueError, match="does not support session kinds"):
         build_runtime(write_config(tmp_path, activesaddler_config(tmp_path)), run_id="builtin")
+
+
+def _draw_epoch_runtime(root: Path, activesaddler_config, *, transition_hook=None):
+    from autosaddler.v2.config.registry import default_registry
+    from conftest import curriculum_fake_factory
+
+    registry = default_registry()
+    registry.scenarios["fake"] = curriculum_fake_factory(registry.scenarios["fake"], decision="draw_first")
+    registry.providers["fake"] = lambda *, ledger, settings: ScriptedCurriculumProvider(ledger, latest_parent=True)
+    # Default session retries, so an attempt interrupted mid-session is retried on resume.
+    value = activesaddler_config(root, max_iterations=5)
+    return build_runtime(write_config(root, value), run_id="epochs", registry=registry, transition_hook=transition_hook)
+
+
+def test_prior_successes_become_drawable_in_a_new_draw_epoch(tmp_path: Path, activesaddler_config) -> None:
+    runtime = _draw_epoch_runtime(tmp_path, activesaddler_config)
+
+    runtime.engine.run()
+    store = runtime.store
+
+    batches = [event.payload for event in store.events_of_type("BatchSampled")]
+    assert [(batch["provenance"]["action"], batch["provenance"]["draw_epoch"]) for batch in batches] == [
+        ("unseen_draw", 0),
+        ("unseen_draw", 0),
+        ("arm_pull", 0),
+        ("unseen_draw", 1),
+        ("arm_pull", 1),
+    ]
+    (opened,) = [change for change in curriculum_changes(store) if change["change"] == "draw_epoch_opened"]
+    assert opened["iteration"] == 3 and opened["epoch"] == 1
+    assert opened["previous_epoch_exhausted_iteration"] == 1
+    # The second draw passed and owns no arm, so its cases are the re-eligible prior successes.
+    assert sorted(opened["case_ids"]) == sorted(batches[1]["case_ids"])
+    assert batches[3]["case_ids"] == opened["case_ids"]
+    state = CurriculumState.replay(store.events())
+    assert state.draw_epoch == 1 and not set(opened["case_ids"]) & {
+        case_id for pattern in state.patterns.values() for case_id in pattern.case_ids
+    }
+
+    from autosaddler.v2.prompting.curriculum import CURRICULUM_ROOT, build_curriculum_bundle
+
+    files = build_curriculum_bundle(store, {"iteration": 5, "task_selection": {"ema_eta": 0.9}})
+    assert json.loads(files[f"{CURRICULUM_ROOT}/manifest.json"])["draw_epoch"] == 1
+    (recorded,) = json.loads(files[f"{CURRICULUM_ROOT}/decisions.json"])["draw_epochs"]
+    assert recorded == {"epoch": 1, "opened_iteration": 3, "case_ids": opened["case_ids"]}
+
+
+def test_draw_epoch_transition_resumes_without_duplicate_work(tmp_path: Path, activesaddler_config) -> None:
+    class Interrupt(RuntimeError):
+        pass
+
+    baseline = _draw_epoch_runtime(tmp_path / "baseline", activesaddler_config)
+    baseline_result = baseline.engine.run()
+    baseline_sessions = sum(entry["kind"] == "session" for entry in baseline.ledger.entries())
+    baseline_changes = curriculum_changes(baseline.store)
+    (opened,) = [
+        event
+        for event in baseline.store.events_of_type("ExtensionStateChanged")
+        if event.payload.get("change") == "draw_epoch_opened"
+    ]
+
+    for target in (opened.sequence - 1, opened.sequence, opened.sequence + 1):
+        count = 0
+
+        def hook(_event, target=target) -> None:
+            nonlocal count
+            count += 1
+            if count == target:
+                raise Interrupt(target)
+
+        root = tmp_path / f"fault-{target}"
+        with pytest.raises(Interrupt):
+            _draw_epoch_runtime(root, activesaddler_config, transition_hook=hook).engine.run()
+        resumed = _draw_epoch_runtime(root, activesaddler_config)
+        assert resumed.engine.run() == baseline_result
+        assert sum(entry["kind"] == "session" for entry in resumed.ledger.entries()) == baseline_sessions
+        assert curriculum_changes(resumed.store) == baseline_changes
