@@ -6,7 +6,7 @@ repairable harness weaknesses instantiated online from diagnosed failures. At ea
 either explores unseen training scenarios or revisits a known arm, so the curriculum co-evolves with
 the harness. AutoSaddler V2 incorporates it as the `activesaddler` task-selection policy.
 
-🌐 **[Project website](https://autosaddler-projectpage.github.io/activesaddler/)**
+📄 **[Paper](https://arxiv.org/abs/2610.00906)** · 🌐 **[Project website](https://autosaddler-projectpage.github.io/activesaddler/)**
 
 <p align="center">
   <img src="../figures/ActiveSaddler_Overall_Framework.jpg" width="100%" alt="ActiveSaddler overview"/>
