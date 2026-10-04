@@ -1,178 +1,56 @@
-# 🛠️ AutoSaddler: Automatic Harness Optimization with Durable Updates from Agent Execution Traces
+# ActiveSaddler: Automated Curriculum Learning for Agent Harness Optimization
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.12-3.14](https://img.shields.io/badge/Python-3.12--3.14-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
-[![arXiv: 2608.23041](https://img.shields.io/badge/arXiv-2608.23041-b31b1b.svg?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.23041)
-[![NeurIPS 2026](https://img.shields.io/badge/NeurIPS-2026-68448B.svg)](https://neurips.cc/Conferences/2026)
+**ActiveSaddler** is an automated curriculum for budgeted offline harness optimization. It treats
+scenario selection as a non-stationary bandit whose arms are **failure patterns**: recurring,
+repairable harness weaknesses instantiated online from diagnosed failures. At each iteration it
+either explores unseen training scenarios or revisits a known arm, so the curriculum co-evolves with
+the harness. This branch incorporates it into [AutoSaddler](https://github.com/microsoft/AutoSaddler)
+V2 as the `activesaddler` task-selection policy.
 
-**AutoSaddler automatically improves LLM-agent harnesses by diagnosing execution traces, applying structured updates to prompts, tools, and middleware, and selecting changes that generalize.**
-
-📄 **[Paper](https://arxiv.org/abs/2608.23041)** · 🌐 **[Project website](https://autosaddler-projectpage.github.io/)** · 🎥 **[Short video](https://autosaddler-projectpage.github.io/#video)**
+📄 **[Paper](https://arxiv.org/abs/2610.00906)** · 🌐 **[Project website](https://autosaddler-projectpage.github.io/activesaddler/)**
 
 <p align="center">
-  <img src="figures/AutoSaddler_Overall_Framework.jpg" width="100%" alt="AutoSaddler Overall Framework"/>
+  <img src="figures/ActiveSaddler_Overall_Framework.jpg" width="100%" alt="ActiveSaddler overview"/>
 </p>
 
-Preliminary results report the following test Pass@1 scores across benchmarks and agent harnesses:
+| Component | Role | Session |
+|---|---|---|
+| Exploration Controller | Decides whether to explore unseen scenarios (DRAW) or revisit a known arm (PULL) | `decide_arm` |
+| Arm Prioritizer | Scores each arm's learning progress from severity, fixability, breadth, and side-effect risk, then samples an arm by softmax | `score_arms` |
+| Failure-Pattern Extractor | Abstracts failures into symptoms and links them to existing arms or new ones | `extract_patterns` |
 
-| Benchmark | Base agent harness | Base Pass@1 | AutoSaddler Pass@1 | Improvement |
-|---|---|---:|---:|---:|
-| GAIA2 | Default ReAct agent | 53.0 | **62.0** | **+9.0 pp** |
-| SWE-Bench Pro | SWE-agent | 37.3 | **46.9** | **+9.6 pp** |
-| Terminal-Bench 2.0 | Terminus 2 | 40.0 | **50.0** | **+10.0 pp** |
+## Results
 
-Papers with Code lists these results as dedicated AutoSaddler held-out test tracks:
+Test Pass@1 (mean ± std. over three test-time executions), with the same `gpt-5.5` models and the
+same rollout budget (1,400 rollouts on GAIA2, 490 on Terminal-Bench 2.0):
 
-[![Papers with Code: GAIA2 AutoSaddler held-out universes](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge.svg?eval=28328&live=1)](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge-link?eval=28328)
-[![Papers with Code: SWE-Bench Pro AutoSaddler held-out repositories](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge.svg?eval=28329&live=1)](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge-link?eval=28329)
-[![Papers with Code: Terminal-Bench 2.0 AutoSaddler 40-task test split](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge.svg?eval=28330&live=1)](https://paperswithcode.co/api/v1/papers/2608.23041/leaderboard-badge-link?eval=28330)
+| Harness | Type | GAIA2 Test (300) | Terminal-Bench 2.0 Test (40) |
+| :--- | :---: | :---: | :---: |
+| Default Agent / Terminus 2 | Manual | 53.6 ± 1.1 | 64.2 ± 2.9 |
+| Terminus-KIRA | Manual | – | 69.2 ± 3.8 |
+| GEPA | Optimizer | 54.2 ± 2.2 | 65.8 ± 5.2 |
+| Meta-Harness | Optimizer | 54.2 ± 1.2 | 66.7 ± 5.2 |
+| AutoSaddler | Optimizer | 55.4 ± 1.2 | 72.5 ± 0.0 |
+| AutoSaddler w/ Category Acc. Order | Fixed curriculum | 55.9 ± 1.3 | 70.8 ± 1.4 |
+| AutoSaddler w/ Scenario Acc. Order | Fixed curriculum | 55.7 ± 1.2 | 73.3 ± 1.4 |
+| **ActiveSaddler** | **Adaptive curriculum** | **59.8 ± 1.0** | **80.0 ± 2.5** |
 
-See the [paper](https://arxiv.org/abs/2608.23041) and
-[interactive project website](https://autosaddler-projectpage.github.io/) for per-model results,
-ablations, compute-efficiency plots, and optimization trajectories.
+ActiveSaddler improves test Pass@1 by **+4.4** and **+7.5** percentage points over the same harness
+optimizer (AutoSaddler) with a scenario order fixed before optimization. This repository includes
+the GAIA2 integration through Meta-ARE.
 
-## ✨ Highlights
+## Setup
 
-- **Full-harness optimization:** searches over prompts, tool definitions and implementations, middleware hooks, and agent-loop logic.
-- **In-depth diagnosis:** deeply debugs execution traces and the harness codebase to identify root causes rather than relying on shallow reflection.
-- **Structured intervention:** targets prompts, tools, and middleware through an explicit patch taxonomy and phased Capability-to-Steering schedule instead of unconstrained editing.
-- **Generalization-aware selection:** validates updates beyond the motivating trajectories and uses reflection with an evolution DAG (EvoDAG) to retain broadly useful lessons.
-- **Durable execution:** records append-only events, immutable provenance, resumable state, and content-addressed candidates.
-
-## 📣 News
-
-- **2026-10-01:** Incorporated [ActiveSaddler](docs/activesaddler.md), an automated curriculum that adapts which training scenarios drive harness optimization, as the V2 `activesaddler` task-selection policy.
-- **2026-09-25:** 🎉 The AutoSaddler paper was accepted to [NeurIPS 2026](https://neurips.cc/Conferences/2026) as a poster!
-- **2026-08-25:** Added V2 support for optimizing the [Meta-ARE](https://github.com/pshlego/Meta-ARE) harness on GAIA2.
-- **2026-08-24:** The AutoSaddler paper was released as [arXiv v1](https://arxiv.org/abs/2608.23041), together with the [project website and short video](https://autosaddler-projectpage.github.io/).
-
-## 🛠️ Installation
-
-AutoSaddler requires Python 3.12-3.14, [uv](https://docs.astral.sh/uv/), and Git.
+Install the repository with [uv](https://docs.astral.sh/uv/) (Python 3.12-3.14):
 
 ```bash
-git clone https://github.com/microsoft/AutoSaddler.git
+git clone -b feat/activesaddler https://github.com/microsoft/AutoSaddler.git
 cd AutoSaddler
-uv sync --extra dev
+uv sync --extra dev --extra meta-are-setup
 ```
 
-Run Python commands in this repository through `uv run`.
-
-## 🚀 Quick Start
-
-Run the deterministic, credential-free V2 template to exercise the optimization engine, event store,
-candidate evolution, and output projections:
-
-```bash
-uv run python -m autosaddler.v2.cli \
-  --config configs/v2/local_template.yaml \
-  --run-id local-template
-```
-
-Repeating the command resumes the same run after validating its resolved inputs.
-
-## 🧭 Versions
-
-- **V2 (current):** the durable, plugin-based implementation documented in this README. New users and integrations should start here.
-- **V1 (legacy):** the research-quality implementation used for the experiments in the arXiv paper, retained for paper reproduction and reference. See the [V1 README](src/autosaddler/v1/README.md).
-
-## 🗂️ Repository Structure
-
-```text
-AutoSaddler/
-├── configs/                 # V1/V2 configs and benchmark split manifests
-├── docs/                    # Architecture, scenario-integration, and provider guides
-├── figures/                 # README and paper figures
-├── scripts/                 # Data provisioning and legacy launch scripts
-├── src/autosaddler/v1/      # Legacy implementation
-├── src/autosaddler/v2/      # Current engine, plugins, providers, and storage
-└── tests/                   # Characterization and focused V2 tests
-```
-
-Start with the [V2 architecture guide](docs/v2-architecture.md) for the current implementation.
-
-## 🧩 How It Works
-
-AutoSaddler formulates harness optimization as offline mini-batch learning. It uses three session
-types across the optimization lifecycle:
-
-1. **Diagnosis-Patch:** inspects failed traces and the harness codebase, then proposes structured
-   Capability patches (code or infrastructure) and Steering patches (textual behavior changes).
-2. **Reflection:** compares pre- and post-patch traces, classifies fixed, regressed, still-failing,
-   and still-passing cases, and records reusable lessons.
-3. **Evolution:** consults the full EvoDAG to synthesize candidates from successful components and
-   lessons across lineages.
-
-Candidate updates are verified on sampled training cases and gated on the development split. When
-its rollout budget is exhausted, AutoSaddler returns the highest-ranked development candidate. See
-the [V2 architecture guide](docs/v2-architecture.md) for the event lifecycle and invariants.
-
-## 🎯 Supported Harnesses and Benchmarks
-
-The current repository includes:
-
-| Harness | Harness space | Benchmark | Purpose |
-|---|---|---|---|
-| Deterministic fake harness (`fake`) | Structured component map | Synthetic cases | Local development and tests |
-| Meta-ARE Default ReAct Agent (`meta_are`) | Git repository | GAIA2 | End-to-end smoke experiments |
-
-V2 supports immutable, content-addressed component-map and Git candidate spaces. Optimizer sessions
-can use the built-in fake provider, Anthropic Claude Agent SDK, GitHub Copilot SDK, or Codex CLI transport.
-
-> [!WARNING]
-> The Codex provider relies on CLI-based execution and therefore introduces subprocess usage. See the [Codex provider guide](docs/codex-provider.md).
-
-Integrations for additional harnesses (e.g., **OpenClaw** and **Codex**) and benchmarks (e.g., **Terminal-Bench**) are coming. Stay tuned!
-
-## ⚙️ Configuration
-
-Every V2 config starts with `schema_version: autosaddler/v2`.
-A **scenario plugin** is the adapter between AutoSaddler's generic optimization engine and a
-specific harness/benchmark pair. It supplies the harness space, cases, evaluator, evidence,
-prompts, capabilities, and reproducibility metadata. A config selects that plugin and declares four
-explicit ownership areas:
-
-| Section | Responsibility |
-|---|---|
-| `scenario` | Plugin type, immutable sources, datasets, evaluator, and mutable harness surface |
-| `optimization` | Task selection, acceptance, development gate, ranking, budget, retries, and timeouts |
-| `provider` | Optimizer provider, capabilities, model, endpoint, and provider-specific settings |
-| `storage` | Durable run root |
-
-Included configurations:
-
-| Path | Purpose |
-|---|---|
-| `configs/v2/local_template.yaml` | Credential-free deterministic V2 template |
-| `configs/v2/codex_local_smoke.yaml` | Real Codex optimizer with the deterministic local evaluator |
-| `configs/v2/meta_are_smoke.yaml` | Current Meta-ARE/GAIA2 smoke integration |
-| `configs/v1/meta_are.yaml` | Legacy full Meta-ARE/GAIA2 run |
-| `configs/v1/meta_are_smoke.yaml` | Legacy bounded smoke run |
-| `configs/datasets/GAIA2/` | Shared train, development, and test split manifests |
-
-Configuration is strict and fail-closed. A run ID can be reused only when all resolved inputs are
-byte-identical; changed source revisions, manifests, settings, or provenance are rejected.
-
-## 🔬 Reproducing the Included GAIA2 Smoke Run
-
-The checked-in V2 smoke config exercises the real optimization pipeline on seven GAIA2 scenarios:
-six training cases and one development case, for two optimization iterations. It is a bounded
-integration run rather than the full paper experiment, may take several hours, and incurs provider
-charges.
-
-### 1. Prepare the repositories
-
-Use this sibling layout:
-
-```text
-<parent>/
-|-- AutoSaddler/
-|-- Meta-ARE/
-|-- meta_are_data/
-`-- working_dir/
-```
-
-Clone the adapted Meta-ARE repository at the revision pinned by the config:
+Clone the adapted Meta-ARE repository next to it, then provision the GAIA2 scenarios and the demo
+filesystem:
 
 ```bash
 cd ..
@@ -180,138 +58,76 @@ git clone https://github.com/pshlego/Meta-ARE.git Meta-ARE
 git -C Meta-ARE checkout --detach 395d1dd512add1e3aeb5a6a092490768b51e3ce5
 mkdir -p working_dir
 cd AutoSaddler
-uv sync --extra meta-are-setup
-```
 
-### 2. Provision the benchmark inputs
-
-Provision the seven manifest-selected GAIA2 payloads from the pinned Hugging Face revision.
-`HF_TOKEN` is optional for this public dataset but avoids anonymous rate limits:
-
-```bash
+# Smoke split (6 train, 1 dev)
 uv run --extra meta-are-setup python scripts/meta_are/provision_gaia2_scenarios.py \
   --destination-root "$PWD/../Meta-ARE/datasets_local/gaia2_smoke" \
   --revision 78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99
-```
-
-The command must report `"file_count": 7`. Then provision the approximately 260 MB demo
-filesystem:
-
-```bash
+# Full split (75 train, 65 dev)
+uv run --extra meta-are-setup python scripts/meta_are/provision_gaia2_scenarios.py \
+  --destination-root "$PWD/../Meta-ARE/datasets_local/gaia2" \
+  --revision 78ea3bdbdeec2bdcd6afa5420915d8a22f23ed99 \
+  --manifest configs/datasets/GAIA2/train.json \
+  --manifest configs/datasets/GAIA2/val.json
+# Demo filesystem shared by both splits
 uv run --extra meta-are-setup python scripts/meta_are/provision_demo_filesystem.py \
   --destination-root "$PWD/../meta_are_data/gaia2_filesystem" \
   --revision 132e26376f5e963bb59f64bcccdd02188cb08dee \
   --meta-are-project ../Meta-ARE
 ```
 
-Both commands are idempotent, record source revisions and content digests, and reject mismatched
-local files. Evaluation runs with Hugging Face clients forced offline.
+## Run
 
-### 3. Configure providers and run
+Two task-selection policies are provided:
 
-The smoke config uses OpenAI `gpt-4.1-mini` for the task agent and judge, and Anthropic
-`claude-opus-4-6` for optimization:
+| Strategy | Mini-batch sampling | Full profile | Smoke profile |
+|---|---|---|---|
+| `activesaddler` (ours) | Adaptive curriculum over failure-pattern arms | `configs/v2/meta_are_activesaddler_full.yaml` | `configs/v2/meta_are_activesaddler_smoke.yaml` |
+| `epoch_shuffled` (AutoSaddler baseline) | Fixed epoch-shuffled mini-batches | `configs/v2/meta_are_full.yaml` | `configs/v2/meta_are_smoke.yaml` |
+
+The smoke profiles use OpenAI `gpt-4.1-mini` for the task agent and judge and Anthropic
+`claude-opus-4-6` for the optimizer; the full profiles use OpenAI `gpt-5.5` for all three. Export
+the matching keys, then run from `working_dir` with a new run ID:
 
 ```bash
 export OPENAI_API_KEY="..."
-export ANTHROPIC_API_KEY="..."
-```
+export ANTHROPIC_API_KEY="..."   # smoke profiles only
 
-Run from the external working directory so generated workspaces cannot inherit repository-level
-agent instructions through Git ancestry. Use a new run ID for every independent run:
-
-```bash
 cd ../working_dir
-RUN_ID="meta-are-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
-printf 'run_id=%s\n' "$RUN_ID"
-uv run --project ../AutoSaddler \
-  python -m autosaddler.v2.cli \
-  --config ../AutoSaddler/configs/v2/meta_are_smoke.yaml \
+RUN_ID="activesaddler-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+uv run --project ../AutoSaddler python -m autosaddler.v2.cli \
+  --config ../AutoSaddler/configs/v2/meta_are_activesaddler_smoke.yaml \
   --run-id "$RUN_ID"
 ```
 
-Runs are written under `working_dir/outputs/v2_meta_are/runs/<run-id>/`. Success writes
-`result.json` with `"iterations": 2` and prints the selected candidate and development score.
+Use another profile from the table for the full run or the baseline. Each run is written under the
+config's `storage.run_root`, for example
+`working_dir/outputs/v2_meta_are_activesaddler/runs/<run-id>/`. `result.json` holds the selected
+harness and its development score, and `strategy/curriculum.json` records the curriculum: failure
+patterns, PULL/DRAW decisions, and arm scores. To resume an interrupted run, repeat the same command
+with the same run ID.
 
-### Run artifacts and resumption
+## Configuration
 
-A run is self-contained and can include:
+Switching between ActiveSaddler and the AutoSaddler baseline changes only
+`optimization.task_selection`:
 
-```text
-<run-root>/<run-id>/
-├── events.jsonl
-├── manifest.json
-├── snapshot.json
-├── evolution_dag.json
-├── metrics.jsonl
-├── metrics-summary.json
-├── result.json
-├── resolved/
-├── candidates/
-├── evaluations/
-├── sessions/
-├── mutation-deltas/  # Git harnesses only
-└── workspaces/
+```yaml
+optimization:
+  task_selection:
+    type: activesaddler        # epoch_shuffled for the AutoSaddler baseline
+    batch_size: 3
+    seed: 42
+    settings:                  # activesaddler only
+      softmax_temperature: 0.15                # arm-selection temperature (> 0)
+      min_prob: 0.0                            # per-arm probability floor in [0, 1)
+      ema_eta: 0.9                             # failure-activity EMA shown to the agent only
+      pattern_extraction_timeout_seconds: 3600 # extract_patterns session timeout
+      arm_scoring_timeout_seconds: 3600        # decide_arm and score_arms session timeout
 ```
 
-`events.jsonl` is authoritative. To resume after an interruption, confirm no process is using the
-run ID and repeat the same command with the same inputs. Never run two processes against one run ID.
-Review `sessions/` and `evaluations/` before sharing a run because traces may contain prompts,
-responses, tool arguments, working directories, repository metadata, or other sensitive data.
+See the [V2 architecture guide](docs/v2-architecture.md) for how the curriculum plugs into
+AutoSaddler V2, and the [AutoSaddler README](https://github.com/microsoft/AutoSaddler/blob/main/README.md)
+for the rest of the framework.
 
-To branch a validated nonterminal checkpoint into a new run:
-
-```bash
-uv run python -m autosaddler.v2.cli \
-  --config CONFIG.yaml \
-  --run-id NEW_RUN_ID \
-  --fork-from-run-id SOURCE_RUN_ID \
-  --fork-through-sequence LAST_EVENT_SEQUENCE
-```
-
-Only `optimization.budget.max_iterations` may differ when initializing a fork. Legacy checkpoints
-cannot be imported.
-
-## 🔌 Adding a Harness or Benchmark
-
-A V2 scenario plugin owns the integration boundary: harness space, evaluator, evidence builder,
-prompt pack, disjoint train and development cases, provider capabilities, and resolved provenance.
-
-Built-in integrations live under `src/autosaddler/v2/plugins/`. An external package can register a
-plugin through the `autosaddler.scenarios` entry-point group without adding scenario-specific code
-to this repository. AutoSaddler rejects duplicate names, API-version mismatches, malformed
-descriptors, and plugin load failures.
-
-Follow the [scenario integration guide](docs/scenario-integration.md) for the ownership checklist,
-package layout, registration contract, tests, and smoke-config requirements. Use
-`src/autosaddler/v2/plugins/fake.py` as the smallest deterministic example and
-`src/autosaddler/v2/plugins/meta_are/` as a production Git-harness example.
-You are encouraged to use a coding agent to conduct the scenario integration by following the
-integration guide.
-
-## 🧰 Development and Project Policies
-
-```bash
-uv sync --extra dev
-uv run ruff check src/autosaddler tests/
-uv run python -m pytest tests/ -v --tb=short
-uv build
-```
-
-Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). This project follows the
-[Microsoft Open Source Code of Conduct](CODE_OF_CONDUCT.md), publishes its
-[security reporting policy](SECURITY.md), and is available under the [MIT License](LICENSE).
-
-## 📝 Citation
-
-```bibtex
-@misc{park2026autosaddlerautomaticharnessoptimization,
-  title={AutoSaddler: Automatic Harness Optimization with Durable Updates from Agent Execution Traces},
-  author={Sungho Park and Wonjoong Kim and Rongyuan Tan and Jue Zhang and Wook-Shin Han and Pengfei Gao and Chanyoung Park and Yongqiang Yao and Rao Fu and Elsie Nallipogu and Qingwei Lin and Saravan Rajmohan and Dongmei Zhang},
-  year={2026},
-  eprint={2608.23041},
-  archivePrefix={arXiv},
-  primaryClass={cs.AI},
-  url={https://arxiv.org/abs/2608.23041},
-}
-```
+This project is available under the [MIT License](LICENSE).
