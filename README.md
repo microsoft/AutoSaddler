@@ -130,4 +130,18 @@ See the [V2 architecture guide](docs/v2-architecture.md) for how the curriculum 
 AutoSaddler V2, and the [AutoSaddler README](https://github.com/microsoft/AutoSaddler/blob/main/README.md)
 for the rest of the framework.
 
+## Citation
+
+```bibtex
+@misc{park2026activesaddlerautomatedcurriculumlearning,
+      title={ActiveSaddler: Automated Curriculum Learning for Agent Harness Optimization}, 
+      author={Sungho Park and Wonjoong Kim and Jue Zhang and Wook-Shin Han and Pengfei Gao and Chanyoung Park and Yongqiang Yao and Rao Fu and Elsie Nallipogu and Qingwei Lin and Victor Rühle},
+      year={2026},
+      eprint={2610.00906},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2610.00906}, 
+}
+```
+
 This project is available under the [MIT License](LICENSE).
