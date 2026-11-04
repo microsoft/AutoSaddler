@@ -50,6 +50,42 @@ class CapturingTransport:
         )
 
 
+@pytest.mark.parametrize("cached", [0, 3, 10])
+def test_session_cost_preserves_input_breakdown(cached: int) -> None:
+    from autosaddler.v2.core.serde import cost_from, record
+    from autosaddler.v2.providers.base import _session_cost
+
+    usage = (
+        Usage(input_tokens=10, cached_input_tokens=cached, output_tokens=4),
+        Usage(input_tokens=5, cached_input_tokens=2, output_tokens=1),
+    )
+    cost = _session_cost(usage)
+    assert cost.sessions == 1
+    assert cost.input_tokens == 15
+    assert cost.cached_input_tokens == cached + 2
+    assert cost.uncached_input_tokens == 13 - cached
+    assert cost.output_tokens == 5
+    assert cost.currency_amount is None
+    assert cost_from(record(cost)) == cost
+
+
+@pytest.mark.parametrize("condition", ["empty", "incomplete"])
+def test_session_cost_does_not_invent_input_breakdown(condition: str) -> None:
+    from autosaddler.v2.providers.base import _session_cost
+
+    usage = () if condition == "empty" else (
+        Usage(input_tokens=10, cached_input_tokens=3),
+        Usage(
+            input_tokens=5, cached_input_tokens=2,
+            usage_incomplete=True,
+        ),
+    )
+    cost = _session_cost(usage)
+    assert cost.input_tokens == (0 if condition == "empty" else 15)
+    assert cost.cached_input_tokens is None
+    assert cost.uncached_input_tokens is None
+
+
 def test_usage_preserves_provider_native_metrics() -> None:
     usage = Usage(
         role="optimizer",

@@ -9,6 +9,7 @@ from autosaddler.v2.core.domain import JsonValue, freeze_json_mapping
 
 EVENT_SCHEMA_VERSION = "autosaddler-event/v1"
 ITERATION_COMPLETION_SCHEMA_VERSION = "autosaddler-iteration-completion/v1"
+PARETO_DECISION_SCHEMA_VERSION = "autosaddler-pareto-decision/v1"
 
 KNOWN_EVENT_TYPES = frozenset(
     {
@@ -38,6 +39,7 @@ KNOWN_EVENT_TYPES = frozenset(
         "EvidenceProviderCompleted",
         "EvidenceProviderFailed",
         "AcceptanceDecided",
+        "ParetoArchiveUpdated",
         "DevelopmentGateDecided",
         "EvolutionRecorded",
         "BudgetUpdated",

@@ -80,6 +80,8 @@ class Cost:
     output_tokens: int = 0
     wall_seconds: float = 0.0
     currency_amount: float | None = None
+    cached_input_tokens: int | None = None
+    uncached_input_tokens: int | None = None
 
     def __post_init__(self) -> None:
         numeric = (self.rollouts, self.sessions, self.input_tokens, self.output_tokens, self.wall_seconds)
@@ -87,6 +89,13 @@ class Cost:
             raise ValueError("Cost fields cannot be negative")
         if self.currency_amount is not None and self.currency_amount < 0:
             raise ValueError("Cost.currency_amount cannot be negative")
+        if self.cached_input_tokens is not None or self.uncached_input_tokens is not None:
+            for name in ("cached_input_tokens", "uncached_input_tokens"):
+                count = getattr(self, name)
+                if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                    raise ValueError(f"Cost.{name} must be a nonnegative integer when input breakdown is provided")
+            if self.cached_input_tokens + self.uncached_input_tokens != self.input_tokens:
+                raise ValueError("Cost.input_tokens must equal cached_input_tokens + uncached_input_tokens")
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +314,45 @@ class PatchVerdict:
     compared_case_ids: tuple[str, ...]
     accepted: bool
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParetoScreenParameters:
+    repetitions: int
+    draws: int = 10_000
+    rng_seed: int = 42
+    max_accuracy_drop: float = 0.10
+    joint_support_threshold: float = 0.70
+
+    def __post_init__(self) -> None:
+        for name, value, minimum in (
+            ("repetitions", self.repetitions, 1),
+            ("draws", self.draws, 1),
+            ("rng_seed", self.rng_seed, 0),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"Pareto {name} must be an integer >= {minimum}")
+        for name, value in (
+            ("max_accuracy_drop", self.max_accuracy_drop),
+            ("joint_support_threshold", self.joint_support_threshold),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"Pareto {name} must be a finite number")
+        if self.max_accuracy_drop < 0:
+            raise ValueError("Pareto max_accuracy_drop must be nonnegative")
+        if not 0 <= self.joint_support_threshold <= 1:
+            raise ValueError("Pareto joint_support_threshold must be in [0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class ParetoScreenResult(PatchVerdict):
+    """A training promotion decision with mean task-agent costs in USD."""
+
+    before_cost: float
+    after_cost: float
+    parameters: ParetoScreenParameters
+    samples_per_arm: int
+    joint_support: float
 
 
 @dataclass(frozen=True, slots=True)

@@ -19,7 +19,7 @@ scenario:
       - are/simulation/agents/default_agent
       - are/simulation/agents/are_simulation_agent_config.py
       - are/simulation/agents/agent_config_builder.py
-      - are/simulation/apps/agent_user_interface.py
+      - are/simulation/apps
       - hook.json
     forbidden_paths:
       - are/simulation/validation

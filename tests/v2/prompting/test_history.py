@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from autosaddler.v2.core.domain import ArtifactRef, Candidate, ChangeSummary, sha256_digest
+from autosaddler.v2.core.domain import ArtifactRef, Candidate, ChangeSummary, Cost, Evaluation, Observation, sha256_digest
 from autosaddler.v2.core.serde import record
 from autosaddler.v2.prompting.history import build_history_bundle
 from autosaddler.v2.storage.local import LocalRunStore
@@ -266,6 +267,78 @@ def test_history_bundle_keeps_accepted_status_after_identical_declined_proposal(
     seed_summary = next(item for item in summary["candidates"] if item["candidate_id"] == seed.candidate_id)
 
     assert seed_summary["status"] == "accepted"
+
+
+@pytest.mark.parametrize("repetitions", [1, 2, 3, 5])
+def test_pareto_history_uses_archive_references_without_development_detail(tmp_path: Path, repetitions: int) -> None:
+    store = _store(tmp_path)
+    seed = _seed(store)
+    candidates = [seed]
+    for name in ("tradeoff", "dominated"):
+        child = Candidate(
+            candidate_id=sha256_digest(name), parent_ids=(seed.candidate_id,), space="git",
+            artifact=ArtifactRef(uri=f"candidates/{name}.json", kind="git-candidate"),
+            change=ChangeSummary(changed_units=("prompt.md",), added=1, removed=0),
+        )
+        store.append("CandidateFinalized", name, {"iteration": 0, "candidate": record(child)})
+        store.append("EvolutionRecorded", f"{name}:evolution", {
+            "iteration": 0, "candidate_id": child.candidate_id, "accepted": True,
+        })
+        candidates.append(child)
+    evaluations = []
+    for candidate, score, cost in zip(candidates, (1.0, 0.95, 0.8), (2.0, 1.0, 3.0), strict=True):
+        evaluation = Evaluation(
+            evaluation_id=sha256_digest(f"dev:{candidate.candidate_id}"), candidate_id=candidate.candidate_id,
+            split="development", purpose="development", iteration=0, requested_case_ids=("DEV-SECRET",),
+            observations=tuple(Observation.create(
+                candidate_id=candidate.candidate_id, case_id="DEV-SECRET", split="development",
+                repetition=repetition, disposition="success", score=score, cost=Cost(currency_amount=cost),
+                evaluator_fingerprint="test", metadata={"answer": "HIDDEN-ANSWER"},
+                trace=ArtifactRef(uri="quarantine/DEV-TRACE", kind="trace"),
+            ) for repetition in range(repetitions)),
+            artifact_dir=ArtifactRef(uri="quarantine/DEV-DIR", kind="evaluation-directory"),
+        )
+        store.append("EvaluationCompleted", evaluation.evaluation_id, {"evaluation": record(evaluation)})
+        evaluations.append(evaluation)
+    seed_id, current_id, dominated_id = [candidate.candidate_id for candidate in candidates]
+    store.append("ParetoArchiveUpdated", "archive", {
+        "schema_version": "autosaddler-pareto-decision/v1", "iteration": 0, "repetitions": repetitions,
+        "evaluation_ids": [evaluation.evaluation_id for evaluation in evaluations],
+        "archive_candidate_ids": [seed_id, current_id], "current_candidate_id": current_id,
+    })
+    unreferenced = replace(evaluations[1], evaluation_id=sha256_digest("unreferenced"), observations=tuple(
+        replace(observation, score=0.1, cost=Cost(currency_amount=0.01))
+        for observation in evaluations[1].observations
+    ))
+    store.append("EvaluationCompleted", "unreferenced", {"evaluation": record(unreferenced)})
+    store.append("IterationStarted", "iteration", {"iteration": 0, "working_candidate_id": seed_id})
+    verdict = {"accepted": True, "before_cost": 2.0, "after_cost": 1.0, "joint_support": 1.0}
+    store.append("AcceptanceDecided", "screen", {"iteration": 0, "verdict": verdict})
+    store.append("IterationCompleted", "completed", {
+        "iteration": 0, "resulting_candidate_id": current_id, "promoted_candidate_id": dominated_id,
+        "archive_candidate_ids": [seed_id, current_id], "current_candidate_id": current_id,
+    })
+    store.append("BestCandidateSelected", "best", {"candidate_id": seed_id})
+
+    bundle = build_history_bundle(store, {"train_case_ids": ["train-a"]})
+    summary = json.loads(bundle.workspace_files[".autosaddler/history/summary.json"])
+    assert summary["archive_candidate_ids"] == [seed_id, current_id]
+    assert summary["current_candidate_id"] == current_id
+    assert summary["selected_candidate_id"] == seed_id
+    assert summary["repetitions"] == repetitions
+    assert [item["candidate_id"] for item in summary["candidates"]] == [seed_id, current_id, dominated_id]
+    assert [item["status"] for item in summary["candidates"]] == ["selected", "current", "dominated"]
+    assert summary["candidates"][1]["development_aggregate"] == pytest.approx(0.95)
+    assert summary["candidates"][1]["development_cost"] == 1.0
+    assert summary["candidates"][1]["development_evaluation_id"] == evaluations[1].evaluation_id
+    iteration = json.loads(bundle.workspace_files[".autosaddler/history/iterations/0000.json"])
+    assert iteration["working_candidate_id"] == seed_id
+    assert iteration["promoted_candidate_id"] == dominated_id
+    assert iteration["current_candidate_id"] == current_id
+    assert iteration["verdict"] == verdict
+    assert bundle.compatibility_history["archive_candidate_ids"] == [seed_id, current_id]
+    rendered = "\n".join(bundle.workspace_files.values())
+    assert all(secret not in rendered for secret in ("DEV-SECRET", "DEV-TRACE", "DEV-DIR", "HIDDEN-ANSWER"))
 
 
 def _store(tmp_path: Path) -> LocalRunStore:

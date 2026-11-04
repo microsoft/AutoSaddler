@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from autosaddler.v2.config.registry import build_runtime
+from autosaddler.v2.core.domain import canonical_json
 from autosaddler.v2.storage.local import LocalRunStore
 
 
@@ -24,8 +25,11 @@ def main() -> None:
         )
         runtime.store.fork_from(source, through_sequence=arguments.fork_through_sequence)
     result = runtime.engine.run()
-    print(f"selected_candidate_id={result.selected_candidate_id}")
-    print(f"development_score={result.development_score:.6f}")
+    if result.selected_candidate_id is None:
+        print(f"archive={canonical_json(result.archive)}")
+    else:
+        print(f"selected_candidate_id={result.selected_candidate_id}")
+        print(f"development_score={result.development_score:.6f}")
 
 
 if __name__ == "__main__":

@@ -63,5 +63,11 @@ class FakeAgentProvider:
             raw_response=canonical_json(response),
             tool_calls=(),
             usage=(usage,),
-            cost=Cost(sessions=1, input_tokens=usage.input_tokens, output_tokens=usage.output_tokens),
+            cost=Cost(
+                sessions=1,
+                input_tokens=usage.input_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                uncached_input_tokens=usage.uncached_input_tokens,
+                output_tokens=usage.output_tokens,
+            ),
         )

@@ -222,6 +222,16 @@ def test_event_engine_runs_complete_fake_optimization(tmp_path: Path) -> None:
     assert json.loads((run_dir / "manifest.json").read_text())["status"] == "completed"
     assert json.loads((run_dir / "evolution_dag.json").read_text())["nodes"][-1]["status"] == "selected"
     assert (run_dir / "result.json").is_file()
+    assert store.read_json("result.json") == {
+        "run_id": result.run_id,
+        "selected_candidate_id": result.selected_candidate_id,
+        "development_score": result.development_score,
+        "iterations": result.iterations,
+    }
+    assert result.current_candidate_id is None
+    assert result.archive == ()
+    assert result.archive_candidate_ids == ()
+    assert engine.run() == result
     rollouts = [entry for entry in ledger.entries() if entry["kind"] == "rollout"]
     assert len(rollouts) == 24
     assert len({entry["key"] for entry in rollouts}) == 24

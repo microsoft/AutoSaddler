@@ -164,7 +164,9 @@ class FakePromptPack:
                 "component_sources": {},
                 "rationale": "Use the only accepted candidate.",
             }
-            schema = _object_schema(("schema_version", "parent_ids", "component_sources", "rationale"))
+            if "fixed_current_candidate_id" in context:
+                response = {**response, "changed_paths": [], "donor_candidate_ids": []}
+            schema = _object_schema(tuple(response))
         elif kind == "diagnose_patch":
             response = {
                 "schema_version": "autosaddler-diagnosis-patch/v1",

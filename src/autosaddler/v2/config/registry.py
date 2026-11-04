@@ -6,9 +6,10 @@ from importlib.metadata import EntryPoint, PackageNotFoundError, entry_points, v
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from autosaddler.v2.config.models import RunConfig
+from autosaddler.v2.config.models import ParetoAcceptanceConfig, RunConfig
 from autosaddler.v2.core.domain import JsonValue
 from autosaddler.v2.core.engine import AutoSaddlerEngine
+from autosaddler.v2.core.events import PARETO_DECISION_SCHEMA_VERSION
 from autosaddler.v2.core.policies import (
     BudgetPolicy,
     EpochShuffledTaskSelectionPolicy,
@@ -16,9 +17,12 @@ from autosaddler.v2.core.policies import (
     FullOnAcceptDevelopment,
     MatchedValidStrictImprovement,
     MeanDevelopmentRanking,
+    ParetoAcceptance,
+    ParetoDevelopmentRanking,
     PolicyBundle,
 )
 from autosaddler.v2.core.ports import AgentProvider, ScenarioComponents
+from autosaddler.v2.core.serde import record
 from autosaddler.v2.plugins.api import (
     SCENARIO_PLUGIN_API_VERSION,
     SCENARIO_PLUGIN_ENTRY_POINT_GROUP,
@@ -103,9 +107,9 @@ class Registry:
             str,
             Callable[..., FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy],
         ] = {}
-        self.acceptance: dict[str, Callable[[], MatchedValidStrictImprovement]] = {}
+        self.acceptance: dict[str, Callable[..., MatchedValidStrictImprovement | ParetoAcceptance]] = {}
         self.development: dict[str, Callable[[], FullOnAcceptDevelopment]] = {}
-        self.ranking: dict[str, Callable[[], MeanDevelopmentRanking]] = {}
+        self.ranking: dict[str, Callable[..., MeanDevelopmentRanking | ParetoDevelopmentRanking]] = {}
 
     def resolve(self, family: str, name: str):
         values = cast(dict[str, Any], getattr(self, family))
@@ -145,8 +149,10 @@ def default_registry() -> Registry:
         seed=seed,
     )
     registry.acceptance["matched_valid_strict_improvement"] = MatchedValidStrictImprovement
+    registry.acceptance["pareto"] = ParetoAcceptance
     registry.development["full_on_accept"] = FullOnAcceptDevelopment
     registry.ranking["mean_development_score"] = MeanDevelopmentRanking
+    registry.ranking["pareto"] = ParetoDevelopmentRanking
     return registry
 
 
@@ -278,14 +284,21 @@ def build_runtime(
     if missing_capabilities:
         raise ValueError(f"Configured provider lacks required capabilities: {missing_capabilities}")
     provider = provider_factory(ledger=ledger, settings=config.provider.settings)
+    acceptance_config = config.optimization.acceptance
+    if isinstance(acceptance_config, ParetoAcceptanceConfig):
+        acceptance = acceptance_factory(parameters=acceptance_config.parameters)
+        ranking = ranking_factory(repetitions=acceptance_config.parameters.repetitions)
+    else:
+        acceptance = acceptance_factory()
+        ranking = ranking_factory()
     policies = PolicyBundle(
         task_selection=task_selection_factory(
             batch_size=config.optimization.task_selection.batch_size,
             seed=config.optimization.task_selection.seed,
         ),
-        acceptance=acceptance_factory(),
+        acceptance=acceptance,
         development=development_factory(),
-        ranking=ranking_factory(),
+        ranking=ranking,
         budget=BudgetPolicy(
             max_rollouts=config.optimization.budget.max_rollouts,
             max_iterations=config.optimization.budget.max_iterations,
@@ -308,6 +321,7 @@ def build_runtime(
         reflection_timeout_seconds=config.optimization.reflection_timeout_seconds,
         session_retries=config.optimization.session_retries,
         session_retry_backoff_seconds=config.optimization.session_retry_backoff_seconds,
+        final_selection=config.optimization.final_selection,
     )
     return Runtime(config, store, scenario, provider, policies, engine, ledger)
 
@@ -426,6 +440,13 @@ def _resolved_entities(
     overlap = sorted(common.keys() & scenario.resolved_entities.keys())
     if overlap:
         raise ValueError(f"Scenario resolved entities collide with common entities: {overlap}")
+    if isinstance(policies.acceptance, ParetoAcceptance):
+        policy_record = cast(dict[str, JsonValue], common["resolved/policies.json"])
+        policy_record["pareto"] = {
+            "schema_version": PARETO_DECISION_SCHEMA_VERSION,
+            "method": "bayesian_bootstrap",
+            "parameters": record(policies.acceptance.parameters),
+        }
     return {**common, **scenario.resolved_entities}
 
 

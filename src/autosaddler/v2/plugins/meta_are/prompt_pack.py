@@ -22,7 +22,6 @@ _SESSION_CONTEXT_PATH = ".autosaddler/session_context.json"
 _TRAINING_EVIDENCE_PATH = ".autosaddler/training_evidence.json"
 _PROMPT_ASSETS_PATH = ".autosaddler/prompt_assets.json"
 
-
 class MetaAREPromptPack:
     def __init__(
         self,
@@ -44,15 +43,18 @@ class MetaAREPromptPack:
         if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 0:
             raise ValueError("Meta-ARE prompt context requires a nonnegative iteration")
         patch_phase = "capability" if iteration + 1 <= self.capability_phase_iterations else "steering"
+        history = build_history_bundle(self.store, context)
+        objective_mode = "pareto" if history.compatibility_history.get("objective_mode") == "pareto" else "accuracy"
         rendered_context: dict[str, JsonValue] = {
             **context,
+            "objective_mode": objective_mode,
             "patch_phase": patch_phase,
             "mutation_scope": [path.as_posix() for path in self.writable_paths],
         }
         workspace_files = {
             _SESSION_CONTEXT_PATH: canonical_json(rendered_context) + "\n",
         }
-        workspace_files.update(build_history_bundle(self.store, context).workspace_files)
+        workspace_files.update(history.workspace_files)
 
         if kind == "diagnose_patch":
             workspace_files[_TRAINING_EVIDENCE_PATH] = self._evidence(context.get("evidence"))
@@ -70,9 +72,22 @@ class MetaAREPromptPack:
                 context.get("component_source_options"),
                 candidate_ids,
             )
-            schema = _evolve_schema(candidate_ids, component_source_options)
-            skill_paths = {"history-analysis": None}
-            mutation_label = None
+            if objective_mode == "pareto":
+                base_id = context.get("fixed_current_candidate_id")
+                if candidate_ids != (base_id,):
+                    raise ValueError("Pareto preparation must receive only the recorded current as its base")
+                donors = _optional_strings(context.get("donor_candidate_ids"), "donor_candidate_ids")
+                schema = _pareto_evolve_schema(candidate_ids[0], donors)
+                skill_paths = {
+                    "history-analysis": None,
+                    f"{patch_phase}-patch": f"skills/{patch_phase}-patch/SKILL.md",
+                    "patch-verification": "skills/patch-verification/SKILL.md",
+                }
+                mutation_label = patch_phase
+            else:
+                schema = _evolve_schema(candidate_ids, component_source_options)
+                skill_paths = {"history-analysis": None}
+                mutation_label = None
         elif kind == "reflect":
             schema = _reflection_schema()
             skill_paths = {"history-analysis": None}
@@ -80,8 +95,8 @@ class MetaAREPromptPack:
         else:
             raise ValueError(f"Unknown Meta-ARE session kind: {kind}")
 
-        resolved = _resolved_assets(kind, skill_paths)
-        workspace_files[_PROMPT_ASSETS_PATH] = _provenance_manifest(resolved)
+        resolved = _resolved_assets(kind, skill_paths, objective_mode=objective_mode)
+        workspace_files[_PROMPT_ASSETS_PATH] = _provenance_manifest(resolved, objective_mode=objective_mode)
 
         return SessionSpec(
             kind=kind,
@@ -162,6 +177,22 @@ def _evolve_schema(
     }
 
 
+def _pareto_evolve_schema(base_id: str, donors: tuple[str, ...]) -> Mapping[str, JsonValue]:
+    schema = dict(_evolve_schema((base_id,), {}))
+    properties = dict(schema["properties"])
+    properties["parent_ids"] = {**properties["parent_ids"], "maxItems": 1}
+    properties["changed_paths"] = {
+        "type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": True,
+    }
+    properties["donor_candidate_ids"] = {
+        "type": "array", "uniqueItems": True,
+        **({"items": {"type": "string", "enum": list(donors)}} if donors else {"maxItems": 0}),
+    }
+    schema["properties"] = properties
+    schema["required"] = [*schema["required"], "changed_paths", "donor_candidate_ids"]
+    return schema
+
+
 def _component_source_options(
     value: JsonValue | None,
     candidate_ids: tuple[str, ...],
@@ -210,26 +241,40 @@ def _reflection_schema() -> Mapping[str, JsonValue]:
     }
 
 
-def _resolved_assets(kind: str, skill_paths: Mapping[str, str | None]) -> ResolvedPromptAssets:
+def _resolved_assets(
+    kind: str, skill_paths: Mapping[str, str | None], *, objective_mode: str = "accuracy",
+) -> ResolvedPromptAssets:
+    methodology_root = "methodology/pareto" if objective_mode == "pareto" else "methodology"
+    methodology_id = "methodology.pareto" if objective_mode == "pareto" else "methodology"
     shared_skills = {
-        "history-analysis": "methodology/skills/history-analysis/SKILL.md",
-        "diagnose": "methodology/skills/causal-diagnosis/SKILL.md",
+        "history-analysis": f"{methodology_root}/skills/history-analysis/SKILL.md",
+        "diagnose": f"{methodology_root}/skills/causal-diagnosis/SKILL.md",
         "patch-verification": "methodology/skills/verification-baseline/SKILL.md",
     }
     return resolve_prompt_composition(
         PromptComposition(
             system_assets=(
-                _shared_asset("methodology/system/optimizer-invariants.md", "methodology.system.invariants"),
+                _shared_asset(f"{methodology_root}/system/optimizer-invariants.md", f"{methodology_id}.system.invariants"),
                 _plugin_asset("SYSTEM.md", "meta_are.system"),
             ),
             task_assets=(
-                _shared_asset(f"methodology/prompts/{_method_name(kind)}-method.md", f"methodology.prompt.{kind}"),
-                _plugin_asset(f"prompts/{kind}.md", f"meta_are.prompt.{kind}"),
+                _shared_asset(f"{methodology_root}/prompts/{_method_name(kind)}-method.md", f"{methodology_id}.prompt.{kind}"),
+                *(
+                    () if objective_mode == "pareto" and kind == "evolve"
+                    else (_plugin_asset(f"prompts/{kind}.md", f"meta_are.prompt.{kind}"),)
+                ),
+                *(
+                    (_plugin_asset(f"pareto/prompts/{kind}.md", f"meta_are.pareto.prompt.{kind}"),)
+                    if objective_mode == "pareto" else ()
+                ),
             ),
             skill_assets={
                 name: (
                     *(
-                        (_shared_asset(shared_skills[name], f"methodology.skill.{name}"),)
+                        (_shared_asset(
+                            shared_skills[name],
+                            f"{methodology_id if name != 'patch-verification' else 'methodology'}.skill.{name}",
+                        ),)
                         if name in shared_skills
                         else ()
                     ),
@@ -246,35 +291,40 @@ def _resolved_assets(kind: str, skill_paths: Mapping[str, str | None]) -> Resolv
 
 
 def meta_are_prompt_composition_entity() -> Mapping[str, JsonValue]:
+    skills = {
+        "evolve": {"history-analysis": None},
+        "diagnose_patch.capability": {
+            "history-analysis": None,
+            "diagnose": None,
+            "capability-patch": "skills/capability-patch/SKILL.md",
+            "patch-verification": "skills/patch-verification/SKILL.md",
+        },
+        "diagnose_patch.steering": {
+            "history-analysis": None,
+            "diagnose": None,
+            "steering-patch": "skills/steering-patch/SKILL.md",
+            "patch-verification": "skills/patch-verification/SKILL.md",
+        },
+        "reflect": {"history-analysis": None},
+    }
     return prompt_composition_record(
         plugin_name="meta_are",
         compositions={
-            "evolve": _resolved_assets(
-                "evolve",
-                {"history-analysis": None},
-            ),
-            "diagnose_patch.capability": _resolved_assets(
-                "diagnose_patch",
-                {
-                    "history-analysis": None,
-                    "diagnose": None,
-                    "capability-patch": "skills/capability-patch/SKILL.md",
-                    "patch-verification": "skills/patch-verification/SKILL.md",
-                },
-            ),
-            "diagnose_patch.steering": _resolved_assets(
-                "diagnose_patch",
-                {
-                    "history-analysis": None,
-                    "diagnose": None,
-                    "steering-patch": "skills/steering-patch/SKILL.md",
-                    "patch-verification": "skills/patch-verification/SKILL.md",
-                },
-            ),
-            "reflect": _resolved_assets(
-                "reflect",
-                {"history-analysis": None},
-            ),
+            (name if mode == "accuracy" else f"pareto.{name}"): _resolved_assets(
+                name.split(".")[0], skill_paths, objective_mode=mode,
+            )
+            for mode, variants in (
+                ("accuracy", skills),
+                ("pareto", {
+                    **{name: paths for name, paths in skills.items() if name != "evolve"},
+                    **{f"evolve.{phase}": {
+                        "history-analysis": None,
+                        f"{phase}-patch": f"skills/{phase}-patch/SKILL.md",
+                        "patch-verification": "skills/patch-verification/SKILL.md",
+                    } for phase in ("capability", "steering")},
+                }),
+            )
+            for name, skill_paths in variants.items()
         },
     )
 
@@ -301,11 +351,12 @@ def _plugin_asset(relative_path: str, asset_id: str):
     )
 
 
-def _provenance_manifest(resolved: ResolvedPromptAssets) -> str:
+def _provenance_manifest(resolved: ResolvedPromptAssets, *, objective_mode: str) -> str:
     return (
         canonical_json(
             {
                 "schema_version": "autosaddler-prompt-assets/v1",
+                "objective_mode": objective_mode,
                 "assets": [
                     {
                         "asset_id": asset.asset_id,

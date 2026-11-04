@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import yaml
 
-from autosaddler.v2.core.domain import JsonValue, to_json_value
+from autosaddler.v2.core.domain import JsonValue, ParetoScreenParameters, to_json_value
 from autosaddler.v2.prompting.models import Capability
 
 CONFIG_SCHEMA_VERSION = "autosaddler/v2"
@@ -33,6 +33,11 @@ class NamedPolicyConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ParetoAcceptanceConfig(NamedPolicyConfig):
+    parameters: ParetoScreenParameters
+
+
+@dataclass(frozen=True, slots=True)
 class BudgetConfig:
     max_rollouts: int
     max_iterations: int
@@ -50,6 +55,7 @@ class OptimizationConfig:
     reflection_timeout_seconds: float
     session_retries: int
     session_retry_backoff_seconds: float
+    final_selection: str = "score"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +103,7 @@ class RunConfig:
             "reflection_timeout_seconds",
             "session_retries",
             "session_retry_backoff_seconds",
+            "final_selection",
         }
         _required_and_allowed(
             optimization_value,
@@ -126,7 +133,10 @@ class RunConfig:
             {"type", "batch_size", "seed"},
             "optimization.task_selection",
         )
-        acceptance = _named_policy(optimization_value["acceptance"], "optimization.acceptance")
+        settings = _json_mapping(scenario_value["settings"], "scenario.settings")
+        acceptance = _named_policy(
+            optimization_value["acceptance"], "optimization.acceptance", repetitions=settings.get("repetitions"),
+        )
         development = _named_policy(optimization_value["development"], "optimization.development")
         ranking = _named_policy(optimization_value["ranking"], "optimization.ranking")
         budget_value = _mapping(optimization_value["budget"], "optimization.budget")
@@ -155,7 +165,6 @@ class RunConfig:
         run_root = Path(run_root_value)
         if not run_root.is_absolute():
             run_root = (path.parent / run_root).resolve()
-        settings = _json_mapping(scenario_value["settings"], "scenario.settings")
         provider_settings = _json_mapping(provider_value["settings"], "provider.settings")
         return cls(
             schema_version=schema_version,
@@ -178,6 +187,10 @@ class RunConfig:
                 reflection_timeout_seconds=reflection_timeout,
                 session_retries=session_retries,
                 session_retry_backoff_seconds=retry_backoff,
+                final_selection=(
+                    _required_string(optimization_value, "final_selection", "optimization")
+                    if "final_selection" in optimization_value else "score"
+                ),
             ),
             provider=ProviderConfig(
                 type=_required_string(provider_value, "type", "provider"),
@@ -193,11 +206,25 @@ class RunConfig:
     def as_mapping(self) -> Mapping[str, JsonValue]:
         converted = to_json_value(self)
         assert isinstance(converted, dict)
+        optimization = cast(dict[str, Any], converted["optimization"])
+        if isinstance(self.optimization.acceptance, ParetoAcceptanceConfig):
+            del optimization["acceptance"]["parameters"]["repetitions"]
+        elif self.optimization.final_selection == "score":
+            del optimization["final_selection"]
         return converted
 
 
-def _named_policy(value: object, path: str) -> NamedPolicyConfig:
+def _named_policy(value: object, path: str, *, repetitions: object = None) -> NamedPolicyConfig:
     mapping = _mapping(value, path)
+    if path == "optimization.acceptance" and mapping.get("type") == "pareto":
+        parameters = _mapping(mapping.get("parameters", {}), f"{path}.parameters")
+        return ParetoAcceptanceConfig(
+            type="pareto",
+            parameters=ParetoScreenParameters(
+                repetitions=_positive_int(repetitions, "scenario.settings.repetitions"),
+                **parameters,
+            ),
+        )
     _exact(mapping, {"type"}, path)
     return NamedPolicyConfig(type=_required_string(mapping, "type", path))
 

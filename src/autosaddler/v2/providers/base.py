@@ -139,9 +139,14 @@ def _read_structured_output(
 
 
 def _session_cost(usage: tuple[Usage, ...]) -> Cost:
+    input_tokens = sum(item.input_tokens for item in usage)
+    complete_usage = bool(usage) and all(not item.usage_incomplete for item in usage)
+    cached_input_tokens = sum(item.cached_input_tokens for item in usage) if complete_usage else None
     return Cost(
         sessions=1,
-        input_tokens=sum(item.input_tokens for item in usage),
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        uncached_input_tokens=input_tokens - cached_input_tokens if cached_input_tokens is not None else None,
         output_tokens=sum(item.output_tokens for item in usage),
     )
 

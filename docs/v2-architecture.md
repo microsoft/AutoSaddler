@@ -130,6 +130,38 @@ Train evidence can include case-level traces and scores. Development data is qua
 diagnosis: it is used for ranking and exposed to reflection only through permitted aggregate
 feedback. Test payloads are outside optimization and are not opened by the engine.
 
+### Pareto Optimization
+
+ParetoSaddler extends the same V2 candidate, evaluation, diagnosis, reflection, and event-store
+contracts to maximize task quality and minimize task-agent USD cost. Configure both
+`optimization.acceptance.type` and `optimization.ranking.type` as `pareto`; see the
+[full](../configs/v2/meta_are_pareto_full.yaml) and
+[smoke](../configs/v2/meta_are_pareto_smoke.yaml) Meta-ARE profiles.
+
+- Each iteration starts from the recorded current candidate. From the second iteration, the
+  `evolve` session may keep it unchanged, repair it locally, or transfer a localized mechanism
+  from an archive donor. The base stays fixed; donors do not become lineage parents. Changed
+  preparation content is verified and evaluated as the training before arm.
+- Parent and child are evaluated on the same ordered training cases with the configured
+  repetitions. Bayesian bootstrap screening requires sufficient joint support for a quality
+  increase or cost reduction while respecting `max_accuracy_drop`. Passing this screen triggers
+  development evaluation; it does not by itself establish development-set nondominance.
+- Development evaluations maintain the nondominated quality–cost archive. With
+  `optimization.final_selection`, `pareto` returns the archive, `score` selects its highest-quality
+  member, and `cost` selects its lowest-cost member.
+
+For Meta-ARE, cost is calculated from task-agent token usage and `task_agent_pricing`, including
+cached-input pricing. Judge and optimizer costs are outside this objective. Pareto evaluations
+require complete, valid repeated observations with finite scores and positive USD costs; missing
+cost is not treated as zero. A timeout with missing cost is retried within the configured
+infrastructure allowance. Other missing-cost outcomes can still fail objective validation.
+
+The implementation entry points are `core/policies.py` (screening and archive), `core/engine.py`
+(iteration and preparation), and `plugins/meta_are/evaluator.py` (usage and pricing), under
+`src/autosaddler/v2`. Shared Pareto methodology lives in `prompting/methodology/pareto/`, with
+Meta-ARE adaptations in `plugins/meta_are/pareto/`. Prompt composition, mutation verification,
+split isolation, and durable resume continue to use the common V2 infrastructure.
+
 ## Harness Spaces
 
 `ComponentMapHarnessSpace` stores a mapping of named text components and is useful for prompt-only or

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
@@ -14,6 +15,7 @@ from autosaddler.v2.core.domain import (
     Evaluation,
     JsonValue,
     Observation,
+    ParetoScreenParameters,
     canonical_json,
     sha256_digest,
 )
@@ -24,12 +26,17 @@ from autosaddler.v2.core.policies import (
     FullOnAcceptDevelopment,
     MatchedValidStrictImprovement,
     MeanDevelopmentRanking,
+    ParetoAcceptance,
+    ParetoDevelopmentRanking,
     PolicyBundle,
 )
 from autosaddler.v2.core.ports import EvaluationContext, ScenarioComponents
 from autosaddler.v2.harness.git import GitHarnessSpace
 from autosaddler.v2.prompting.models import SessionRequest, SessionResult, SessionSpec
 from autosaddler.v2.storage.local import LocalRunStore
+from autosaddler.v2.plugins.meta_are.prompt_pack import MetaAREPromptPack
+from autosaddler.v2.plugins.meta_are.verification import MetaAREVerifier
+from autosaddler.v2.prompting.history import build_history_bundle, HISTORY_ROOT
 
 
 class InterruptAfterDiagnosisCompleted:
@@ -477,3 +484,255 @@ def _policies() -> PolicyBundle:
         ranking=MeanDevelopmentRanking(),
         budget=BudgetPolicy(max_rollouts=20, max_iterations=1),
     )
+
+
+class PreparationProvider:
+    def __init__(self, behavior="edit"):
+        self.behavior = behavior
+        self.requests = []
+
+    async def run(self, request):
+        self.requests.append(request)
+        context = json.loads(request.spec.workspace_files[".autosaddler/session_context.json"])
+        if request.spec.kind == "evolve":
+            if self.behavior in {"edit", "failed_edit", "exception_edit", "invalid_base", "protected", "python", "interrupted_edit", "revert"}:
+                path = "benchmark.py" if self.behavior == "protected" else (
+                    "candidate/new.py" if self.behavior == "python" else "candidate/instructions.txt"
+                )
+                (request.workspace / path).write_text("# prepared\n" if path.endswith(".py") else "baseline\n" if self.behavior == "revert" else "prepared\n")
+                changed = [path]
+            else:
+                changed = []
+            if self.behavior in {"interrupted_edit", "interrupted_noop"}:
+                raise AbruptPreparationStop()
+            if self.behavior == "exception_edit":
+                raise RuntimeError("provider failed after edit")
+            output = {
+                "schema_version": "autosaddler-meta-are-evolution/v1",
+                "parent_ids": [context["fixed_current_candidate_id"]], "component_sources": {},
+                "changed_paths": changed, "donor_candidate_ids": context["donor_candidate_ids"] if changed else [],
+                "rationale": "Transfer a focused archive mechanism." if changed else "Keep the current fork.",
+            }
+            if self.behavior == "invalid_base":
+                output["parent_ids"] = [context["donor_candidate_ids"][0]]
+            if self.behavior in {"failed_edit", "failed_unchanged"}:
+                return SessionResult(status="failed", structured_output=None, raw_response="", tool_calls=(),
+                                     usage=(), cost=Cost(sessions=1), error="preparation failed")
+        elif request.spec.kind == "diagnose_patch":
+            (request.workspace / "candidate/instructions.txt").write_text(
+                "improved\n" if context["iteration"] == 0 else "patched\n",
+            )
+            output = {
+                "schema_version": "autosaddler-meta-are-diagnosis/v1", "intent": "Remove wasted work.",
+                "diagnosis": "Unnecessary steps.", "expected_effect": "Preserve quality at lower cost.",
+                "changed_paths": ["candidate/instructions.txt"],
+            }
+        else:
+            output = {"schema_version": "autosaddler-meta-are-reflection/v1", "lessons": []}
+        return SessionResult(status="completed", structured_output=output, raw_response=canonical_json(output),
+                             tool_calls=(), usage=(), cost=Cost(sessions=1))
+
+
+def make_git_preparation_engine(tmp_path, behavior="edit", capability_iterations=25):
+    run_dir = tmp_path / "run"
+    store = LocalRunStore(run_dir=run_dir, run_id="preparation")
+    store.initialize(resolved_config={}, resolved_entities={})
+    harness = _harness(tmp_path, run_dir)
+    harness.verifier = MetaAREVerifier(import_check="", verification_timeout_seconds=1, train_case_ids=("train-a",))
+    delegate = GitFixtureEvaluator(harness)
+    seen = []
+
+    class PricedEvaluator:
+        async def evaluate(self, candidate, cases, context):
+            materialized = harness.materialize(candidate, "inspect")
+            try:
+                content = (materialized.root / "candidate/instructions.txt").read_text().strip()
+            finally:
+                materialized.release()
+            seen.append((context.iteration, context.purpose, candidate.candidate_id, content))
+            measured = await delegate.evaluate(candidate, cases, context)
+            cost = {"baseline": 4.0, "improved": 3.0, "prepared": 2.0, "patched": 1.0}[content]
+            score = 1.0 if content == "baseline" else 0.95
+            return replace(measured, observations=tuple(
+                replace(item, score=score, disposition="success", cost=Cost(rollouts=1, currency_amount=cost))
+                for item in measured.observations
+            ))
+
+    class Evidence:
+        def build(self, evaluation):
+            return store.write_json("evidence/preparation.json", {
+                "schema_version": "autosaddler-meta-are-evidence/v1", "case_records": [],
+            }, kind="training-evidence")
+
+    provider = PreparationProvider(behavior)
+    scenario = ScenarioComponents(
+        name="preparation-fixture", version="1", harness_space=harness, evaluator=PricedEvaluator(),
+        evidence_builder=Evidence(), prompt_pack=MetaAREPromptPack(
+            store=store, writable_paths=(PurePosixPath("candidate"),),
+            capability_phase_iterations=capability_iterations,
+        ), train_cases=(Case("train-a", "train", {}),), development_cases=(Case("dev-a", "development", {}),),
+        required_capabilities=frozenset({"read_workspace", "edit_workspace", "load_skills"}),
+    )
+    engine = AutoSaddlerEngine(store=store, scenario=scenario, provider=provider, session_retries=1,
+                             session_retry_backoff_seconds=0,
+                             policies=PolicyBundle(
+                                 task_selection=FixedTaskSelectionPolicy(batch_size=1),
+                                 acceptance=ParetoAcceptance(ParetoScreenParameters(1, draws=100)),
+                                 development=FullOnAcceptDevelopment(), ranking=ParetoDevelopmentRanking(1),
+                                 budget=BudgetPolicy(max_rollouts=100, max_iterations=2),
+                             ))
+    return engine, provider, seen
+
+
+@pytest.mark.parametrize("behavior,expected", [("edit", "prepared"), ("noop", "unchanged"),
+                                               ("failed_unchanged", "failed_unchanged")])
+def test_pareto_preparation_uses_exact_content_and_keeps_base_lineage(tmp_path, behavior, expected):
+    engine, provider, seen = make_git_preparation_engine(tmp_path, behavior)
+    engine.run()
+    preparations = preparation_events(engine)
+    assert len(preparations) == 1 and preparations[0].payload["iteration"] == 1
+    preparation = preparations[0].payload
+    assert preparation["status"] == expected
+    before = next(item for item in seen if item[:2] == (1, "train_before"))
+    assert before[2] == preparation["prepared_candidate_id"]
+    assert before[3] == ("prepared" if behavior == "edit" else "improved")
+    assert next(item for item in seen if item[:2] == (1, "train_after"))[3] == "patched"
+    evolve = next(request for request in provider.requests if request.spec.kind == "evolve")
+    context = json.loads(evolve.spec.workspace_files[".autosaddler/session_context.json"])
+    assert context["candidate_ids"] == [preparation["base_candidate_id"]]
+    assert "dev-a" not in "\n".join(evolve.spec.workspace_files.values())
+    state = engine._state()
+    if behavior == "edit":
+        prepared = state.candidates[preparation["prepared_candidate_id"]]
+        assert prepared.parent_ids == (preparation["base_candidate_id"],)
+        decision = engine.store.events_of_type("AcceptanceDecided")[-1].payload
+        assert state.candidates[decision["candidate_id"]].parent_ids == (prepared.candidate_id,)
+        assert preparation["donor_candidate_ids"] == context["donor_candidate_ids"]
+    else:
+        assert preparation["prepared_candidate_id"] == preparation["base_candidate_id"]
+        assert not any(event.payload.get("kind") == "preparation"
+                       for event in engine.store.events_of_type("CandidateFinalized"))
+    history = build_history_bundle(engine.store, {})
+    iteration = json.loads(history.workspace_files[f"{HISTORY_ROOT}/iterations/0001.json"])
+    assert iteration["preparation"] == dict(preparation)
+    dag = engine.store.read_json("evolution_dag.json")
+    nodes = {node["candidate_id"]: node for node in dag["nodes"]}
+    if behavior == "edit":
+        assert nodes[preparation["prepared_candidate_id"]]["parent_ids"] == [preparation["base_candidate_id"]]
+    assert engine.store.events_of_type("DeferredWorkScheduled")[-1].payload["preparation"] == preparation
+
+
+@pytest.mark.parametrize("behavior", ["failed_edit", "exception_edit", "invalid_base", "protected"])
+def test_failed_or_invalid_preparation_never_changes_current(tmp_path, behavior):
+    engine, provider, seen = make_git_preparation_engine(tmp_path, behavior)
+    engine.run()
+    preparation = preparation_events(engine)[0].payload
+    assert preparation["status"] == "rejected" and preparation["prepared_candidate_id"] is None
+    assert not any(item[0] == 1 for item in seen)
+    assert engine._state().current_candidate_id == preparation["base_candidate_id"]
+    assert sum(request.spec.kind == "evolve" for request in provider.requests) == 1
+    assert engine.store.events_of_type("IterationCompleted")[-1].payload["outcome"] == "mutation_rejected"
+
+
+def test_preparation_preserves_steering_verification(tmp_path):
+    engine, _, seen = make_git_preparation_engine(tmp_path, "python", capability_iterations=1)
+    engine.run()
+    preparation = preparation_events(engine)[0].payload
+    assert preparation["status"] == "rejected"
+    assert "steering_scope" in preparation["rationale"]
+    assert not any(item[0] == 1 for item in seen)
+
+
+@pytest.mark.parametrize("behavior,boundary", [
+    ("edit", "SessionCompleted"), ("edit", "CandidateFinalized"), ("edit", "ExtensionStateChanged"),
+    ("noop", "ExtensionStateChanged"), ("failed_edit", "SessionFailed"),
+    ("failed_unchanged", "SessionFailed"), ("protected", "ExtensionStateChanged"),
+])
+def test_preparation_recovery_reuses_completed_edits_and_failure_decisions(tmp_path, behavior, boundary):
+    engine, provider, seen = make_git_preparation_engine(tmp_path, behavior)
+
+    def interrupt(event):
+        if event.event_type != boundary:
+            return
+        if boundary == "ExtensionStateChanged" and event.payload.get("namespace") != "autosaddler.preparation":
+            return
+        preparation = (
+            event.payload.get("kind") == "preparation" if boundary == "CandidateFinalized"
+            else str(event.payload.get("logical_operation_id", "")).endswith(":preparation")
+            if boundary in {"SessionCompleted", "SessionFailed"} else True
+        )
+        if preparation:
+            raise RuntimeError("interrupt preparation boundary")
+
+    engine.store.transition_hook = interrupt
+    with pytest.raises(RuntimeError, match="interrupt preparation boundary"):
+        engine.run()
+    completed_evaluations = list(seen)
+    prep_calls = sum(request.spec.kind == "evolve" for request in provider.requests)
+    engine.store.transition_hook = None
+    engine.run()
+    assert seen[:len(completed_evaluations)] == completed_evaluations
+    # Only an unchanged failure may consume its remaining retry on resume.
+    expected_calls = 2 if behavior == "failed_unchanged" else prep_calls
+    assert sum(request.spec.kind == "evolve" for request in provider.requests) == expected_calls
+    assert len(preparation_events(engine)) == 1
+    assert len([item for item in seen if item[:2] == (0, "train_before")]) == 1
+    assert len([item for item in seen if item[:2] == (1, "train_before")]) == (behavior not in {"failed_edit", "protected"})
+    engine.store.validate_integrity()
+
+
+class AbruptPreparationStop(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("behavior,expected", [("interrupted_edit", "rejected"),
+                                               ("interrupted_noop", "unchanged")])
+def test_preparation_recovers_attempt_without_result_artifact(tmp_path, behavior, expected):
+    engine, provider, seen = make_git_preparation_engine(tmp_path, behavior)
+    with pytest.raises(AbruptPreparationStop):
+        engine.run()
+    provider.behavior = "noop"
+    engine.run()
+    preparation = preparation_events(engine)[0].payload
+    assert preparation["status"] == expected
+    assert any(item[:2] == (1, "train_before") for item in seen) is (expected == "unchanged")
+    assert sum(request.spec.kind == "evolve" for request in provider.requests) == (1 if expected == "rejected" else 2)
+
+
+@pytest.mark.parametrize("behavior", ["edit", "failed_edit", "failed_unchanged"])
+def test_preparation_recovers_result_artifact_before_terminal_event(tmp_path, behavior, monkeypatch):
+    engine, provider, seen = make_git_preparation_engine(tmp_path, behavior)
+    write = engine.store.write_json
+
+    def interrupt_result(path, value, **kwargs):
+        result = write(path, value, **kwargs)
+        if str(path).endswith("/result.json") and provider.requests[-1].spec.kind == "evolve":
+            raise RuntimeError("interrupt durable result artifact")
+        return result
+
+    monkeypatch.setattr(engine.store, "write_json", interrupt_result)
+    with pytest.raises(RuntimeError, match="interrupt durable result artifact"):
+        engine.run()
+    monkeypatch.setattr(engine.store, "write_json", write)
+    engine.run()
+    preparation = preparation_events(engine)[0].payload
+    assert preparation["status"] == {"edit": "prepared", "failed_edit": "rejected",
+                                     "failed_unchanged": "failed_unchanged"}[behavior]
+    assert sum(request.spec.kind == "evolve" for request in provider.requests) == (2 if behavior == "failed_unchanged" else 1)
+    assert len([item for item in seen if item[:2] == (0, "train_before")]) == 1
+
+
+def test_preparation_repeated_content_preserves_original_identity_and_order(tmp_path):
+    engine, _, seen = make_git_preparation_engine(tmp_path, "revert")
+    engine.run()
+    preparation = preparation_events(engine)[0].payload
+    seed_id = engine.store.events_of_type("ParetoArchiveUpdated")[0].payload["current_candidate_id"]
+    assert preparation["prepared_candidate_id"] == seed_id
+    assert next(item for item in seen if item[:2] == (1, "train_before"))[3] == "baseline"
+    assert list(engine._state().candidates)[0] == seed_id
+    assert engine._state().candidates[seed_id].parent_ids == ()
+
+
+def preparation_events(engine):
+    return tuple(event for event in engine.store.events_of_type("ExtensionStateChanged")
+                 if event.payload.get("namespace") == "autosaddler.preparation")

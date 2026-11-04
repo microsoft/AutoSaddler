@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from autosaddler.v2.core.domain import Case, JsonValue, canonical_json, sha256_digest
+from autosaddler.v2.core.domain import Case, JsonValue, canonical_json, freeze_json_mapping, sha256_digest
 from autosaddler.v2.plugins.meta_are.responses_runtime import RESPONSES_RUNTIME_PATH
 from autosaddler.v2.plugins.meta_are.scenario_provisioning import (
     DEFAULT_SCENARIO_REPO_ID,
@@ -19,7 +19,7 @@ APPROVED_WRITABLE_PATHS = (
     PurePosixPath("are/simulation/agents/default_agent"),
     PurePosixPath("are/simulation/agents/are_simulation_agent_config.py"),
     PurePosixPath("are/simulation/agents/agent_config_builder.py"),
-    PurePosixPath("are/simulation/apps/agent_user_interface.py"),
+    PurePosixPath("are/simulation/apps"),
     PurePosixPath("hook.json"),
 )
 APPROVED_FORBIDDEN_PATHS = (
@@ -115,13 +115,22 @@ class MetaARESettings:
     responses_runtime_sha256: str | None
     demo_filesystem_digest: str
     execution_fingerprint: str
+    task_agent_pricing: Mapping[str, JsonValue] | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, JsonValue], *, base_dir: Path) -> "MetaARESettings":
         missing = sorted(_EXPECTED_KEYS - value.keys())
-        extra = sorted(value.keys() - _EXPECTED_KEYS)
+        extra = sorted(value.keys() - _EXPECTED_KEYS - {"task_agent_pricing"})
         if missing or extra:
             raise ValueError(f"Invalid Meta-ARE settings keys: missing={missing}, unexpected={extra}")
+
+        pricing = None
+        if "task_agent_pricing" in value:
+            raw_pricing = value["task_agent_pricing"]
+            price_keys = {"input_usd_per_million", "cached_input_usd_per_million", "output_usd_per_million"}
+            if not isinstance(raw_pricing, Mapping) or raw_pricing.keys() != price_keys:
+                raise ValueError("Meta-ARE task_agent_pricing requires exactly three USD rates")
+            pricing = freeze_json_mapping(raw_pricing)
 
         source_repo = _directory(value["source_repo"], base_dir, "source_repo")
         base_revision = _full_commit(value["base_revision"], "base_revision")
@@ -256,6 +265,8 @@ class MetaARESettings:
                 value["capability_phase_iterations"], "capability_phase_iterations"
             ),
         }
+        if pricing is not None:
+            resolved["task_agent_pricing"] = dict(pricing)
         fingerprint = sha256_digest(canonical_json(resolved))
         return cls(
             source_repo=source_repo,
@@ -301,6 +312,7 @@ class MetaARESettings:
             ),
             demo_filesystem_digest=demo_digest,
             execution_fingerprint=fingerprint,
+            task_agent_pricing=pricing,
         )
 
     def load_cases(self) -> tuple[tuple[Case, ...], tuple[Case, ...]]:

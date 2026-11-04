@@ -28,4 +28,6 @@ def test_fake_provider_executes_plugin_owned_session_contract(tmp_path: Path) ->
 
     assert result.status == "completed"
     assert result.structured_output["updates"] == {"instruction": "improved"}
-    assert result.cost == Cost(sessions=1, input_tokens=5, output_tokens=3)
+    assert result.cost == Cost(
+        sessions=1, input_tokens=5, cached_input_tokens=0, uncached_input_tokens=5, output_tokens=3,
+    )

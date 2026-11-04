@@ -20,9 +20,16 @@ from autosaddler.v2.core.domain import (
     canonical_json,
     sha256_digest,
 )
-from autosaddler.v2.core.events import ITERATION_COMPLETION_SCHEMA_VERSION, operation_id
+from autosaddler.v2.core.events import ITERATION_COMPLETION_SCHEMA_VERSION, PARETO_DECISION_SCHEMA_VERSION, operation_id
 from autosaddler.v2.core.metrics import EventModelUsageSink
-from autosaddler.v2.core.policies import DevelopmentDecision, PolicyBundle
+from autosaddler.v2.core.policies import (
+    DevelopmentDecision,
+    ParetoAcceptance,
+    PolicyBundle,
+    _mean_cost,
+    _objective_runs,
+    pareto_front,
+)
 from autosaddler.v2.core.ports import (
     AgentProvider,
     CompositionPlan,
@@ -48,13 +55,23 @@ from autosaddler.v2.storage.local import LocalRunStore
 @dataclass(frozen=True, slots=True)
 class OptimizationResult:
     run_id: str
-    selected_candidate_id: str
-    development_score: float
+    selected_candidate_id: str | None
+    development_score: float | None
     iterations: int
+    current_candidate_id: str | None = None
+    archive: tuple[Mapping[str, JsonValue], ...] = ()
+
+    @property
+    def archive_candidate_ids(self) -> tuple[str, ...]:
+        return tuple(cast(str, member["candidate_id"]) for member in self.archive)
 
 
 class SessionRetriesExhausted(RuntimeError):
     pass
+
+
+class ModifiedPreparationFailure(SessionRetriesExhausted):
+    """A failed preparation changed its isolated attempt and must be abandoned."""
 
 
 class AutoSaddlerEngine:
@@ -70,6 +87,7 @@ class AutoSaddlerEngine:
         reflection_timeout_seconds: float | None = None,
         session_retries: int = 2,
         session_retry_backoff_seconds: float = 0.0,
+        final_selection: str = "score",
     ) -> None:
         if session_retries < 0:
             raise ValueError("Session retries cannot be negative")
@@ -84,6 +102,7 @@ class AutoSaddlerEngine:
         self.reflection_timeout_seconds = reflection_timeout_seconds or diagnosis_patch_timeout_seconds
         self.session_retries = session_retries
         self.session_retry_backoff_seconds = session_retry_backoff_seconds
+        self.final_selection = final_selection
         self.run_invocation_id = uuid4().hex
         self._iteration_started_at: dict[int, float] = {}
 
@@ -148,6 +167,7 @@ class AutoSaddlerEngine:
 
         seed_id = state.accepted_candidate_ids[0]
         seed = state.candidates[seed_id]
+        pareto = isinstance(self.policies.acceptance, ParetoAcceptance)
         await self._ensure_evaluation(
             logical_operation_id=operation_id(self.store.run_id, "seed", "development"),
             candidate=seed,
@@ -155,12 +175,14 @@ class AutoSaddlerEngine:
             purpose="development",
             iteration=0,
         )
-
+        if pareto:
+            self._update_archive(operation_id(self.store.run_id, "seed", "development", "archive"), 0)
         for iteration in range(self.policies.budget.max_iterations):
             if iteration > 0:
                 await self._drain_deferred()
             state = self._state()
-            if not self.policies.budget.allows_iteration(
+            started = pareto and self.store.find("IterationStarted", operation_id(self.store.run_id, "iteration", iteration))
+            if not started and not self.policies.budget.allows_iteration(
                 iteration=iteration,
                 attempted_rollouts=state.attempted_rollouts,
             ):
@@ -172,31 +194,43 @@ class AutoSaddlerEngine:
         if state.pending_obligations:
             raise RuntimeError("Optimization cannot complete with pending deferred work")
         finalization_started = time.monotonic()
-        selected, development = self._select_best()
-        best_operation = operation_id(self.store.run_id, "best-candidate")
-        self.store.append(
-            "BestCandidateSelected",
-            best_operation,
-            {
-                "candidate_id": selected.candidate_id,
-                "evaluation_id": development.evaluation_id,
-                "development_aggregate": development.aggregate_score,
-            },
-        )
+        selected_candidate_id = None
+        development_score = None
+        if not (pareto and self.final_selection == "pareto"):
+            selected, development = self._select_best(self.final_selection)
+            selected_candidate_id = selected.candidate_id
+            development_score = _required_score(development)
+            self.store.append(
+                "BestCandidateSelected",
+                operation_id(self.store.run_id, "best-candidate"),
+                {
+                    "candidate_id": selected_candidate_id,
+                    "evaluation_id": development.evaluation_id,
+                    "development_aggregate": development_score,
+                },
+            )
         result = OptimizationResult(
             run_id=self.store.run_id,
-            selected_candidate_id=selected.candidate_id,
-            development_score=_required_score(development),
+            selected_candidate_id=selected_candidate_id,
+            development_score=development_score,
             iterations=len(self.store.events_of_type("IterationStarted")),
+            current_candidate_id=state.current_candidate_id,
+            archive=self._result_archive() if pareto else (),
         )
-        self.store.write_json("result.json", record(result), kind="optimization-result")
+        result_record = record(result)
+        if pareto:
+            result_record["archive_candidate_ids"] = list(result.archive_candidate_ids)
+        else:
+            result_record.pop("current_candidate_id")
+            result_record.pop("archive")
+        self.store.write_json("result.json", result_record, kind="optimization-result")
         optimization_operation = operation_id(self.store.run_id, "optimization", "complete")
         if self.store.find("OptimizationCompleted", optimization_operation) is None:
             self.store.append(
                 "OptimizationCompleted",
                 optimization_operation,
                 {
-                    "candidate_id": selected.candidate_id,
+                    "candidate_id": selected_candidate_id,
                     "wall_seconds": time.monotonic() - finalization_started,
                 },
             )
@@ -204,7 +238,7 @@ class AutoSaddlerEngine:
             "RunCompleted",
             operation_id(self.store.run_id, "run", "complete"),
             {
-                **record(result),
+                **result_record,
                 "run_invocation_id": self.run_invocation_id,
                 "wall_seconds": self._run_wall_seconds(),
             },
@@ -216,7 +250,13 @@ class AutoSaddlerEngine:
         if self.store.find("IterationCompleted", iteration_operation) is not None:
             return
         self._iteration_started_at[iteration] = time.monotonic()
-        self.store.append("IterationStarted", iteration_operation, {"iteration": iteration})
+        pareto = isinstance(self.policies.acceptance, ParetoAcceptance)
+        started = self.store.find("IterationStarted", iteration_operation)
+        if started is None:
+            started = self.store.append("IterationStarted", iteration_operation, {
+                "iteration": iteration,
+                **({"working_candidate_id": self._state().current_candidate_id} if pareto else {}),
+            })
 
         batch_operation = operation_id(self.store.run_id, "iteration", iteration, "batch")
         batch_event = self.store.find("BatchSampled", batch_operation)
@@ -236,30 +276,36 @@ class AutoSaddlerEngine:
         cases = tuple(cases_by_id[case_id] for case_id in case_ids)
 
         state = self._state()
-        component_source_options: dict[str, list[str]] = {}
-        for candidate_id in state.accepted_candidate_ids:
-            change = state.candidates[candidate_id].change
-            if change is None:
-                continue
-            for unit in change.changed_units:
-                component_source_options.setdefault(unit, []).append(candidate_id)
-        evolve_spec = self.scenario.prompt_pack.session(
-            "evolve",
-            {
-                "iteration": iteration,
-                "candidate_ids": list(state.accepted_candidate_ids),
-                "component_source_options": component_source_options,
-                "train_case_ids": list(case_ids),
-            },
-        )
-        evolve = await self._ensure_session(
-            logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, "evolve"),
-            spec=evolve_spec,
-            source_workspace=None,
-            result_validator=lambda result: _selection_failure_reason(result, state.accepted_candidate_ids),
-            metrics_context={"stage": "proposal.selection", "iteration": iteration},
-        )
-        selection_plan = _selection_plan(evolve, state.accepted_candidate_ids)
+        if pareto:
+            selection_plan = CompositionPlan(
+                parents=(started.payload["working_candidate_id"],), selections={}, overrides={},
+                rationale="Continue from the recorded Pareto current candidate.",
+            )
+        else:
+            component_source_options: dict[str, list[str]] = {}
+            for candidate_id in state.accepted_candidate_ids:
+                change = state.candidates[candidate_id].change
+                if change is None:
+                    continue
+                for unit in change.changed_units:
+                    component_source_options.setdefault(unit, []).append(candidate_id)
+            evolve_spec = self.scenario.prompt_pack.session(
+                "evolve",
+                {
+                    "iteration": iteration,
+                    "candidate_ids": list(state.accepted_candidate_ids),
+                    "component_source_options": component_source_options,
+                    "train_case_ids": list(case_ids),
+                },
+            )
+            evolve = await self._ensure_session(
+                logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, "evolve"),
+                spec=evolve_spec,
+                source_workspace=None,
+                result_validator=lambda result: _selection_failure_reason(result, state.accepted_candidate_ids),
+                metrics_context={"stage": "proposal.selection", "iteration": iteration},
+            )
+            selection_plan = _selection_plan(evolve, state.accepted_candidate_ids)
         selected_parent = state.candidates[selection_plan.parents[0]]
         if selection_plan.selections:
             composition_operation = operation_id(self.store.run_id, "iteration", iteration, "composition")
@@ -276,6 +322,16 @@ class AutoSaddlerEngine:
                 parent = candidate_from(composition_event.payload.get("candidate"))
         else:
             parent = selected_parent
+        if pareto and iteration > 0:
+            prepared = await self._prepare_pareto_parent(iteration, selected_parent, case_ids)
+            if prepared is None:
+                self._complete_rejected_iteration(
+                    iteration=iteration, resulting_parent=selected_parent,
+                    working_parent=selected_parent, case_ids=case_ids,
+                    reason="Pareto preparation rejected; retain the recorded current.",
+                )
+                return
+            parent = prepared
         parent_evaluation = await self._ensure_evaluation(
             logical_operation_id=operation_id(self.store.run_id, "iteration", iteration, "train-before"),
             candidate=parent,
@@ -283,7 +339,7 @@ class AutoSaddlerEngine:
             purpose="train_before",
             iteration=iteration,
         )
-        if all(observation.disposition == "success" for observation in parent_evaluation.observations):
+        if not pareto and all(observation.disposition == "success" for observation in parent_evaluation.observations):
             self._complete_iteration(
                 iteration=iteration,
                 resulting_candidate=selected_parent,
@@ -366,6 +422,8 @@ class AutoSaddlerEngine:
                 )
                 self.scenario.harness_space.apply_mutation(mutation_session, outcome)
                 child = self.scenario.harness_space.finalize(mutation_session)
+                if pareto:
+                    child = self._state().candidates.get(child.candidate_id, child)
             except (FileNotFoundError, TypeError, ValueError) as error:
                 reason = f"{type(error).__name__}: {error}"
                 self._reject_mutation(
@@ -412,6 +470,12 @@ class AutoSaddlerEngine:
                     "parent_ids": list(selection_plan.parents),
                     "child_candidate_id": child.candidate_id,
                     "verdict": record(verdict),
+                    **({
+                        "schema_version": PARETO_DECISION_SCHEMA_VERSION,
+                        "candidate_id": child.candidate_id,
+                        "parent_evaluation_id": parent_evaluation.evaluation_id,
+                        "child_evaluation_id": child_evaluation.evaluation_id,
+                    } if pareto else {}),
                 },
             )
         verdict = _verdict(acceptance_event.payload.get("verdict"))
@@ -444,6 +508,9 @@ class AutoSaddlerEngine:
                 iteration=iteration,
             )
 
+        if pareto and development_evaluation is not None:
+            self._update_archive(operation_id(self.store.run_id, "iteration", iteration, "archive"), iteration)
+
         evolution_operation = operation_id(self.store.run_id, "iteration", iteration, "evolution")
         self.store.append(
             "EvolutionRecorded",
@@ -473,6 +540,9 @@ class AutoSaddlerEngine:
                 "selection_parent_ids": list(selection_plan.parents),
                 "component_sources": dict(selection_plan.selections),
                 "selection_rationale": selection_plan.rationale,
+                **({"preparation": dict(self.store.find(
+                    "ExtensionStateChanged", operation_id(self.store.run_id, "iteration", iteration, "preparation"),
+                ).payload)} if pareto and iteration > 0 else {}),
                 "session_kind": "reflect",
                 "train_case_ids": list(case_ids),
                 "train_before_aggregate": parent_evaluation.aggregate_score,
@@ -491,13 +561,90 @@ class AutoSaddlerEngine:
                 "acceptance_reason": verdict.reason,
             },
         )
+        state = self._state()
+        resulting_candidate = state.candidates[state.current_candidate_id] if pareto else child if verdict.accepted else selected_parent
         self._complete_iteration(
             iteration=iteration,
-            resulting_candidate=child if verdict.accepted else selected_parent,
+            resulting_candidate=resulting_candidate,
             evaluated_candidates=(parent, child),
             accepted=verdict.accepted,
             outcome="accepted" if verdict.accepted else "declined",
         )
+
+    async def _prepare_pareto_parent(
+        self, iteration: int, base: Candidate, case_ids: tuple[str, ...],
+    ) -> Candidate | None:
+        preparation_operation = operation_id(self.store.run_id, "iteration", iteration, "preparation")
+        completed = self.store.find("ExtensionStateChanged", preparation_operation)
+        if completed is not None:
+            candidate_id = completed.payload["prepared_candidate_id"]
+            return self._state().candidates[candidate_id] if candidate_id is not None else None
+        candidate_operation = operation_id(self.store.run_id, "iteration", iteration, "prepared-candidate")
+        finalized = self.store.find("CandidateFinalized", candidate_operation)
+        if finalized is not None:
+            self.store.append("ExtensionStateChanged", preparation_operation, {
+            "namespace": "autosaddler.preparation",
+            "schema_version": "autosaddler-preparation/v1",
+                "iteration": iteration, "base_candidate_id": base.candidate_id,
+                "prepared_candidate_id": finalized.payload["candidate"]["candidate_id"],
+                "status": "prepared", "donor_candidate_ids": finalized.payload["donor_candidate_ids"],
+                "rationale": finalized.payload["preparation_rationale"],
+            })
+            return candidate_from(finalized.payload["candidate"])
+        state = self._state()
+        donors = tuple(candidate_id for candidate_id in state.archive_candidate_ids if candidate_id != base.candidate_id)
+        spec = self.scenario.prompt_pack.session("evolve", {
+            "iteration": iteration, "candidate_ids": [base.candidate_id],
+            "fixed_current_candidate_id": base.candidate_id,
+            "donor_candidate_ids": list(donors), "train_case_ids": list(case_ids),
+        })
+        session = self.scenario.harness_space.begin_mutation(base, MutationContext(
+            iteration=iteration, patch_label=spec.mutation_label or "preparation",
+            evidence=None, workspace_root=self.store.run_dir / "workspaces" / f"iteration-{iteration:04d}-preparation",
+        ))
+        status, rationale, used_donors = "unchanged", "", []
+        prepared: Candidate | None = base
+        try:
+            result = await self._ensure_session(
+                logical_operation_id=preparation_operation, spec=spec,
+                source_workspace=session.workspace, mutation_session=session,
+                result_validator=lambda value: _selection_failure_reason(value, (base.candidate_id,)),
+                reject_changed_failure=True,
+                metrics_context={"stage": "proposal.preparation", "iteration": iteration,
+                                 "candidate_id": base.candidate_id},
+            )
+            outcome = self._mutation_outcome(logical_operation_id=preparation_operation, result=result)
+            output = result.structured_output
+            assert output is not None
+            used_donors = list(output["donor_candidate_ids"])
+            rationale = str(output["rationale"])
+            if outcome.workspace_delta is not None and outcome.workspace_delta.changed_paths:
+                self.scenario.harness_space.apply_mutation(session, outcome)
+                candidate = self.scenario.harness_space.finalize(session)
+                prepared = self._state().candidates.get(candidate.candidate_id, candidate)
+                status = "prepared"
+                self.store.append("CandidateFinalized", candidate_operation, {
+                    "iteration": iteration, "kind": "preparation", "candidate": record(prepared),
+                    "base_candidate_id": base.candidate_id,
+                    "donor_candidate_ids": used_donors, "preparation_rationale": rationale,
+                })
+        except ModifiedPreparationFailure as error:
+            prepared, status, rationale = None, "rejected", str(error)
+        except SessionRetriesExhausted as error:
+            status, rationale = "failed_unchanged", str(error)
+        except (FileNotFoundError, TypeError, ValueError) as error:
+            # Fault-injection interruptions must remain resumable, not become rejections.
+            if self.store.transition_hook_error is error:
+                raise
+            prepared, status, rationale = None, "rejected", f"{type(error).__name__}: {error}"
+        self.store.append("ExtensionStateChanged", preparation_operation, {
+                "namespace": "autosaddler.preparation",
+                "schema_version": "autosaddler-preparation/v1",
+            "iteration": iteration, "base_candidate_id": base.candidate_id,
+            "prepared_candidate_id": prepared.candidate_id if prepared is not None else None,
+            "status": status, "donor_candidate_ids": used_donors, "rationale": rationale,
+        })
+        return prepared
 
     def _reject_mutation(
         self,
@@ -553,19 +700,32 @@ class AutoSaddlerEngine:
         details: Mapping[str, JsonValue] | None = None,
     ) -> None:
         evaluated_candidate_ids = [candidate.candidate_id for candidate in evaluated_candidates]
+        pareto = isinstance(self.policies.acceptance, ParetoAcceptance)
+        if pareto:
+            evaluated_candidate_ids = list(dict.fromkeys(evaluated_candidate_ids))
         if not evaluated_candidate_ids or len(set(evaluated_candidate_ids)) != len(evaluated_candidate_ids):
             raise ValueError("Iteration completion requires unique evaluated candidate IDs")
         state = self._state()
-        if resulting_candidate.candidate_id not in state.accepted_candidate_ids:
+        if pareto:
+            if resulting_candidate.candidate_id != state.current_candidate_id:
+                raise ValueError("Pareto iteration must carry forward the recorded current")
+        elif resulting_candidate.candidate_id not in state.accepted_candidate_ids:
             raise ValueError("Iteration resulting candidate must be present in accepted state")
         unknown = sorted(set(evaluated_candidate_ids) - state.candidates.keys())
         if unknown:
             raise ValueError(f"Iteration evaluated candidates are unknown: {unknown}")
         if accepted != (outcome == "accepted"):
             raise ValueError("Only an accepted iteration may use the accepted outcome")
-        if accepted and resulting_candidate.candidate_id != evaluated_candidate_ids[-1]:
+        if not pareto and accepted and resulting_candidate.candidate_id != evaluated_candidate_ids[-1]:
             raise ValueError("An accepted iteration must carry forward its final evaluated candidate")
         extra = dict(details or {})
+        if pareto:
+            decision = self.store.find("AcceptanceDecided", operation_id(self.store.run_id, "iteration", iteration, "acceptance"))
+            extra.update(
+                promoted_candidate_id=decision.payload["candidate_id"] if accepted else None,
+                archive_candidate_ids=list(state.archive_candidate_ids),
+                current_candidate_id=state.current_candidate_id,
+            )
         reserved = {
             "schema_version",
             "iteration",
@@ -614,6 +774,7 @@ class AutoSaddlerEngine:
                     "selection_parent_ids": cast(JsonValue, obligation.get("selection_parent_ids")),
                     "component_sources": cast(JsonValue, obligation.get("component_sources")),
                     "selection_rationale": cast(JsonValue, obligation.get("selection_rationale")),
+                    **({"preparation": obligation["preparation"]} if "preparation" in obligation else {}),
                     "train_before_aggregate": cast(JsonValue, obligation.get("train_before_aggregate")),
                     "train_after_aggregate": cast(JsonValue, obligation.get("train_after_aggregate")),
                     "train_before_case_scores": cast(
@@ -693,6 +854,7 @@ class AutoSaddlerEngine:
         metrics_context: Mapping[str, JsonValue] | None = None,
         mutation_session: MutationSession | None = None,
         result_validator: Callable[[SessionResult], str | None] | None = None,
+        reject_changed_failure: bool = False,
     ) -> SessionResult:
         failed_events = [
             event
@@ -702,6 +864,13 @@ class AutoSaddlerEngine:
         ]
         for failed in failed_events:
             self._ensure_session_budget(failed.operation_id, session_result_from(failed.payload["result"]))
+
+        if reject_changed_failure:
+            for failed in self.store.events_of_type("SessionFailed"):
+                if failed.payload.get("logical_operation_id") == logical_operation_id:
+                    delta = failed.payload.get("workspace_delta")
+                    if isinstance(delta, Mapping) and delta.get("changed_paths"):
+                        raise ModifiedPreparationFailure("Preparation failed after modifying its attempt")
 
         completed_failure: str | None = None
         completed_events = [
@@ -790,7 +959,8 @@ class AutoSaddlerEngine:
                         "wall_seconds": 0.0,
                         "recovered_from_result_artifact": True,
                     }
-                    if recovery_error is None:
+                    mutation_delta = None
+                    if recovery_error is None or reject_changed_failure:
                         request_artifact = started.payload.get("request")
                         if not isinstance(request_artifact, Mapping):
                             raise TypeError("Session request artifact must be an object")
@@ -802,10 +972,11 @@ class AutoSaddlerEngine:
                             self.store.run_dir / str(request_value.get("workspace", "")),
                             started.operation_id,
                         )
-                        recovery_error = _workspace_delta_failure_reason(result, mutation_delta)
+                        if recovery_error is None:
+                            recovery_error = _workspace_delta_failure_reason(result, mutation_delta)
+                    if mutation_delta is not None:
+                        terminal_payload["workspace_delta"] = record(mutation_delta)
                     if recovery_error is None:
-                        if mutation_delta is not None:
-                            terminal_payload["workspace_delta"] = record(mutation_delta)
                         self.store.append("SessionCompleted", started.operation_id, terminal_payload)
                         self._ensure_session_budget(logical_operation_id, result)
                         return result
@@ -820,7 +991,15 @@ class AutoSaddlerEngine:
                             "usage_incomplete": False,
                         },
                     )
+                    if reject_changed_failure and mutation_delta is not None and mutation_delta.changed_paths:
+                        raise ModifiedPreparationFailure("Recovered preparation failed after modifying its attempt")
                     continue
+                interrupted_delta = None
+                if reject_changed_failure:
+                    request_value = self.store.read_json(str(started.payload["request"]["uri"]))
+                    attempt_root = self.store.run_dir / str(request_value["workspace"])
+                    if attempt_root.is_dir():
+                        interrupted_delta = self._capture_mutation_delta(mutation_session, attempt_root, started.operation_id)
                 self.store.append(
                     "SessionFailed",
                     started.operation_id,
@@ -831,8 +1010,11 @@ class AutoSaddlerEngine:
                         "error": "Session start had no terminal event during replay",
                         "wall_seconds": 0.0,
                         "usage_incomplete": True,
+                        **({"workspace_delta": record(interrupted_delta)} if interrupted_delta is not None else {}),
                     },
                 )
+                if interrupted_delta is not None and interrupted_delta.changed_paths:
+                    raise ModifiedPreparationFailure("Interrupted preparation modified its attempt")
 
         max_attempts = self.session_retries + 1
         attempt = len(starts) + 1
@@ -889,9 +1071,14 @@ class AutoSaddlerEngine:
                 },
             )
             attempt_started = time.monotonic()
+            mutation_delta = None
             try:
                 result = await self.provider.run(request)
             except Exception as error:
+                if self.store.transition_hook_error is error:
+                    raise
+                if reject_changed_failure:
+                    mutation_delta = self._capture_mutation_delta(mutation_session, attempt_workspace, attempt_operation)
                 last_error = f"{type(error).__name__}: {error}"
                 if not any(
                     event.payload.get("attempt_operation_id") == attempt_operation
@@ -915,6 +1102,7 @@ class AutoSaddlerEngine:
                         "wall_seconds": time.monotonic() - attempt_started,
                         "usage_incomplete": True,
                         **dict(metrics_context or {}),
+                        **({"workspace_delta": record(mutation_delta)} if mutation_delta is not None else {}),
                     },
                 )
             else:
@@ -948,13 +1136,14 @@ class AutoSaddlerEngine:
                         stage=(metrics_context or {}).get("stage", "unknown"),
                         errors=usage_sink.write_errors,
                     )
-                if last_error is None:
+                if last_error is None or reject_changed_failure:
                     mutation_delta = self._capture_mutation_delta(
                         mutation_session,
                         attempt_workspace,
                         attempt_operation,
                     )
-                    last_error = _workspace_delta_failure_reason(result, mutation_delta)
+                    if last_error is None:
+                        last_error = _workspace_delta_failure_reason(result, mutation_delta)
                 if last_error is None:
                     terminal_payload: dict[str, JsonValue] = {
                         "logical_operation_id": logical_operation_id,
@@ -986,6 +1175,7 @@ class AutoSaddlerEngine:
                         "result_artifact": record(result_ref),
                         "wall_seconds": time.monotonic() - attempt_started,
                         "usage_incomplete": usage_sink.observed_count > 0,
+                        **({"workspace_delta": record(mutation_delta)} if mutation_delta is not None else {}),
                         **dict(metrics_context or {}),
                     },
                 )
@@ -995,6 +1185,8 @@ class AutoSaddlerEngine:
                     stage=(metrics_context or {}).get("stage", "unknown"),
                     errors=usage_sink.write_errors,
                 )
+            if reject_changed_failure and mutation_delta is not None and mutation_delta.changed_paths:
+                raise ModifiedPreparationFailure("Preparation failed after modifying its attempt")
             if attempt < max_attempts and self.session_retry_backoff_seconds:
                 await asyncio.sleep(self.session_retry_backoff_seconds * (2 ** (attempt - 1)))
             attempt += 1
@@ -1067,6 +1259,11 @@ class AutoSaddlerEngine:
             evaluation = evaluation_from(completed.payload.get("evaluation"))
             self._ensure_evaluation_budget(logical_operation_id, evaluation)
             return evaluation
+        pareto = isinstance(self.policies.acceptance, ParetoAcceptance)
+        if pareto and purpose == "development":
+            for evaluation in self._state().evaluations.values():
+                if evaluation.candidate_id == candidate.candidate_id and evaluation.purpose == "development":
+                    return evaluation
         split = cases[0].split if cases else None
         if split is None or any(case.split != split for case in cases):
             raise ValueError("Evaluation cases must be a non-empty single split")
@@ -1180,8 +1377,17 @@ class AutoSaddlerEngine:
             },
         )
 
-    def _select_best(self) -> tuple[Candidate, Evaluation]:
+    def _select_best(self, preference: str = "score") -> tuple[Candidate, Evaluation]:
         state = self._state()
+        if isinstance(self.policies.acceptance, ParetoAcceptance):
+            members, repetitions = self._archive_evaluations(state)
+            if preference == "cost":
+                selected = min(reversed(members), key=lambda evaluation: _mean_cost(
+                    _objective_runs(evaluation, repetitions),
+                ))
+            else:
+                selected = max(reversed(members), key=_required_score)
+            return state.candidates[selected.candidate_id], selected
         candidates = []
         for candidate_id in state.accepted_candidate_ids:
             evaluations = [
@@ -1192,6 +1398,28 @@ class AutoSaddlerEngine:
             if evaluations:
                 candidates.append((state.candidates[candidate_id], evaluations[-1]))
         return self.policies.ranking.select(candidates)
+
+    def _update_archive(self, archive_operation: str, iteration: int) -> None:
+        if self.store.find("ParetoArchiveUpdated", archive_operation) is not None:
+            return
+        state = self._state()
+        evaluations = {
+            evaluation.candidate_id: evaluation for evaluation in state.evaluations.values()
+            if evaluation.purpose == "development"
+        }
+        candidates = [(candidate, evaluations[candidate_id]) for candidate_id, candidate in state.candidates.items()
+                      if candidate_id in evaluations]
+        assert isinstance(self.policies.acceptance, ParetoAcceptance)
+        repetitions = self.policies.acceptance.parameters.repetitions
+        archive = pareto_front(candidates, repetitions=repetitions)
+        self.store.append("ParetoArchiveUpdated", archive_operation, {
+            "schema_version": PARETO_DECISION_SCHEMA_VERSION,
+            "iteration": iteration,
+            "repetitions": repetitions,
+            "evaluation_ids": [evaluation.evaluation_id for _, evaluation in candidates],
+            "archive_candidate_ids": [candidate.candidate_id for candidate, _ in archive],
+            "current_candidate_id": archive[-1][0].candidate_id,
+        })
 
     def _latest_development_aggregate(self, candidate_id: str) -> float | None:
         evaluations = [
@@ -1204,15 +1432,43 @@ class AutoSaddlerEngine:
     def _state(self) -> RunState:
         return RunState.replay(self.store.events())
 
+    def _archive_evaluations(self, state: RunState) -> tuple[tuple[Evaluation, ...], int]:
+        archive = self.store.events_of_type("ParetoArchiveUpdated")[-1].payload
+        evaluations = {evaluation.evaluation_id: evaluation for evaluation in state.evaluations.values()}
+        by_candidate = {
+            evaluations[evaluation_id].candidate_id: evaluations[evaluation_id]
+            for evaluation_id in archive["evaluation_ids"]
+        }
+        return tuple(by_candidate[candidate_id] for candidate_id in archive["archive_candidate_ids"]), archive["repetitions"]
+
+    def _result_archive(self) -> tuple[Mapping[str, JsonValue], ...]:
+        members, repetitions = self._archive_evaluations(self._state())
+        return tuple(
+            {
+                "candidate_id": evaluation.candidate_id,
+                "development_aggregate": _required_score(evaluation),
+                "development_cost": _mean_cost(_objective_runs(evaluation, repetitions)),
+                "development_evaluation_id": evaluation.evaluation_id,
+            }
+            for evaluation in members
+        )
+
     def _load_result(self) -> OptimizationResult:
         value = self.store.read_json("result.json")
         if not isinstance(value, Mapping):
             raise TypeError("Optimization result must be an object")
+        archive = ()
+        if "archive" in value:
+            archive = tuple(value["archive"])
+        elif "archive_candidate_ids" in value:
+            archive = self._result_archive()
         return OptimizationResult(
             run_id=str(value.get("run_id", "")),
-            selected_candidate_id=str(value.get("selected_candidate_id", "")),
-            development_score=float(value.get("development_score")),
+            selected_candidate_id=cast(str | None, value["selected_candidate_id"]),
+            development_score=float(value["development_score"]) if value["development_score"] is not None else None,
             iterations=int(value.get("iterations")),
+            current_candidate_id=cast(str | None, value.get("current_candidate_id")),
+            archive=archive,
         )
 
 

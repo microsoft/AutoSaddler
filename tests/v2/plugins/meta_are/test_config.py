@@ -88,7 +88,7 @@ def _settings_mapping(tmp_path: Path) -> tuple[dict[str, object], str]:
             "are/simulation/agents/default_agent",
             "are/simulation/agents/are_simulation_agent_config.py",
             "are/simulation/agents/agent_config_builder.py",
-            "are/simulation/apps/agent_user_interface.py",
+            "are/simulation/apps",
             "hook.json",
         ],
         "forbidden_paths": [
@@ -163,6 +163,77 @@ def test_settings_reject_unknown_keys_and_symbolic_revision(tmp_path: Path) -> N
             {**mapping, "scenario_timeout_seconds": 30.5},
             base_dir=tmp_path,
         )
+
+
+def test_pareto_smoke_settings_with_local_fixture_sources(tmp_path: Path) -> None:
+    from autosaddler.v2.config.models import RunConfig
+    from autosaddler.v2.plugins.meta_are.config import MetaARESettings
+
+    root = Path(__file__).resolve().parents[4]
+    config = RunConfig.load(root / "configs/v2/meta_are_pareto_smoke.yaml")
+    mapping = dict(config.scenario.settings)
+    fixture, _ = _settings_mapping(tmp_path)
+    for key in (
+        "source_repo", "base_revision", "dataset_root", "dataset_source_revision", "dataset_source_descriptor",
+        "train_manifest", "development_manifest", "test_manifest", "demo_filesystem_root",
+        "demo_filesystem_source_revision", "demo_filesystem_source_descriptor", "demo_filesystem_manifest",
+    ):
+        mapping[key] = fixture[key]
+
+    settings = MetaARESettings.from_mapping(mapping, base_dir=tmp_path)
+    train, development = settings.load_cases()
+
+    assert len(train) == 2
+    assert len(development) == 1
+    assert settings.repetitions == 3
+    assert settings.max_concurrent == 3
+    assert settings.model_provider == settings.judge_provider == "azure"
+    assert settings.model_wire_api == "chat_completions"
+    assert settings.model_endpoint is settings.judge_endpoint is None
+    assert settings.reasoning_effort == "xhigh"
+    assert settings.task_agent_pricing == config.scenario.settings["task_agent_pricing"]
+    assert settings.capability_phase_iterations == 1
+
+
+def test_task_agent_pricing_is_optional_shape_checked_and_fingerprinted(tmp_path: Path) -> None:
+    from autosaddler.v2.plugins.meta_are.config import MetaARESettings
+
+    mapping, _ = _settings_mapping(tmp_path)
+    baseline = MetaARESettings.from_mapping(mapping, base_dir=tmp_path)
+    assert baseline.task_agent_pricing is None
+    pricing = {
+        "input_usd_per_million": 2.0,
+        "cached_input_usd_per_million": 0.5,
+        "output_usd_per_million": 8.0,
+    }
+    priced = MetaARESettings.from_mapping({**mapping, "task_agent_pricing": pricing}, base_dir=tmp_path)
+    assert priced.task_agent_pricing == pricing
+    assert priced.execution_fingerprint != baseline.execution_fingerprint
+    for name in pricing:
+        changed = MetaARESettings.from_mapping(
+            {**mapping, "task_agent_pricing": {**pricing, name: 9.0}}, base_dir=tmp_path
+        )
+        assert changed.execution_fingerprint != priced.execution_fingerprint
+    for invalid in (
+        None,
+        {},
+        {**pricing, "unknown": 1},
+        {**pricing, "input_token_semantics": "includes_cached_tokens"},
+    ):
+        with pytest.raises(ValueError, match="task_agent_pricing"):
+            MetaARESettings.from_mapping({**mapping, "task_agent_pricing": invalid}, base_dir=tmp_path)
+
+    for rate in (0, -1, True, "8"):
+        raw_pricing = {**pricing, "output_usd_per_million": rate}
+        resolved = MetaARESettings.from_mapping({**mapping, "task_agent_pricing": raw_pricing}, base_dir=tmp_path)
+        assert resolved.task_agent_pricing == raw_pricing
+        assert resolved.execution_fingerprint != priced.execution_fingerprint
+
+    for rate in (float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            MetaARESettings.from_mapping(
+                {**mapping, "task_agent_pricing": {**pricing, "output_usd_per_million": rate}}, base_dir=tmp_path
+            )
 
 
 def test_settings_pin_responses_runtime_and_reject_unsupported_provider(

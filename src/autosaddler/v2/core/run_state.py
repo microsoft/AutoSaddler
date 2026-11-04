@@ -17,6 +17,8 @@ class RunState:
     selected_candidate_id: str | None
     optimization_completed: bool
     run_completed: bool
+    archive_candidate_ids: tuple[str, ...] = ()
+    current_candidate_id: str | None = None
 
     @classmethod
     def replay(cls, events: tuple[RunEvent, ...]) -> "RunState":
@@ -27,6 +29,8 @@ class RunState:
         selected: str | None = None
         optimization_completed = False
         run_completed = False
+        archive: tuple[str, ...] = ()
+        current: str | None = None
         for event in events:
             if event.event_type == "RunStarted":
                 seed_value = event.payload.get("seed_candidate")
@@ -38,6 +42,9 @@ class RunState:
                 candidates[candidate.candidate_id] = candidate
             elif event.event_type == "EvaluationCompleted":
                 evaluations[event.operation_id] = evaluation_from(event.payload.get("evaluation"))
+            elif event.event_type == "ParetoArchiveUpdated":
+                archive = tuple(event.payload["archive_candidate_ids"])
+                current = event.payload["current_candidate_id"]
             elif event.event_type == "EvolutionRecorded" and event.payload.get("accepted") is True:
                 candidate_id = event.payload.get("candidate_id")
                 if isinstance(candidate_id, str) and candidate_id not in accepted:
@@ -69,4 +76,6 @@ class RunState:
             selected_candidate_id=selected,
             optimization_completed=optimization_completed,
             run_completed=run_completed,
+            archive_candidate_ids=archive,
+            current_candidate_id=current,
         )

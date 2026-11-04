@@ -9,9 +9,11 @@ from typing import Any
 
 import yaml
 
-from autosaddler.v2.core.domain import ArtifactRef, JsonValue, canonical_json, sha256_digest, to_json_value
+from autosaddler.v2.core.domain import ArtifactRef, Evaluation, JsonValue, canonical_json, sha256_digest, to_json_value
 from autosaddler.v2.core.events import RunEvent, operation_id
 from autosaddler.v2.core.metrics import metrics_records, summarize_metrics
+from autosaddler.v2.core.policies import _mean_cost, _objective_runs
+from autosaddler.v2.core.run_state import RunState
 
 TransitionHook = Callable[[RunEvent], None]
 
@@ -182,6 +184,7 @@ class LocalRunStore:
 
     def refresh_projections(self) -> None:
         events = self.events()
+        pareto_state = RunState.replay(events) if any(_is_pareto_event(event) for event in events) else None
         status = _run_status(events)
         snapshot = {
             "schema_version": "autosaddler-run-snapshot/v1",
@@ -200,11 +203,17 @@ class LocalRunStore:
                         "DeferredWorkCompleted",
                         "IterationCompleted",
                     }
+                    or _is_pareto_event(event)
                 }
             ),
         }
+        if pareto_state is not None:
+            snapshot["pareto"] = {
+                "archive_candidate_ids": list(pareto_state.archive_candidate_ids),
+                "current_candidate_id": pareto_state.current_candidate_id,
+            }
         _atomic_write(self.run_dir / "snapshot.json", canonical_json(snapshot) + "\n")
-        _atomic_write(self.run_dir / "evolution_dag.json", canonical_json(_evolution_dag(events)) + "\n")
+        _atomic_write(self.run_dir / "evolution_dag.json", canonical_json(_evolution_dag(events, pareto_state)) + "\n")
         _atomic_write(
             self.run_dir / "strategy" / "lessons.json",
             canonical_json(_extension_projection(events, "autosaddler.lessons")) + "\n",
@@ -401,7 +410,17 @@ def _rebase_run_value(value: object, source_run_id: str, target_run_id: str) -> 
     raise TypeError(f"Unsupported fork payload value: {type(value).__name__}")
 
 
-def _evolution_dag(events: tuple[RunEvent, ...]) -> dict[str, JsonValue]:
+def _is_pareto_event(event: RunEvent) -> bool:
+    return (
+        event.event_type == "ParetoArchiveUpdated"
+        or event.event_type == "AcceptanceDecided" and (
+            "schema_version" in event.payload
+            or isinstance(event.payload.get("verdict"), Mapping) and "parameters" in event.payload["verdict"]
+        )
+    )
+
+
+def _evolution_dag(events: tuple[RunEvent, ...], pareto_state: RunState | None = None) -> dict[str, JsonValue]:
     nodes: dict[str, dict[str, JsonValue]] = {}
     selected: str | None = None
     for event in events:
@@ -432,6 +451,30 @@ def _evolution_dag(events: tuple[RunEvent, ...]) -> dict[str, JsonValue]:
             value = event.payload.get("candidate_id")
             if isinstance(value, str):
                 selected = value
+        elif event.event_type == "AcceptanceDecided" and pareto_state is not None and _is_pareto_event(event):
+            verdict = event.payload["verdict"]
+            candidate_id = event.payload.get("candidate_id")
+            if isinstance(candidate_id, str) and candidate_id in nodes:
+                nodes[candidate_id]["status"] = "promoted" if verdict["accepted"] else "declined"
+    if pareto_state is not None:
+        evaluations_by_id: dict[str, Evaluation] = {}
+        for event in events:
+            if event.event_type == "EvaluationCompleted":
+                evaluation = pareto_state.evaluations[event.operation_id]
+                evaluations_by_id[evaluation.evaluation_id] = evaluation
+            elif event.event_type == "ParetoArchiveUpdated":
+                repetitions = event.payload["repetitions"]
+                for evaluation_id in event.payload["evaluation_ids"]:
+                    evaluation = evaluations_by_id[evaluation_id]
+                    score = evaluation.aggregate_score
+                    assert score is not None
+                    node = nodes[evaluation.candidate_id]
+                    node["development_aggregate"] = score
+                    node["development_cost"] = _mean_cost(_objective_runs(evaluation, repetitions))
+                    node["development_evaluation_id"] = evaluation_id
+                    node["status"] = "archived" if evaluation.candidate_id in pareto_state.archive_candidate_ids else "dominated"
+        if pareto_state.current_candidate_id is not None:
+            nodes[pareto_state.current_candidate_id]["status"] = "current"
     if selected in nodes:
         nodes[selected]["status"] = "selected"
     edges: list[JsonValue] = []
@@ -442,6 +485,11 @@ def _evolution_dag(events: tuple[RunEvent, ...]) -> dict[str, JsonValue]:
         "schema_version": "autosaddler-evolution-dag/v1",
         "nodes": [nodes[key] for key in sorted(nodes)],
         "edges": edges,
+        **({
+            "archive_candidate_ids": list(pareto_state.archive_candidate_ids),
+            "current_candidate_id": pareto_state.current_candidate_id,
+            "selected_candidate_id": selected,
+        } if pareto_state is not None else {}),
     }
 
 

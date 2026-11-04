@@ -7,8 +7,9 @@ from autosaddler.v2.storage.local import LocalRunStore
 
 
 class MetaAREEvidenceBuilder:
-    def __init__(self, *, store: LocalRunStore) -> None:
+    def __init__(self, *, store: LocalRunStore, repetitions: int) -> None:
         self.store = store
+        self.repetitions = repetitions
 
     def build(self, evaluation: Evaluation) -> ArtifactRef:
         if evaluation.split != "train":
@@ -42,10 +43,12 @@ class MetaAREEvidenceBuilder:
                     "repetition": observation.repetition,
                     "disposition": observation.disposition,
                     "score": observation.score,
+                    "cost": to_json_value(observation.cost),
                     "producer_status": observation.metadata.get("producer_status"),
                     "validation_rationale": str(rationale),
                     "interactions": interactions,
                     "usage": dict(usage),
+                    "model_usage": observation.metadata.get("model_usage", []),
                     "trace_digests": dict(trace_digests),
                     "trace_artifact": (
                         {
@@ -65,6 +68,7 @@ class MetaAREEvidenceBuilder:
                 {
                     "case_id": case_id,
                     "consistency": _consistency(observations),
+                    "observed_repetitions": len(observations),
                     "per_repetition": per_repetition,
                 }
             )
@@ -78,6 +82,7 @@ class MetaAREEvidenceBuilder:
                 "candidate_id": evaluation.candidate_id,
                 "split": "train",
                 "purpose": evaluation.purpose,
+                "requested_repetitions": self.repetitions,
                 "case_records": case_records,
             },
             kind="meta-are-training-evidence",

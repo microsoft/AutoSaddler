@@ -42,6 +42,8 @@ def cost_from(value: object) -> Cost:
         output_tokens=_integer(item, "output_tokens"),
         wall_seconds=_number(item, "wall_seconds"),
         currency_amount=_optional_number(item, "currency_amount"),
+        cached_input_tokens=_optional_int(item, "cached_input_tokens"),
+        uncached_input_tokens=_optional_int(item, "uncached_input_tokens"),
     )
 
 

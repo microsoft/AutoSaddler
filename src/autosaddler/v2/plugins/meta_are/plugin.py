@@ -71,6 +71,7 @@ def build_meta_are_components(
         evaluator_fingerprint=f"meta-are/v1:{resolved.execution_fingerprint}",
         artifact_root=run_dir,
         infrastructure_retries=resolved.infrastructure_retries,
+        task_agent_pricing=resolved.task_agent_pricing,
     )
     prompt_pack = MetaAREPromptPack(
         store=store,
@@ -82,7 +83,7 @@ def build_meta_are_components(
         version="1",
         harness_space=harness,
         evaluator=evaluator,
-        evidence_builder=MetaAREEvidenceBuilder(store=store),
+        evidence_builder=MetaAREEvidenceBuilder(store=store, repetitions=resolved.repetitions),
         prompt_pack=prompt_pack,
         train_cases=train_cases,
         development_cases=development_cases,
@@ -150,6 +151,7 @@ def _resolved_entities(settings, train_cases, development_cases):
             "repetitions": settings.repetitions,
             "max_concurrent": settings.max_concurrent,
             "infrastructure_retries": settings.infrastructure_retries,
+            **({"task_agent_pricing": dict(settings.task_agent_pricing)} if settings.task_agent_pricing is not None else {}),
         },
         "resolved/mutation_scope.json": {
             "writable_paths": [path.as_posix() for path in settings.writable_paths],

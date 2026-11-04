@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from autosaddler.v2.core.domain import Candidate, Case, Evaluation, JsonValue, PatchVerdict
+import numpy as np
+from numpy.typing import NDArray
+
+from autosaddler.v2.core.domain import (
+    Candidate,
+    Case,
+    Evaluation,
+    JsonValue,
+    ParetoScreenParameters,
+    ParetoScreenResult,
+    PatchVerdict,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +174,163 @@ class MeanDevelopmentRanking:
         return selected
 
 
+def _objective_runs(evaluation: Evaluation, repetitions: int) -> tuple[tuple[tuple[float, float], ...], ...]:
+    if not evaluation.requested_case_ids:
+        raise ValueError("Pareto evaluation requires at least one case")
+    expected = {(case_id, repetition) for case_id in evaluation.requested_case_ids for repetition in range(repetitions)}
+    by_key: dict[tuple[str, int], tuple[float, float]] = {}
+    for observation in evaluation.observations:
+        if not observation.is_valid:
+            raise ValueError("Pareto evaluations require every observation to be valid")
+        if type(observation.repetition) is not int:
+            raise ValueError("Pareto repetition IDs must be integers")
+        score = observation.score
+        cost = observation.cost.currency_amount
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not 0 <= score <= 1
+        ):
+            raise ValueError("Pareto observation score must be a number in [0, 1]")
+        if (
+            isinstance(cost, bool)
+            or not isinstance(cost, (int, float))
+            or not math.isfinite(cost)
+            or cost <= 0
+        ):
+            raise ValueError("Pareto observation cost.currency_amount must be finite and positive")
+        by_key[(observation.case_id, observation.repetition)] = (score, cost)
+    if by_key.keys() != expected:
+        raise ValueError("Pareto evaluation must cover exactly the configured case/repetition IDs")
+    return tuple(
+        tuple(by_key[(case_id, repetition)] for repetition in range(repetitions))
+        for case_id in evaluation.requested_case_ids
+    )
+
+
+def _mean_cost(runs: tuple[tuple[tuple[float, float], ...], ...]) -> float:
+    cost = math.fsum(math.fsum(cost / len(task) for _, cost in task) / len(runs) for task in runs)
+    if not math.isfinite(cost) or cost <= 0:
+        raise ValueError("Pareto mean cost must be finite and positive")
+    return cost
+
+
+def dominates(first: tuple[float, float], second: tuple[float, float]) -> bool:
+    """Compare validated (mean score, mean USD cost) pairs."""
+    first_score, first_cost = first
+    second_score, second_cost = second
+    return (
+        first_score >= second_score
+        and first_cost <= second_cost
+        and (first_score > second_score or first_cost < second_cost)
+    )
+
+
+def pareto_front(
+    candidates: Sequence[tuple[Candidate, Evaluation]], *, repetitions: int
+) -> tuple[tuple[Candidate, Evaluation], ...]:
+    """Return nondominated candidates in caller-supplied durable creation order.
+
+    Repeated identities retain their first position and must agree on objectives.
+    Distinct identities with equal vectors remain separate archive members.
+    """
+    if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions <= 0:
+        raise ValueError("Pareto repetitions must be a positive integer")
+    if not candidates:
+        raise ValueError("Pareto archive requires development-evaluated candidates")
+    case_ids = candidates[0][1].requested_case_ids
+    unique: dict[str, tuple[Candidate, Evaluation, tuple[float, float]]] = {}
+    for candidate, evaluation in candidates:
+        if evaluation.split != "development" or evaluation.candidate_id != candidate.candidate_id:
+            raise ValueError("Pareto archive requires matching candidate development evaluations")
+        if evaluation.requested_case_ids != case_ids:
+            raise ValueError("Pareto archive requires identical ordered development case sets")
+        runs = _objective_runs(evaluation, repetitions)
+        score = evaluation.aggregate_score
+        assert score is not None
+        summary = (score, _mean_cost(runs))
+        if candidate.candidate_id in unique:
+            if unique[candidate.candidate_id][2] != summary:
+                raise ValueError("Repeated Pareto candidate identity has conflicting objectives")
+            continue
+        unique[candidate.candidate_id] = (candidate, evaluation, summary)
+    return tuple(
+        (candidate, evaluation)
+        for candidate, evaluation, summary in unique.values()
+        if not any(dominates(other_summary, summary) for _, _, other_summary in unique.values())
+    )
+
+
+def _bootstrap_arm(
+    runs: tuple[tuple[tuple[float, float], ...], ...],
+    parameters: ParetoScreenParameters,
+    rng: np.random.Generator,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    task_draws = []
+    for task in runs:
+        weights = rng.dirichlet(np.ones(parameters.repetitions), parameters.draws)
+        task_draws.append(weights @ np.asarray(task))
+    mean_draws = np.mean(task_draws, axis=0)
+    return mean_draws[:, 0], mean_draws[:, 1]
+
+
+@dataclass(frozen=True, slots=True)
+class ParetoAcceptance:
+    parameters: ParetoScreenParameters
+
+    def compare(self, parent: Evaluation, child: Evaluation) -> ParetoScreenResult:
+        if parent.purpose != "train_before" or child.purpose != "train_after":
+            raise ValueError("Pareto screening requires train_before and train_after evaluations")
+        if parent.iteration != child.iteration or parent.requested_case_ids != child.requested_case_ids:
+            raise ValueError("Pareto screening requires the same iteration and identical ordered case sets")
+        parameters = self.parameters
+        before_runs = _objective_runs(parent, parameters.repetitions)
+        after_runs = _objective_runs(child, parameters.repetitions)
+        before_score = parent.aggregate_score
+        after_score = child.aggregate_score
+        assert before_score is not None and after_score is not None
+        try:
+            with np.errstate(over="raise", divide="raise", invalid="raise"):
+                rng = np.random.default_rng(parameters.rng_seed)
+                before_accuracy, before_cost = _bootstrap_arm(before_runs, parameters, rng)
+                after_accuracy, after_cost = _bootstrap_arm(after_runs, parameters, rng)
+                accuracy_delta = after_accuracy - before_accuracy
+                cost_delta_ratio = (after_cost - before_cost) / before_cost
+        except FloatingPointError as error:
+            raise ValueError("Pareto objective magnitudes exceed finite screening arithmetic") from error
+        tolerance = np.finfo(float).eps * 8
+        promising = (accuracy_delta > tolerance) | (cost_delta_ratio < -tolerance)
+        safe = accuracy_delta >= -parameters.max_accuracy_drop - tolerance * max(1.0, parameters.max_accuracy_drop)
+        joint_support = float(np.mean(promising & safe))
+        threshold = parameters.joint_support_threshold
+        accepted = joint_support >= threshold
+        return ParetoScreenResult(
+            before_score=before_score,
+            after_score=after_score,
+            compared_case_ids=parent.requested_case_ids,
+            accepted=accepted,
+            reason=(
+                f"joint support {joint_support:.4f} "
+                f"{'meets' if accepted else 'is below'} threshold {threshold:.4f} "
+                f"for promising movement with max accuracy drop {parameters.max_accuracy_drop:.4f}"
+            ),
+            before_cost=_mean_cost(before_runs),
+            after_cost=_mean_cost(after_runs),
+            parameters=parameters,
+            samples_per_arm=len(parent.observations),
+            joint_support=joint_support,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ParetoDevelopmentRanking:
+    repetitions: int
+
+    def select(self, candidates: Sequence[tuple[Candidate, Evaluation]]) -> tuple[Candidate, Evaluation]:
+        """Select the newest nondominated candidate in the supplied creation order."""
+        return pareto_front(candidates, repetitions=self.repetitions)[-1]
+
+
 @dataclass(frozen=True, slots=True)
 class BudgetPolicy:
     max_rollouts: int
@@ -178,7 +347,7 @@ class BudgetPolicy:
 @dataclass(frozen=True, slots=True)
 class PolicyBundle:
     task_selection: FixedTaskSelectionPolicy | EpochShuffledTaskSelectionPolicy
-    acceptance: MatchedValidStrictImprovement
+    acceptance: MatchedValidStrictImprovement | ParetoAcceptance
     development: FullOnAcceptDevelopment
-    ranking: MeanDevelopmentRanking
+    ranking: MeanDevelopmentRanking | ParetoDevelopmentRanking
     budget: BudgetPolicy

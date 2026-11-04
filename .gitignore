@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .venv/
+.local/
 *.egg
 dist/
 build/

@@ -253,9 +253,12 @@ def test_runner_does_not_relaunch_outputless_durable_completion(
     assert calls == 1
 
 
+@pytest.mark.parametrize("worker_override, expected_timeout", [(None, 150), (1, 240)])
 def test_runner_process_timeout_covers_all_concurrency_waves(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    worker_override: int | None,
+    expected_timeout: int,
 ) -> None:
     from autosaddler.v2.plugins.meta_are.runner import MetaARERunner
 
@@ -276,7 +279,8 @@ def test_runner_process_timeout_covers_all_concurrency_waves(
         )
 
     def fake_run(argv, **kwargs):
-        assert kwargs["timeout"] == 150
+        assert kwargs["timeout"] == expected_timeout
+        assert argv[argv.index("--max_concurrent_scenarios") + 1] == str(worker_override or 2)
         output_dir = Path(argv[argv.index("--output_dir") + 1])
         output_dir.mkdir(parents=True)
         (output_dir / "output.jsonl").write_text("{}\n", encoding="utf-8")
@@ -302,7 +306,9 @@ def test_runner_process_timeout_covers_all_concurrency_waves(
         cases=tuple(cases),
         repetitions=2,
         attempt_dir=tmp_path / "attempt",
+        max_concurrent=worker_override,
     )
+    assert runner.max_concurrent == 2
 
 
 def test_runner_stages_mixed_capabilities_in_one_requested_bucket(

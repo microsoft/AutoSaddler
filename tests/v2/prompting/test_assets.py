@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from autosaddler.v2.core.domain import sha256_digest
 from autosaddler.v2.prompting.assets import (
     PromptAsset,
     PromptComposition,
@@ -169,18 +170,9 @@ def test_prompt_source_entities_snapshot_shared_and_plugin_assets(tmp_path) -> N
     assert "shared/system/optimizer-invariants.md" in sources
 
 
-@pytest.mark.parametrize(
-    ("plugin_name", "plugin_root", "composition"),
-    [
-        (
-            "meta_are",
-            Path(__file__).parents[3] / "src/autosaddler/v2/plugins/meta_are",
-            meta_are_prompt_composition_entity(),
-        ),
-    ],
-)
-def test_composition_sources_join_resolved_inventory(plugin_name, plugin_root, composition) -> None:
-    entities = prompt_source_entities(plugin_root=plugin_root, plugin_name=plugin_name)
+def test_composition_sources_join_resolved_inventory() -> None:
+    entities = prompt_source_entities(plugin_root=_V2_ROOT / "plugins/meta_are", plugin_name="meta_are")
+    composition = meta_are_prompt_composition_entity()
     inventory = entities["resolved/prompts/assets.json"]
     assert isinstance(inventory, dict)
     inventory_sources = {asset["source"] for asset in inventory["assets"]}
@@ -189,6 +181,13 @@ def test_composition_sources_join_resolved_inventory(plugin_name, plugin_root, c
     }
 
     assert composition_sources <= inventory_sources
+    inventory_by_source = {asset["source"]: asset for asset in inventory["assets"]}
+    for value in composition["compositions"].values():
+        for asset in value["assets"]:
+            source = inventory_by_source[asset["source"]]
+            content = entities[source["resolved_path"]]
+            assert sha256_digest(content) == source["sha256"] == asset["sha256"]
+            assert len(content.encode("utf-8")) == source["bytes"] == asset["bytes"]
 
 
 def test_prompt_composition_record_pins_final_order_and_digests() -> None:
@@ -293,19 +292,17 @@ def test_load_prompt_asset_rejects_invalid_skill_frontmatter(
     "composition",
     [meta_are_prompt_composition_entity()],
 )
-def test_generic_skills_are_core_only(composition) -> None:
+def test_generic_skills_select_one_methodology_per_mode(composition) -> None:
     compositions = composition["compositions"]
     for name, value in compositions.items():
         asset_ids = [asset["asset_id"] for asset in value["assets"]]
-        assert "methodology.skill.history-analysis" in asset_ids
-        assert [asset_id for asset_id in asset_ids if asset_id.endswith(".skill.history-analysis")] == [
-            "methodology.skill.history-analysis"
-        ]
-        if name.startswith("diagnose_patch"):
-            assert "methodology.skill.diagnose" in asset_ids
-            assert [asset_id for asset_id in asset_ids if asset_id.endswith(".skill.diagnose")] == [
-                "methodology.skill.diagnose"
-            ]
+        skills = ["history-analysis"]
+        if name.removeprefix("pareto.").startswith("diagnose_patch"):
+            skills.append("diagnose")
+        for skill in skills:
+            prefix = "methodology.pareto" if name.startswith("pareto.") else "methodology"
+            expected = [f"{prefix}.skill.{skill}"]
+            assert [asset_id for asset_id in asset_ids if asset_id.endswith(f".skill.{skill}")] == expected
 
 
 @pytest.mark.parametrize(
@@ -313,18 +310,19 @@ def test_generic_skills_are_core_only(composition) -> None:
     [meta_are_prompt_composition_entity()],
 )
 def test_actual_compositions_order_core_before_plugin(composition) -> None:
-    for value in composition["compositions"].values():
+    for name, value in composition["compositions"].items():
         asset_ids = [asset["asset_id"] for asset in value["assets"]]
-        system_index = asset_ids.index("methodology.system.invariants")
+        prefix = "methodology.pareto" if name.startswith("pareto.") else "methodology"
+        system_index = asset_ids.index(f"{prefix}.system.invariants")
         plugin_system_index = next(index for index, asset_id in enumerate(asset_ids) if asset_id.endswith(".system"))
         assert system_index < plugin_system_index
 
         core_task_index = next(
-            index for index, asset_id in enumerate(asset_ids) if asset_id.startswith("methodology.prompt.")
+            index for index, asset_id in enumerate(asset_ids) if asset_id.startswith(f"{prefix}.prompt.")
         )
         plugin_task_index = next(
             index
             for index, asset_id in enumerate(asset_ids)
-            if ".prompt." in asset_id and not asset_id.startswith("methodology.prompt.")
+            if ".prompt." in asset_id and not asset_id.startswith(f"{prefix}.prompt.")
         )
         assert core_task_index < plugin_task_index

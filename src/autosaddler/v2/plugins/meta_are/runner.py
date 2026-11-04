@@ -81,11 +81,14 @@ class MetaARERunner:
         cases: tuple[Case, ...],
         repetitions: int,
         attempt_dir: Path,
+        max_concurrent: int | None = None,
     ) -> MetaARERunResult:
         if not cases:
             raise ValueError("Meta-ARE runner requires at least one requested case")
         if repetitions < 1:
             raise ValueError("Meta-ARE repetitions must be positive")
+        if max_concurrent is not None and max_concurrent < 1:
+            raise ValueError("Meta-ARE max_concurrent must be positive")
         attempt_dir = attempt_dir.resolve()
         try:
             dataset_dir = attempt_dir / "dataset"
@@ -107,6 +110,7 @@ class MetaARERunner:
                 output_dir,
                 repetitions,
                 runtime_entrypoint,
+                max_concurrent=max_concurrent,
             )
             environment = self._environment(materialized.root, attempt_dir)
             (attempt_dir / "command.json").write_text(
@@ -163,7 +167,7 @@ class MetaARERunner:
                 env=environment,
                 text=True,
                 capture_output=True,
-                timeout=self._process_timeout(len(cases), repetitions),
+                timeout=self._process_timeout(len(cases), repetitions, max_concurrent=max_concurrent),
                 shell=False,
                 check=False,
             )
@@ -195,9 +199,10 @@ class MetaARERunner:
         finally:
             materialized.release()
 
-    def _process_timeout(self, case_count: int, repetitions: int) -> float:
+    def _process_timeout(self, case_count: int, repetitions: int, *, max_concurrent: int | None = None) -> float:
         work_items = case_count * repetitions
-        concurrency_waves = (work_items + self.max_concurrent - 1) // self.max_concurrent
+        workers = self.max_concurrent if max_concurrent is None else max_concurrent
+        concurrency_waves = (work_items + workers - 1) // workers
         return (
             concurrency_waves * self.timeout_seconds
             + self.process_completion_grace_seconds
@@ -244,6 +249,8 @@ class MetaARERunner:
         output_dir: Path,
         repetitions: int,
         runtime_entrypoint: Path | None,
+        *,
+        max_concurrent: int | None = None,
     ) -> tuple[str, ...]:
         values = [
             "uv",
@@ -297,7 +304,7 @@ class MetaARERunner:
                 "--num_runs",
                 str(repetitions),
                 "--max_concurrent_scenarios",
-                str(self.max_concurrent),
+                str(self.max_concurrent if max_concurrent is None else max_concurrent),
                 "--trace_dump_format",
                 "both",
                 "--judge_provider",

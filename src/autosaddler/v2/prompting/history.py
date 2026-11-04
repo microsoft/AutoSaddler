@@ -6,6 +6,7 @@ from pathlib import PurePosixPath
 
 from autosaddler.v2.core.domain import JsonValue, canonical_json, sha256_digest, to_json_value
 from autosaddler.v2.core.events import RunEvent
+from autosaddler.v2.core.policies import _mean_cost, _objective_runs
 from autosaddler.v2.core.run_state import RunState
 from autosaddler.v2.storage.local import LocalRunStore
 
@@ -33,11 +34,30 @@ def build_history_bundle(
     current_case_ids = set(all_current_case_ids)
     all_candidate_ids = list(state.candidates)
     candidate_ids = all_candidate_ids
-    development_scores = {
-        evaluation.candidate_id: evaluation.aggregate_score
+    development: dict[str, dict[str, JsonValue]] = {
+        evaluation.candidate_id: {"development_aggregate": evaluation.aggregate_score}
         for evaluation in state.evaluations.values()
         if evaluation.split == "development" and evaluation.aggregate_score is not None
     }
+    archives = [event for event in events if event.event_type == "ParetoArchiveUpdated"]
+    pareto_state: dict[str, JsonValue] = {}
+    if archives:
+        archive = archives[-1].payload
+        evaluations = {evaluation.evaluation_id: evaluation for evaluation in state.evaluations.values()}
+        development = {}
+        for evaluation_id in archive["evaluation_ids"]:
+            evaluation = evaluations[evaluation_id]
+            development[evaluation.candidate_id] = {
+                "development_aggregate": evaluation.aggregate_score,
+                "development_cost": _mean_cost(_objective_runs(evaluation, archive["repetitions"])),
+                "development_evaluation_id": evaluation_id,
+            }
+        pareto_state = {
+            "objective_mode": "pareto",
+            "repetitions": archive["repetitions"],
+            "archive_candidate_ids": list(state.archive_candidate_ids),
+            "current_candidate_id": state.current_candidate_id,
+        }
     accepted_ids = set(state.accepted_candidate_ids)
     evolution_status = {
         candidate_id: "accepted" if event.payload.get("accepted") is True else "declined"
@@ -51,11 +71,20 @@ def build_history_bundle(
     edge_paths: list[str] = []
     omitted_diffs = 0
     included_diff_bytes = 0
-    for candidate_id in sorted(candidate_ids):
+    for candidate_id in (candidate_ids if archives else sorted(candidate_ids)):
         candidate = state.candidates[candidate_id]
         status = "accepted" if candidate_id in accepted_ids else evolution_status.get(candidate_id, "proposed")
+        if archives:
+            status = "promoted" if candidate_id in accepted_ids else evolution_status.get(candidate_id, "proposed")
+            if candidate_id in development:
+                status = "dominated"
+            if candidate_id in state.archive_candidate_ids:
+                status = "archive"
+            if candidate_id == state.current_candidate_id:
+                status = "current"
         if state.selected_candidate_id == candidate_id:
             status = "selected"
+        development_fields = development.get(candidate_id, {"development_aggregate": None})
         candidate_path = f"{HISTORY_ROOT}/candidates/{_digest_name(candidate_id)}.json"
         changed_units = list(candidate.change.changed_units) if candidate.change is not None else []
         detail: dict[str, JsonValue] = {
@@ -65,7 +94,7 @@ def build_history_bundle(
             "space": candidate.space,
             "status": status,
             "accepted": candidate_id in accepted_ids,
-            "development_aggregate": development_scores.get(candidate_id),
+            **development_fields,
             "changed_units": changed_units,
             "change": to_json_value(candidate.change),
         }
@@ -93,7 +122,7 @@ def build_history_bundle(
                 "parent_ids": list(candidate.parent_ids),
                 "status": status,
                 "changed_units": changed_units,
-                "development_aggregate": development_scores.get(candidate_id),
+                **development_fields,
                 "detail_path": candidate_path,
             }
         )
@@ -164,6 +193,7 @@ def build_history_bundle(
                 "schema_version": "autosaddler-history-summary/v1",
                 "accepted_candidate_ids": list(state.accepted_candidate_ids),
                 "selected_candidate_id": state.selected_candidate_id,
+                **pareto_state,
                 "candidates": candidate_summaries,
                 "edge_paths": edge_paths,
                 "iteration_paths": iteration_paths,
@@ -227,7 +257,7 @@ def build_history_bundle(
 
     summaries_by_id = {item["candidate_id"]: item for item in candidate_summaries}
     compatibility_candidates = []
-    for candidate_id in state.accepted_candidate_ids:
+    for candidate_id in (candidate_ids if archives else state.accepted_candidate_ids):
         if candidate_id not in summaries_by_id:
             continue
         item = summaries_by_id[candidate_id]
@@ -237,10 +267,12 @@ def build_history_bundle(
                 "parent_ids": item["parent_ids"],
                 "changed_components": item["changed_units"],
                 "development_aggregate": item["development_aggregate"],
+                **({"status": item["status"], **development.get(candidate_id, {})} if archives else {}),
             }
         )
     compatibility: dict[str, JsonValue] = {
         "schema_version": "autosaddler-optimization-history/v1",
+        **pareto_state,
         "candidates": compatibility_candidates,
         "lessons": lessons,
         "prior_iterations": [iterations[index] for index in sorted(iterations)],
@@ -262,8 +294,14 @@ def build_history_bundle(
 def _iteration_records(events: tuple[RunEvent, ...]) -> dict[int, dict[str, JsonValue]]:
     records: dict[int, dict[str, JsonValue]] = {}
     for event in events:
+        if event.event_type == "IterationStarted" and "working_candidate_id" not in event.payload:
+            continue
+        if event.event_type == "ExtensionStateChanged" and event.payload.get("namespace") != "autosaddler.preparation":
+            continue
         if event.event_type not in {
+            "IterationStarted",
             "BatchSampled",
+            "ExtensionStateChanged",
             "MutationRejected",
             "AcceptanceDecided",
             "DeferredWorkScheduled",
@@ -278,7 +316,12 @@ def _iteration_records(events: tuple[RunEvent, ...]) -> dict[int, dict[str, Json
         if isinstance(iteration, bool) or not isinstance(iteration, int):
             raise TypeError(f"{event.event_type} event must contain an integer iteration")
         record = records.setdefault(iteration, {"iteration": iteration})
-        if event.event_type == "BatchSampled":
+        if event.event_type == "IterationStarted":
+            if "working_candidate_id" in payload:
+                record["working_candidate_id"] = payload["working_candidate_id"]
+        elif event.event_type == "ExtensionStateChanged":
+            record["preparation"] = dict(payload)
+        elif event.event_type == "BatchSampled":
             record["train_case_ids"] = to_json_value(payload.get("case_ids", []))
         elif event.event_type == "MutationRejected":
             record["mutation_rejected"] = True
@@ -286,6 +329,8 @@ def _iteration_records(events: tuple[RunEvent, ...]) -> dict[int, dict[str, Json
         elif event.event_type == "AcceptanceDecided":
             record["verdict"] = to_json_value(payload.get("verdict"))
         elif event.event_type == "DeferredWorkScheduled":
+            if "preparation" in payload:
+                record["preparation"] = to_json_value(payload["preparation"])
             for key in (
                 "candidate_id",
                 "parent_candidate_id",
@@ -317,6 +362,9 @@ def _iteration_records(events: tuple[RunEvent, ...]) -> dict[int, dict[str, Json
             record["outcome"] = to_json_value(payload.get("outcome"))
             record["resulting_candidate_id"] = to_json_value(payload.get("resulting_candidate_id"))
             record["evaluated_candidate_ids"] = to_json_value(payload.get("evaluated_candidate_ids", []))
+            if "archive_candidate_ids" in payload:
+                for key in ("promoted_candidate_id", "archive_candidate_ids", "current_candidate_id"):
+                    record[key] = to_json_value(payload[key])
     return records
 
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from autosaddler.v2.core.domain import ArtifactRef, Evaluation, Observation, sha256_digest
+from autosaddler.v2.core.domain import ArtifactRef, Cost, Evaluation, Observation, sha256_digest
 from autosaddler.v2.storage.local import LocalRunStore
 
 CANDIDATE_ID = sha256_digest("candidate")
@@ -40,10 +41,12 @@ def test_evidence_is_lossless_digest_checked_and_preserves_repetitions(tmp_path:
     )
     evaluation = _evaluation(traces)
 
-    evidence_ref = MetaAREEvidenceBuilder(store=store).build(evaluation)
+    evidence_ref = MetaAREEvidenceBuilder(store=store, repetitions=2).build(evaluation)
     evidence = store.read_json(evidence_ref.uri)
 
     assert evidence["schema_version"] == "autosaddler-meta-are-evidence/v1"
+    assert evidence["requested_repetitions"] == 2
+    assert evidence["case_records"][0]["observed_repetitions"] == 2
     assert evidence["case_records"][0]["consistency"] == "intermittent"
     repetitions = evidence["case_records"][0]["per_repetition"]
     assert [item["repetition"] for item in repetitions] == [0, 1]
@@ -52,8 +55,39 @@ def test_evidence_is_lossless_digest_checked_and_preserves_repetitions(tmp_path:
     assert all(len(item["interactions"][2]["content"]) == 100 for item in repetitions)
     assert repetitions[1]["exception_type"] == "ProviderError"
     assert repetitions[0]["usage"]["judge"]["calls"] == 0
+    assert repetitions[0]["model_usage"] == [{"role": "task_agent", "usage_incomplete": False}]
+    assert repetitions[1]["model_usage"] == [{"role": "task_agent", "usage_incomplete": True}]
     assert "completed_events" not in str(evidence)
     assert "ground_truth" not in str(evidence)
+
+
+@pytest.mark.parametrize("repetitions", [1, 2, 3, 5])
+def test_evidence_preserves_costs_and_requested_sample_count(tmp_path: Path, repetitions: int) -> None:
+    from autosaddler.v2.plugins.meta_are.evidence import MetaAREEvidenceBuilder
+
+    store = _store(tmp_path)
+    trace = store.write_json(
+        "evaluations/eval/trace.json", {"interactions": []}, kind="meta-are-normalized-trace",
+    )
+    base = _evaluation((trace, trace))
+    evaluation = replace(base, observations=tuple(
+        replace(base.observations[0], repetition=repetition, cost=Cost(currency_amount=0.02))
+        for repetition in range(repetitions)
+    ))
+    builder = MetaAREEvidenceBuilder(store=store, repetitions=repetitions)
+    evidence = store.read_json(builder.build(evaluation).uri)
+    case = evidence["case_records"][0]
+    assert evidence["requested_repetitions"] == case["observed_repetitions"] == repetitions
+    assert all(item["cost"]["currency_amount"] == 0.02 for item in case["per_repetition"])
+    assert all(item["usage"] == {} for item in case["per_repetition"])
+
+    incomplete = replace(evaluation, evaluation_id=sha256_digest("incomplete"), observations=(
+        replace(evaluation.observations[0], cost=Cost()),
+    ))
+    evidence = store.read_json(builder.build(incomplete).uri)
+    assert evidence["requested_repetitions"] == repetitions
+    assert evidence["case_records"][0]["observed_repetitions"] == 1
+    assert evidence["case_records"][0]["per_repetition"][0]["cost"]["currency_amount"] is None
 
 
 def test_evidence_rejects_non_training_data_and_trace_drift(tmp_path: Path) -> None:
@@ -65,7 +99,7 @@ def test_evidence_rejects_non_training_data_and_trace_drift(tmp_path: Path) -> N
         {"schema_version": "autosaddler-meta-are-observation/v1", "interactions": []},
         kind="meta-are-normalized-trace",
     )
-    builder = MetaAREEvidenceBuilder(store=store)
+    builder = MetaAREEvidenceBuilder(store=store, repetitions=2)
     development = Evaluation(
         evaluation_id=sha256_digest("development"),
         candidate_id=CANDIDATE_ID,
@@ -116,7 +150,10 @@ def _evaluation(traces: tuple[ArtifactRef, ArtifactRef]) -> Evaluation:
             score=1.0,
             evaluator_fingerprint="meta-are-test/v1",
             trace=traces[0],
-            metadata={"producer_status": "success"},
+            metadata={
+                "producer_status": "success",
+                "model_usage": [{"role": "task_agent", "usage_incomplete": False}],
+            },
         ),
         Observation.create(
             candidate_id=CANDIDATE_ID,
@@ -131,6 +168,7 @@ def _evaluation(traces: tuple[ArtifactRef, ArtifactRef]) -> Evaluation:
                 "producer_status": "failed",
                 "exception_type": "ProviderError",
                 "exception_message": "provider unavailable",
+                "model_usage": [{"role": "task_agent", "usage_incomplete": True}],
             },
         ),
     )

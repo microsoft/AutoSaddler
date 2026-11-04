@@ -12,8 +12,10 @@ from autosaddler.v2.core.domain import (
     Case,
     Cost,
     Evaluation,
+    JsonValue,
     Observation,
     canonical_json,
+    freeze_json_mapping,
     sha256_digest,
 )
 from autosaddler.v2.core.ports import EvaluationContext, HarnessSpace
@@ -26,10 +28,16 @@ class IncompleteMetaAREResultsError(ValueError):
 
 
 class MetaAREResultNormalizer:
-    def __init__(self, *, evaluator_fingerprint: str) -> None:
+    def __init__(
+        self,
+        *,
+        evaluator_fingerprint: str,
+        task_agent_pricing: Mapping[str, JsonValue] | None = None,
+    ) -> None:
         if not evaluator_fingerprint:
             raise ValueError("Meta-ARE evaluator fingerprint must be non-empty")
         self.evaluator_fingerprint = evaluator_fingerprint
+        self.task_agent_pricing = None if task_agent_pricing is None else freeze_json_mapping(task_agent_pricing)
 
     def normalize(
         self,
@@ -111,9 +119,40 @@ class MetaAREResultNormalizer:
             output_path.write_text(canonical_json(row) + "\n", encoding="utf-8")
             lite_value = _json_object(lite_path) if lite_path is not None else {}
             hf_value = _json_object(hf_path) if hf_path is not None else {}
+            pricing = self.task_agent_pricing
             model_usage = _model_usage_records(hf_value, lite_value)
             task_agent_usage = [item for item in model_usage if item["role"] == "task_agent"]
             judge_usage = [item for item in model_usage if item["role"] == "judge"]
+            cost = Cost(rollouts=1)
+            if pricing is not None:
+                complete_usage = bool(task_agent_usage) and all(not item["usage_incomplete"] for item in task_agent_usage)
+                if complete_usage:
+                    currency_amount = math.fsum(
+                        (
+                            item["uncached_input_tokens"] * float(pricing["input_usd_per_million"])
+                            + item["cached_input_tokens"] * float(pricing["cached_input_usd_per_million"])
+                            + item["output_tokens"] * float(pricing["output_usd_per_million"])
+                        ) / 1_000_000
+                        for item in task_agent_usage
+                    )
+                    cost = Cost(
+                        rollouts=1,
+                        input_tokens=sum(item["input_tokens"] for item in task_agent_usage),
+                        cached_input_tokens=sum(item["cached_input_tokens"] for item in task_agent_usage),
+                        uncached_input_tokens=sum(item["uncached_input_tokens"] for item in task_agent_usage),
+                        output_tokens=sum(item["output_tokens"] for item in task_agent_usage),
+                        currency_amount=currency_amount,
+                    )
+            timeout_missing_cost = scenario_timed_out and pricing is not None and (
+                cost.currency_amount is None
+                or not math.isfinite(cost.currency_amount)
+                or cost.currency_amount <= 0
+            )
+            if timeout_missing_cost:
+                # Priced evaluations cannot use an unaccounted timeout as a
+                # valid zero-score result. Reuse the bounded execution retries.
+                disposition = "execution_error"
+                normalized_score = None
             normalized_trace_path = None
             if hf_path is not None and lite_path is not None:
                 normalized_trace_path = artifact_dir / "traces" / f"{case_id}-{repetition}.json"
@@ -163,8 +202,9 @@ class MetaAREResultNormalizer:
                         else None
                     ),
                     attempts=1,
-                    cost=Cost(rollouts=1),
+                    cost=cost,
                     metadata={
+                        **({"incomplete_reason": "scenario_timeout_incomplete_cost"} if timeout_missing_cost else {}),
                         "producer_status": str(status),
                         "has_exception": has_exception,
                         "producer_run_number": metadata.get("run_number"),
@@ -193,6 +233,7 @@ class MetaAREEvaluator:
         evaluator_fingerprint: str,
         artifact_root: Path,
         infrastructure_retries: int,
+        task_agent_pricing: Mapping[str, JsonValue] | None = None,
     ) -> None:
         if infrastructure_retries < 0:
             raise ValueError("Meta-ARE infrastructure retries cannot be negative")
@@ -200,7 +241,10 @@ class MetaAREEvaluator:
         self.runner = runner
         self.artifact_root = artifact_root.resolve()
         self.infrastructure_retries = infrastructure_retries
-        self.normalizer = MetaAREResultNormalizer(evaluator_fingerprint=evaluator_fingerprint)
+        self.normalizer = MetaAREResultNormalizer(
+            evaluator_fingerprint=evaluator_fingerprint,
+            task_agent_pricing=task_agent_pricing,
+        )
         self.fingerprint = evaluator_fingerprint
 
     async def evaluate(
@@ -235,22 +279,33 @@ class MetaAREEvaluator:
                 context.repetitions,
                 latest,
             )
+            retry_key = None
+            runner_repetitions = context.repetitions
+            attempt_root = context.artifact_dir
+            if runner_attempt_number > 1:
+                runner_attempt_number, retry_key, attempt_root = _single_retry_request(
+                    context.artifact_dir, invalid_keys, case_by_id, latest, runner_attempt_number,
+                )
+                current_retry_cases = (case_by_id[retry_key[0]],)
+                runner_repetitions = 1
             if runner_attempt_number > maximum_attempts:
                 raise RuntimeError(
-                    f"Meta-ARE evaluation exhausted infrastructure retries for keys: {sorted(invalid_keys)}"
+                    f"Meta-ARE evaluation retained invalid keys after bounded retries: {sorted(invalid_keys)}"
                 )
-            attempt_dir = context.artifact_dir / f"runner-attempt-{runner_attempt_number:03d}"
+            attempt_dir = attempt_root / f"runner-attempt-{runner_attempt_number:03d}"
             retry_cases = _runner_request_cases(
                 attempt_dir,
                 case_by_id,
                 current_retry_cases,
-                context.repetitions,
+                runner_repetitions,
             )
-            runner_keys = {
+            runner_keys = {retry_key} if retry_key is not None else {
                 (case.case_id, repetition) for case in retry_cases for repetition in range(context.repetitions)
             }
             durable_completion = (attempt_dir / "completion.json").is_file()
-            accounting_keys = runner_keys - latest.keys() if durable_completion else runner_keys
+            accounting_keys = {
+                key for key in runner_keys if key not in latest or latest[key].attempts < runner_attempt_number
+            } if durable_completion else runner_keys
             active_attempts: dict[tuple[str, int], tuple[str, int]] = {}
             for case_id, repetition in sorted(accounting_keys):
                 pending = context.attempt_sink.pending(
@@ -271,13 +326,14 @@ class MetaAREEvaluator:
                 run_result = self.runner.run(
                     materialized=materialized,
                     cases=retry_cases,
-                    repetitions=context.repetitions,
+                    repetitions=runner_repetitions,
                     attempt_dir=attempt_dir,
+                    **({"max_concurrent": 1} if retry_key is not None else {}),
                 )
             except (subprocess.TimeoutExpired, RuntimeError) as error:
                 _write_infrastructure_error(attempt_dir, error)
                 _fail_attempts(context, active_attempts, type(error).__name__)
-                if runner_attempt_number >= maximum_attempts:
+                if retry_key is None and runner_attempt_number >= maximum_attempts:
                     raise RuntimeError("Meta-ARE benchmark failed after bounded infrastructure retries") from error
                 continue
             except Exception:
@@ -290,15 +346,21 @@ class MetaAREEvaluator:
                     lite_trace_dir=run_result.lite_trace_dir,
                     candidate_id=candidate.candidate_id,
                     requested_cases=retry_cases,
-                    repetitions=context.repetitions,
-                    artifact_dir=(context.artifact_dir / f"normalized/attempt-{runner_attempt_number:03d}"),
+                    repetitions=runner_repetitions,
+                    artifact_dir=(
+                        attempt_dir / "normalized" if retry_key is not None
+                        else context.artifact_dir / f"normalized/attempt-{runner_attempt_number:03d}"
+                    ),
                     artifact_root=self.artifact_root,
                     allow_incomplete=True,
                 )
             except Exception:
                 _fail_attempts(context, active_attempts, "invalid_result")
                 raise
-            by_key = {(observation.case_id, observation.repetition): observation for observation in normalized}
+            by_key = {
+                (observation.case_id, retry_key[1] if retry_key is not None else observation.repetition): observation
+                for observation in normalized
+            }
             returned_keys = active_attempts.keys() & by_key.keys()
             missing_keys = active_attempts.keys() - by_key.keys()
             for key in sorted(returned_keys):
@@ -313,7 +375,7 @@ class MetaAREEvaluator:
                     candidate_id=observation.candidate_id,
                     case_id=observation.case_id,
                     split=observation.split,
-                    repetition=observation.repetition,
+                    repetition=key[1],
                     disposition=observation.disposition,
                     score=observation.score,
                     evaluator_fingerprint=self.fingerprint,
@@ -321,7 +383,7 @@ class MetaAREEvaluator:
                     output=observation.output,
                     trace=observation.trace,
                     attempts=event_attempt_number,
-                    cost=Cost(rollouts=1),
+                    cost=observation.cost,
                     metadata=observation.metadata,
                 )
                 context.attempt_sink.complete(attempt_id, observation, observation.cost)
@@ -336,12 +398,12 @@ class MetaAREEvaluator:
                     {key: active_attempts[key] for key in missing_keys},
                     "incomplete_result",
                 )
-                if runner_attempt_number >= maximum_attempts:
+                if retry_key is None and runner_attempt_number >= maximum_attempts:
                     raise RuntimeError(
                         "Meta-ARE benchmark returned incomplete results after bounded retries"
                     ) from error
                 continue
-            if runner_attempt_number >= maximum_attempts:
+            if retry_key is None and runner_attempt_number >= maximum_attempts:
                 remaining = _invalid_keys(cases, context.repetitions, latest)
                 if remaining:
                     raise RuntimeError(
@@ -361,6 +423,22 @@ class MetaAREEvaluator:
                 kind="meta-are-evaluation-directory",
             ),
         )
+
+
+def _single_retry_request(
+    artifact_dir: Path,
+    invalid_keys: set[tuple[str, int]],
+    case_by_id: Mapping[str, Case],
+    latest: Mapping[tuple[str, int], Observation],
+    minimum_attempt: int,
+) -> tuple[int, tuple[str, int], Path]:
+    requests = []
+    for key in sorted(invalid_keys):
+        root = artifact_dir / "single-retries" / sha256_digest(canonical_json(list(key))).removeprefix("sha256:")
+        mapped_latest = {(key[0], 0): latest[key]} if key in latest else {}
+        number = max(minimum_attempt, _runner_attempt_number(root, (case_by_id[key[0]],), 1, mapped_latest))
+        requests.append((number, key, root))
+    return min(requests, key=lambda request: (request[0], request[1]))
 
 
 def _runner_request_cases(
@@ -583,6 +661,7 @@ def _usage_records(
         if isinstance(calls, bool) or not isinstance(calls, int) or calls < 0:
             raise TypeError(f"Meta-ARE {role} total_llm_calls must be nonnegative")
         prompt = _usage_series(stats.get("prompt_tokens"), calls, "prompt_tokens")
+        cached = _usage_series(stats.get("cached_input_tokens"), calls, "cached_input_tokens")
         completion = _usage_series(stats.get("completion_tokens"), calls, "completion_tokens")
         total = _usage_series(stats.get("total_tokens"), calls, "total_tokens")
         reasoning = _usage_series(stats.get("reasoning_tokens"), calls, "reasoning_tokens")
@@ -593,24 +672,34 @@ def _usage_records(
             integer=False,
         )
         for index in range(calls):
-            input_tokens = int(prompt[index] or 0)
+            reported_input = int(prompt[index] or 0)
+            cached_input_tokens = int(cached[index]) if cached[index] is not None else None
+            input_tokens = reported_input if prompt[index] is not None else (cached_input_tokens or 0)
+            if prompt[index] is not None and cached_input_tokens is not None and cached_input_tokens > input_tokens:
+                raise ValueError("Meta-ARE cached input tokens exceed total input tokens")
             output_tokens = int(completion[index] or 0)
             reasoning_tokens = int(reasoning[index] or 0)
             if reasoning_tokens > output_tokens:
                 raise ValueError("Meta-ARE reasoning tokens exceed completion tokens")
-            records.append(
-                {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "reasoning_tokens": reasoning_tokens,
-                    "provider_reported_total_tokens": (int(total[index]) if total[index] is not None else None),
-                    "model": model if isinstance(model, str) else None,
-                    "role": role,
-                    "duration_seconds": (float(duration[index]) if duration[index] is not None else None),
-                    "agent_id": agent_id,
-                    "usage_incomplete": prompt[index] is None or completion[index] is None,
-                }
-            )
+            record = {
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input_tokens,
+                "uncached_input_tokens": (
+                    input_tokens - cached_input_tokens
+                    if prompt[index] is not None and cached_input_tokens is not None else None
+                ),
+                "output_tokens": output_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "provider_reported_total_tokens": (int(total[index]) if total[index] is not None else None),
+                "model": model if isinstance(model, str) else None,
+                "role": role,
+                "duration_seconds": (float(duration[index]) if duration[index] is not None else None),
+                "agent_id": agent_id,
+                "usage_incomplete": (
+                    prompt[index] is None or completion[index] is None or cached[index] is None
+                ),
+            }
+            records.append(record)
     return records
 
 
@@ -633,14 +722,20 @@ def _usage_series(
     return values
 
 
-def _usage_summary(records: Sequence[Mapping[str, object]]) -> dict[str, int]:
-    return {
+def _usage_summary(records: Sequence[Mapping[str, object]]) -> dict[str, int | None]:
+    summary = {
         "calls": len(records),
         "input_tokens": sum(int(item["input_tokens"]) for item in records),
         "output_tokens": sum(int(item["output_tokens"]) for item in records),
         "reasoning_tokens": sum(int(item["reasoning_tokens"]) for item in records),
         "total_tokens": sum(int(item["input_tokens"]) + int(item["output_tokens"]) for item in records),
     }
+    if any("cached_input_tokens" in item for item in records):
+        summary["cached_input_tokens"] = (
+            sum(int(item["cached_input_tokens"]) for item in records)
+            if all(item.get("cached_input_tokens") is not None for item in records) else None
+        )
+    return summary
 
 
 def _usage_from_record(value: object) -> Usage:
@@ -648,6 +743,7 @@ def _usage_from_record(value: object) -> Usage:
         raise TypeError("Meta-ARE model usage record must be an object")
     return Usage(
         input_tokens=int(value.get("input_tokens", 0)),
+        cached_input_tokens=int(value.get("cached_input_tokens") or 0),
         output_tokens=int(value.get("output_tokens", 0)),
         reasoning_tokens=int(value.get("reasoning_tokens", 0)),
         provider_reported_total_tokens=(
