@@ -1,0 +1,56 @@
+{
+  "data-processing": [
+    "multi-source-data-merger",
+    "regex-log"
+  ],
+  "data-querying": [
+    "sparql-university"
+  ],
+  "data-science": [
+    "hf-model-inference",
+    "mcmc-sampling-stan",
+    "mteb-leaderboard"
+  ],
+  "debugging": [
+    "overfull-hbox",
+    "sqlite-db-truncate"
+  ],
+  "file-operations": [
+    "extract-elf",
+    "gcode-to-text"
+  ],
+  "mathematics": [
+    "model-extraction-relu-logits"
+  ],
+  "model-training": [
+    "train-fasttext"
+  ],
+  "personal-assistant": [
+    "constraints-scheduling"
+  ],
+  "scientific-computing": [
+    "bn-fit-modify",
+    "modernize-scientific-stack",
+    "protein-assembly"
+  ],
+  "security": [
+    "crack-7z-hash",
+    "filter-js-from-html",
+    "fix-code-vulnerability"
+  ],
+  "software-engineering": [
+    "build-pmars",
+    "code-from-image",
+    "git-leak-recovery",
+    "make-doom-for-mips",
+    "make-mips-interpreter",
+    "polyglot-c-py",
+    "pypi-server",
+    "schemelike-metacircular-eval",
+    "winning-avg-corewars",
+    "write-compressor"
+  ],
+  "system-administration": [
+    "git-multibranch"
+  ]
+}

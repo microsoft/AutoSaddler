@@ -1,0 +1,39 @@
+{
+  "data-processing": [
+    "financial-document-processor"
+  ],
+  "debugging": [
+    "merge-diff-arc-agi-task"
+  ],
+  "file-operations": [
+    "extract-moves-from-video",
+    "large-scale-text-editing"
+  ],
+  "machine-learning": [
+    "llm-inference-batching-scheduler"
+  ],
+  "model-training": [
+    "count-dataset-tokens",
+    "pytorch-model-recovery"
+  ],
+  "scientific-computing": [
+    "adaptive-rejection-sampler",
+    "dna-assembly",
+    "raman-fitting",
+    "tune-mjcf"
+  ],
+  "security": [
+    "password-recovery"
+  ],
+  "software-engineering": [
+    "build-pov-ray",
+    "fix-git",
+    "gpt2-codegolf",
+    "headless-terminal",
+    "kv-store-grpc",
+    "torch-pipeline-parallelism"
+  ],
+  "system-administration": [
+    "qemu-alpine-ssh"
+  ]
+}

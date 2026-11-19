@@ -1,0 +1,70 @@
+{
+  "data-processing": [
+    "log-summary-date-ranges"
+  ],
+  "data-science": [
+    "mteb-retrieve",
+    "query-optimize",
+    "reshard-c4-data",
+    "rstan-to-pystan",
+    "sam-cell-seg"
+  ],
+  "debugging": [
+    "build-cython-ext",
+    "custom-memory-heap-crash"
+  ],
+  "file-operations": [
+    "db-wal-recovery"
+  ],
+  "games": [
+    "chess-best-move"
+  ],
+  "machine-learning": [
+    "caffe-cifar-10",
+    "distribution-search"
+  ],
+  "mathematics": [
+    "feal-differential-cryptanalysis",
+    "feal-linear-cryptanalysis",
+    "largest-eigenval"
+  ],
+  "model-training": [
+    "pytorch-model-cli"
+  ],
+  "optimization": [
+    "portfolio-optimization"
+  ],
+  "scientific-computing": [
+    "dna-insert"
+  ],
+  "security": [
+    "break-filter-js-from-html",
+    "openssl-selfsigned-cert",
+    "sanitize-git-repo",
+    "vulnerable-secret"
+  ],
+  "software-engineering": [
+    "cancel-async-tasks",
+    "circuit-fibsqrt",
+    "cobol-modernization",
+    "fix-ocaml-gc",
+    "path-tracing",
+    "path-tracing-reverse",
+    "polyglot-rust-c",
+    "prove-plus-comm",
+    "regex-chess",
+    "torch-tensor-parallelism"
+  ],
+  "system-administration": [
+    "compile-compcert",
+    "configure-git-webserver",
+    "install-windows-3.11",
+    "mailman",
+    "nginx-request-logging",
+    "qemu-startup",
+    "sqlite-with-gcov"
+  ],
+  "video-processing": [
+    "video-processing"
+  ]
+}
